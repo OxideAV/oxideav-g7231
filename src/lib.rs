@@ -8,7 +8,7 @@
 //! filter. The decoder accepts real G.723.1 packets, validates the rate
 //! discriminator against the payload length, and emits 240-sample 30 ms
 //! silence frames at 8 kHz while the MP-MLQ / ACELP synthesis paths are
-//! implemented.
+//! not yet implemented.
 //!
 //! What's still stubbed: LSP-VQ codebook lookup + interpolation, adaptive /
 //! fixed-codebook excitation reconstruction, MP-MLQ pulse decoding, gain
