@@ -6,7 +6,7 @@ rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-g7231"
 authors = ["Mark Karpeles"]
-description = "Pure-Rust ITU-T G.723.1 dual-rate (6.3/5.3 kbit/s) speech decoder"
+description = "Pure-Rust ITU-T G.723.1 dual-rate (6.3/5.3 kbit/s) speech codec"
 
 readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-g7231"
