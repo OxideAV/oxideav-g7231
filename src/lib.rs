@@ -51,7 +51,7 @@ pub mod header;
 pub mod synthesis;
 pub mod tables;
 
-use oxideav_codec::{CodecRegistry, Decoder};
+use oxideav_codec::{CodecInfo, CodecRegistry, Decoder};
 use oxideav_core::{
     AudioFrame, CodecCapabilities, CodecId, CodecParameters, CodecTag, Error, Frame, Packet,
     Rational, Result, SampleFormat, TimeBase,
@@ -68,11 +68,14 @@ pub fn register(reg: &mut CodecRegistry) {
         .with_intra_only(false)
         .with_max_channels(1)
         .with_max_sample_rate(SAMPLE_RATE_HZ);
-    let cid = CodecId::new(CODEC_ID_STR);
-    reg.register_both(cid.clone(), caps, make_decoder, encoder::make_encoder);
-
     // AVI / WAVEFORMATEX tag: WAVE_FORMAT_MSG723 = 0x0014.
-    reg.claim_tag(cid, CodecTag::wave_format(0x0014), 10, None);
+    reg.register(
+        CodecInfo::new(CodecId::new(CODEC_ID_STR))
+            .capabilities(caps)
+            .decoder(make_decoder)
+            .encoder(encoder::make_encoder)
+            .tag(CodecTag::wave_format(0x0014)),
+    );
 }
 
 fn make_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
