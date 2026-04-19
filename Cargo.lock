@@ -22,7 +22,7 @@ dependencies = [
 
 [[package]]
 name = "oxideav-g7231"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "oxideav-codec",
  "oxideav-core",
