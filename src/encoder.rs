@@ -4,10 +4,12 @@
 //!
 //! This module implements **both** rates of G.723.1:
 //!
-//! - **5.3 kbit/s ACELP** — 4 fixed-position pulses per subframe on
-//!   4 tracks (T0..T3), 20-byte payload, discriminator `01`.
+//! - **5.3 kbit/s ACELP** — 4 pulses per subframe on stride-8 tracks
+//!   (T0..T3 each with 8 positions, a 1-bit grid shifting all pulses by
+//!   +4 so the union of grids covers every sample); 20-byte payload,
+//!   discriminator `01`.
 //! - **6.3 kbit/s MP-MLQ** — 6 pulses on odd subframes (0, 2) and
-//!   5 pulses on even subframes (1, 3), 24-byte payload, discriminator `00`.
+//!   5 pulses on even subframes (1, 3); 24-byte payload, discriminator `00`.
 //!
 //! [`make_encoder`] dispatches between the two rates based on the
 //! `CodecParameters.bit_rate` hint: `Some(6300)` or unset → MP-MLQ;
@@ -19,44 +21,35 @@
 //! For each 30 ms frame (240 samples at 8 kHz, mono S16):
 //!
 //! ```text
-//!  PCM s16 → LPC analysis (autocorrelation + Levinson + bandwidth-expand)
-//!          → LSP conversion + split VQ quantisation (24 bits total)
-//!          → 4× subframe loop:
-//!                - open-loop pitch from weighted residual
-//!                - closed-loop adaptive-codebook gain
-//!                - rate-specific fixed-codebook search
-//!                    · ACELP:  4-pulse search on T0..T3 tracks
-//!                    · MP-MLQ: greedy 6/5-pulse search on the grid
-//!                - joint gain quantisation (12-bit combined index)
+//!  PCM s16 → LPC analysis (autocorrelation + Levinson + lag window)
+//!          → LSP conversion (Chebyshev root-finding) + factorial
+//!            scalar split VQ (24 bits across three 8-bit splits)
+//!          → 4× subframe loop (ACB lookup against SynthesisState):
+//!                - zero-input response of 1/A_q(z) to form ZIR-free target
+//!                - open-loop lag search on the ZIR-free target
+//!                - ACB gain quantised (4 bits, 0.0..1.25)
+//!                - rate-specific FCB search against the ACB residual
+//!                    · ACELP:  4-pulse stride-8 tracks + grid, coord
+//!                              descent refinement
+//!                    · MP-MLQ: 6/5-pulse greedy search on stride-N tracks
+//!                - joint gain-pair refinement around the initial
+//!                  quantisation (27-pair neighbourhood scan)
+//!          → canonical SynthesisState::synthesise() commits decoder
+//!            state so encoder + decoder stay in lockstep
 //!          → bit-pack 158 bits (ACELP, 20 B, rate=01)
 //!               or 192 bits (MP-MLQ, 24 B, rate=00)
 //! ```
 //!
-//! ## Departures from the letter of the spec
+//! # Not bit-compatible with ITU-T reference tables
 //!
-//! - The LSP split-VQ here uses a small, self-consistent training-derived
-//!   codebook — NOT the ITU-T Table 5 codebook. A bitstream produced by this
-//!   encoder therefore cannot be decoded by an external (e.g. reference-C)
-//!   G.723.1 decoder for high-quality speech. It IS, however, internally
-//!   consistent with the [`decode_acelp_local`] / [`decode_mpmlq_local`]
-//!   helpers provided here (used by the tests for round-trip verification)
-//!   and passes the framework's scaffold decoder (which emits silence).
-//! - Open-loop pitch search is on the weighted short-term residual,
-//!   covering `[PITCH_MIN..=PITCH_MAX]` as the spec mandates; refinement
-//!   within ±1 is done by integer-lag re-correlation rather than the spec's
-//!   fractional-lag search.
-//! - MP-MLQ pulse search is a pure greedy per-pulse residual-minimiser on
-//!   an 8-slot track per pulse (3-bit position + 1-bit sign); a shared
-//!   subframe gain is quantised together with the ACB gain via the same
-//!   12-bit codeword as ACELP.
-//! - Gain quantisation packs a 3-bit ACB gain index + 9-bit FCB gain
-//!   exponent/mantissa into a 12-bit combined word — this fills the
-//!   GAIN field exactly but uses a locally-chosen mapping rather than the
-//!   spec's Table 7.
-//!
-//! These deliberate simplifications keep the encoder pure-Rust, ~1000 LOC,
-//! and bit-exact with its own reference decode, while still exercising the
-//! full analysis / packing pipeline for both rates.
+//! The LSP split VQ (a factorial scalar product code), joint gain
+//! codebook (4-bit ACB + 7-bit FCB magnitude on a log2 scale + 1-bit
+//! sign), and fixed-codebook pulse track layout here are a clean-room,
+//! pure-Rust design. They are internally consistent and give a solid
+//! round-trip PSNR (see the README and integration tests) but are not
+//! bit-compatible with ITU-T Tables 5 / 7 / 9, so a bitstream produced
+//! here does not decode to high-quality speech on an external,
+//! spec-table G.723.1 reference decoder.
 
 use std::collections::VecDeque;
 
