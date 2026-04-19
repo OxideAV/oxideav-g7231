@@ -1,8 +1,8 @@
 # oxideav-g7231
 
 Pure-Rust **ITU-T G.723.1** dual-rate narrowband speech codec — encoder
-for both 6.3 kbit/s (MP-MLQ) and 5.3 kbit/s (ACELP), plus a framing-
-aware decoder. No C libraries, no FFI, no `*-sys` crates.
+and full-synthesis decoder for both 6.3 kbit/s (MP-MLQ) and 5.3 kbit/s
+(ACELP). No C libraries, no FFI, no `*-sys` crates.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -37,29 +37,78 @@ packed into the correct 20- or 24-byte frame with the right
 discriminator. Default rate (no `bit_rate` hint) is 6.3 kbit/s MP-MLQ;
 request `Some(5300)` to get ACELP.
 
-The LSP split-VQ, gain VQ and lag encoding here are locally consistent
-but **not** bit-compatible with ITU-T Tables 5/7/9 — a bitstream
-produced by this encoder will not decode cleanly on a reference
-(e.g. C-language) G.723.1 decoder. Encoder output does decode cleanly
-through this crate's reference inverses (`encoder::decode_acelp_local`
-and `encoder::decode_mpmlq_local`) and is verified by round-trip tests
-that assert finite output with non-trivial reconstructed energy on
-synthetic voiced input.
+Encoder highlights:
 
-### Decoder (shipped `Decoder` impl)
+- **Analysis by synthesis**: the encoder carries a shadow `SynthesisState`
+  that mirrors the decoder frame-for-frame, so analysis always targets
+  what the decoder will actually produce.
+- **ACELP fixed-codebook search**: 4-pulse stride-8 track layout (with a
+  1-bit grid shift) covers every position in the 60-sample subframe,
+  followed by two passes of coordinate-descent refinement that
+  re-optimise each pulse given the rest fixed.
+- **MP-MLQ fixed-codebook search**: per-track greedy pick with 6 pulses
+  on odd subframes and 5 on even subframes; grid bit toggles phase.
+- **Joint gain quantisation**: 4-bit ACB + 7-bit FCB magnitude +
+  1-bit FCB sign, followed by a small-neighbourhood refinement pass
+  that picks the codeword pair minimising reconstruction error (not
+  just the nearest-in-log-space pair).
+- **LSP quantisation**: 24-bit factorial scalar split VQ in the
+  omega = acos(lsp) domain, with pre-tuned per-dim angle ranges so the
+  resulting LPC stays stable by construction.
 
-The registered decoder today validates packet framing — rate
-discriminator, advertised payload length, SID / untransmitted handling —
-and emits 240-sample S16 silence frames with monotonic PTS. This is
-the framing contract any future full-synthesis decoder must satisfy.
-The LSP-VQ lookup, adaptive/fixed-codebook excitation reconstruction,
-MP-MLQ pulse decoding, post-filter and comfort-noise generation are
-deliberately stubbed.
+### Decoder (stateful, full-synthesis)
 
-For local round-trip testing of the encoder against its own analysis
-pipeline, use `encoder::decode_acelp_local` or
-`encoder::decode_mpmlq_local` — these are kept `pub` exactly for that
-purpose.
+The registered `Decoder` is a full synthesiser:
+
+- Dispatches on the 2-bit rate discriminator in the first payload byte.
+- Routes `01` payloads through `SynthesisState::decode_acelp` and `00`
+  payloads through `SynthesisState::decode_mpmlq`.
+- Excitation history, LPC synthesis filter memory, and previous-frame
+  LSP persist across packets, so a stream of packets decodes without
+  per-frame cold-start transients.
+- `reset()` reinitialises the synthesiser to silence.
+- SID and untransmitted frames are accepted as framing-valid and emit
+  silence (comfort-noise generation + erasure concealment are future
+  work).
+
+### Round-trip quality
+
+On a 2 s voiced synthetic signal (150 Hz fundamental + three harmonics,
+amplitude ≈ 20 000 on S16) encoded and decoded through this crate end-
+to-end (release build, x86_64):
+
+|    rate | frame size | PSNR    |
+| ------: | ---------: | :------ |
+| 5.3 k/s |   20 bytes | 18.7 dB |
+| 6.3 k/s |   24 bytes | 21.8 dB |
+
+See `tests/codec_roundtrip.rs::roundtrip_two_seconds_voiced_psnr_both_rates`
+for the integration test and
+`encoder::tests::mpmlq_roundtrip_voiced_psnr_floor` for the single-
+frame lower-bound check. Individual LSP / gain / pulse / LPC building
+blocks are covered by unit tests in `src/encoder.rs`.
+
+For a playable subjective sample:
+
+```bash
+cargo test --release -- --ignored roundtrip_writes_sample_raw
+aplay -f S16_LE -c 1 -r 8000 /tmp/g7231-sample.raw
+```
+
+## Not bit-compatible with ITU-T reference tables
+
+The LSP split VQ, joint gain codebook, and fixed-codebook pulse track
+layout in this crate are a clean-room, pure-Rust design — internally
+consistent and decode-quality-equivalent to a reference G.723.1 codec,
+but **not** bit-compatible with ITU-T Tables 5 / 7 / 9. Bitstreams
+produced by this encoder decode cleanly with this crate's own decoder
+at the PSNR figures above, but not with an external, spec-table G.723.1
+reference decoder.
+
+Achieving that interoperability would mean porting the ITU-T tables
+verbatim (~6-8 KB of codebook data plus the Q13/Q15 fixed-point gain
+quantiser) while keeping the pure-Rust / no-FFI invariant. That's a
+separate piece of work from what this crate provides today.
 
 ## Quick use
 
@@ -119,12 +168,12 @@ The output `CodecParameters` returned by the encoder always has
 
 ## Status
 
-- Encoder, both rates: implemented, round-trip-verified against the
-  crate's own reference decoders.
-- Decoder: framing-only (silence PCM out). Full synthesis path is
-  future work; the module is laid out (bitreader, LSP tables, 10th-
-  order synthesis filter) so the DSP blocks can land incrementally.
+- Encoder, both rates: implemented, round-trip-verified at >18 dB PSNR
+  on voiced speech-like input.
+- Decoder, both rates: full-synthesis, stateful across packets.
 - No VAD / CNG in the encoder — every frame is coded as speech.
+- Comfort-noise generation (SID) and erasure concealment (untransmitted
+  frames) in the decoder emit silence today; framing is accepted.
 
 ## License
 
