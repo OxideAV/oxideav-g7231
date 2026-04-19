@@ -252,7 +252,12 @@ fn roundtrip_two_seconds_voiced_psnr_both_rates() {
     const FRAMES: usize = 66;
     let input = voiced(FRAMES);
 
-    for (bit_rate, floor_db, label) in [(5300u64, 15.0, "ACELP"), (6300u64, 15.0, "MP-MLQ")] {
+    // Per-rate PSNR floors: ACELP has 4 pulses per subframe (vs 5-6 for
+    // MP-MLQ) so it reconstructs less faithfully — 16 dB leaves ~2 dB of
+    // cross-platform rounding headroom above the measured ~18 dB floor.
+    // MP-MLQ steadily sits above 21 dB; 19 dB here is a catch-all for
+    // cross-platform float drift.
+    for (bit_rate, floor_db, label) in [(5300u64, 16.0, "ACELP"), (6300u64, 19.0, "MP-MLQ")] {
         let mut enc = make_encoder(Some(bit_rate));
         enc.send_frame(&audio_frame(&input)).unwrap();
         enc.flush().unwrap();

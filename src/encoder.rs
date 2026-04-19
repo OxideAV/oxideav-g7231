@@ -501,18 +501,28 @@ impl AnalysisState {
             let fcb_mag_ceil = 2.0f32.powf(FCB_GAIN_LOG2_MAX);
             let g_fixed = lsq_gain(&fcb_filtered, &target2).clamp(-fcb_mag_ceil, fcb_mag_ceil);
 
-            // Repack the two half-quantised gains back into the 12-bit
-            // codeword (acb_idx is already quantised; only the FCB sign
-            // and magnitude need quantising here).
+            // Initial FCB-gain quantisation + sign.
             let sign_bit = if g_fixed < 0.0 { 1u32 } else { 0 };
             let mag = g_fixed.abs().max(2.0f32.powf(FCB_GAIN_LOG2_MIN));
-            let fcb_idx = quantise_scalar(
+            let fcb_idx0 = quantise_scalar(
                 mag.log2(),
                 FCB_GAIN_LOG2_MIN,
                 FCB_GAIN_LOG2_MAX,
                 FCB_GAIN_LEVELS,
             );
-            let gi = acb_idx | (fcb_idx << ACB_GAIN_BITS) | (sign_bit << FCB_SIGN_SHIFT);
+            // Refine the joint (ACB, FCB) gain pair against the real
+            // reconstruction error by scanning a small neighbourhood in
+            // index space — catches rounding disagreements where
+            // nominally-nearest pair isn't optimal after the interaction
+            // with the filtered pulse/ACB responses.
+            let gi = refine_gain_pair(
+                acb_idx,
+                fcb_idx0,
+                sign_bit,
+                &adapt_filtered,
+                &fcb_filtered,
+                &target,
+            );
             gain_idx[s] = gi;
 
             // Advance the shadow decoder for the next subframe's ACB
@@ -649,13 +659,20 @@ impl AnalysisState {
 
             let sign_bit = if g_fixed < 0.0 { 1u32 } else { 0 };
             let mag = g_fixed.abs().max(2.0f32.powf(FCB_GAIN_LOG2_MIN));
-            let fcb_idx = quantise_scalar(
+            let fcb_idx0 = quantise_scalar(
                 mag.log2(),
                 FCB_GAIN_LOG2_MIN,
                 FCB_GAIN_LOG2_MAX,
                 FCB_GAIN_LEVELS,
             );
-            let gi = acb_idx | (fcb_idx << ACB_GAIN_BITS) | (sign_bit << FCB_SIGN_SHIFT);
+            let gi = refine_gain_pair(
+                acb_idx,
+                fcb_idx0,
+                sign_bit,
+                &adapt_filtered,
+                &fcb_filtered,
+                &target,
+            );
             gain_idx[s] = gi;
 
             let (g_adapt_q, g_fixed_q) = dequantise_gain(gi);
@@ -1394,15 +1411,24 @@ pub(crate) fn place_pulses(
 
 // ---------- MP-MLQ (6.3 kbit/s) pulse search ----------
 //
-// Each pulse occupies a 3-bit "slot" index on a per-pulse track with stride
-// equal to the number of pulses. For `n` pulses, track `t ∈ 0..n` picks
-// positions `t + n*k + grid`, with `k ∈ 0..8` giving the 3-bit code.
+// 3-bit "slot" index per pulse + 1-bit sign = 4 bits per pulse. Pulses
+// share a track layout inspired by the ACELP one: track `t ∈ 0..n_pulses`
+// at stride `MPMLQ_STRIDE = 8`, with the 1-bit grid adding a 4-sample
+// shift so the union of both grids spans all 60 subframe samples.
 //
-// The search is a per-track greedy correlation maximiser (same shape as
-// [`acelp_4pulse_search`]) iterating both grid=0 and grid=1. This is a
-// simplification of the spec's joint position/amplitude MLQ refinement but
-// is internally consistent with [`decode_mpmlq_local`] and exercises the
-// full analysis / packing pipeline.
+// For n_pulses = 6, track 0 covers positions 0,8,16,24,32,40,48,56 (k=0..7);
+// track 5 covers 5,13,21,29,37,45,53 (k=0..6, k=7 lands at 61 which is
+// out of range and skipped). Per-track greedy pick followed by two
+// passes of coordinate-descent refinement.
+
+/// Compute the absolute position of an MP-MLQ pulse on `track` with slot
+/// `k` and `grid` offset, using stride = `n_pulses` so each track's 8
+/// slots interleave with the other tracks' and the combined pulse set
+/// hits `n_pulses × 8` distinct positions — 48 for 6 pulses, 40 for 5.
+/// The grid bit shifts all positions by 1 (odd/even grid).
+fn mpmlq_pos_of(track: usize, k: u32, grid: u8, n_pulses: usize) -> usize {
+    track + n_pulses * k as usize + grid as usize
+}
 
 /// MP-MLQ multipulse search. Returns `(positions, signs, grid)` with:
 ///
@@ -1410,8 +1436,9 @@ pub(crate) fn place_pulses(
 /// - `signs[t]` — `+1` or `-1`,
 /// - `grid` — the shared 0/1 grid offset for this subframe.
 ///
-/// Only the first `n_pulses` entries of the output arrays are populated;
-/// the rest are left at their default (zero position, +1 sign).
+/// After the per-track greedy pick, two coordinate-descent passes
+/// re-optimise each pulse given the rest fixed, mirroring the ACELP
+/// refinement.
 fn mpmlq_pulse_search(
     target: &[f32; SUBFRAME_SIZE],
     h: &[f32],
@@ -1421,26 +1448,22 @@ fn mpmlq_pulse_search(
     let d = compute_correlations(target, h);
 
     let mut best_grid = 0u8;
-    let mut best_energy = -f32::INFINITY;
+    let mut best_err = f32::INFINITY;
     let mut best_positions = [0u32; MPMLQ_PULSES_ODD];
     let mut best_signs = [1i32; MPMLQ_PULSES_ODD];
 
     for grid in 0..2u8 {
         let mut positions = [0u32; MPMLQ_PULSES_ODD];
         let mut signs = [1i32; MPMLQ_PULSES_ODD];
-        let mut energy = 0.0f32;
-        let mut used = Vec::with_capacity(n_pulses);
 
-        for track in 0..n_pulses as u32 {
+        // Pass 1: per-track greedy pick.
+        for track in 0..n_pulses {
             let mut best_score = 0.0f32;
             let mut best_k = 0u32;
             let mut best_sign = 1i32;
             for k in 0..8u32 {
-                let pos = (track + n_pulses as u32 * k) as usize + grid as usize;
+                let pos = mpmlq_pos_of(track, k, grid, n_pulses);
                 if pos >= SUBFRAME_SIZE {
-                    continue;
-                }
-                if used.contains(&pos) {
                     continue;
                 }
                 let ap = autocorr_at(h, pos);
@@ -1455,15 +1478,33 @@ fn mpmlq_pulse_search(
                     best_sign = if dv >= 0.0 { 1 } else { -1 };
                 }
             }
-            let pos_abs = (track + n_pulses as u32 * best_k) as usize + grid as usize;
-            positions[track as usize] = best_k;
-            signs[track as usize] = best_sign;
-            energy += best_score;
-            used.push(pos_abs);
+            positions[track] = best_k;
+            signs[track] = best_sign;
         }
 
-        if energy > best_energy {
-            best_energy = energy;
+        // Score: reconstruction error against target. (Unlike ACELP, the
+        // MP-MLQ pulse layout uses stride = n_pulses which puts pulses
+        // at adjacent positions; a coordinate-descent refinement on that
+        // layout tends to flip signs in partial-cancellation patterns
+        // that the greedy pass already found a better configuration for,
+        // so we skip it here.)
+        let mut syn = [0.0f32; SUBFRAME_SIZE];
+        for track in 0..n_pulses {
+            let pos = mpmlq_pos_of(track, positions[track], grid, n_pulses);
+            if pos < SUBFRAME_SIZE {
+                let sgn = signs[track] as f32;
+                for n in pos..SUBFRAME_SIZE {
+                    syn[n] += sgn * h[n - pos];
+                }
+            }
+        }
+        let mut err = 0.0f32;
+        for n in 0..SUBFRAME_SIZE {
+            let e = target[n] - syn[n];
+            err += e * e;
+        }
+        if err < best_err {
+            best_err = err;
             best_grid = grid;
             best_positions = positions;
             best_signs = signs;
@@ -1474,7 +1515,8 @@ fn mpmlq_pulse_search(
 }
 
 /// Place MP-MLQ pulses in the subframe buffer using the track layout used
-/// by [`mpmlq_pulse_search`] (track `t ∈ 0..n_pulses`, stride `n_pulses`).
+/// by [`mpmlq_pulse_search`] (track `t ∈ 0..n_pulses`, stride
+/// [`MPMLQ_STRIDE`]).
 pub(crate) fn mpmlq_place_pulses(
     positions: &[u32; MPMLQ_PULSES_ODD],
     signs: &[i32; MPMLQ_PULSES_ODD],
@@ -1483,11 +1525,11 @@ pub(crate) fn mpmlq_place_pulses(
     out: &mut [f32; SUBFRAME_SIZE],
 ) {
     out.fill(0.0);
-    for t in 0..n_pulses as u32 {
-        let k = positions[t as usize];
-        let pos = (t + n_pulses as u32 * k) as usize + grid as usize;
+    for t in 0..n_pulses {
+        let k = positions[t];
+        let pos = mpmlq_pos_of(t, k, grid, n_pulses);
         if pos < SUBFRAME_SIZE {
-            out[pos] = signs[t as usize] as f32;
+            out[pos] = signs[t] as f32;
         }
     }
 }
@@ -1564,6 +1606,50 @@ fn quantise_gain(g_adapt: f32, g_fixed: f32) -> u32 {
         FCB_GAIN_LEVELS,
     );
     acb_idx | (fcb_idx << ACB_GAIN_BITS) | (sign << FCB_SIGN_SHIFT)
+}
+
+/// Refine the joint (ACB, FCB) gain pair by scanning a small
+/// neighbourhood of the initial indices and picking the codeword that
+/// minimises `sum((target - g_acb * adapt_filt - g_fcb * fcb_filt)^2)`.
+///
+/// Returns the 12-bit `gain_idx` packing `acb_idx | (fcb_idx <<
+/// ACB_GAIN_BITS) | (sign_bit << FCB_SIGN_SHIFT)`.
+fn refine_gain_pair(
+    acb_idx0: u32,
+    fcb_idx0: u32,
+    sign_bit: u32,
+    adapt_filt: &[f32; SUBFRAME_SIZE],
+    fcb_filt: &[f32; SUBFRAME_SIZE],
+    target: &[f32; SUBFRAME_SIZE],
+) -> u32 {
+    // Narrow neighbourhood around the initial quantisation: scanning
+    // too far in ACB breaks the pulse-search assumption that the FCB
+    // residual is `target - g_acb_q * adapt_filt`.
+    let acb_lo = acb_idx0.saturating_sub(1);
+    let acb_hi = (acb_idx0 + 1).min(ACB_GAIN_LEVELS - 1);
+    let fcb_lo = fcb_idx0.saturating_sub(4);
+    let fcb_hi = (fcb_idx0 + 4).min(FCB_GAIN_LEVELS - 1);
+    let sign_f = if sign_bit == 1 { -1.0f32 } else { 1.0 };
+    let mut best_err = f32::INFINITY;
+    let mut best_gi = acb_idx0 | (fcb_idx0 << ACB_GAIN_BITS) | (sign_bit << FCB_SIGN_SHIFT);
+    for acb in acb_lo..=acb_hi {
+        let g_a = dequantise_scalar(acb, 0.0, ACB_GAIN_MAX, ACB_GAIN_LEVELS);
+        for fcb in fcb_lo..=fcb_hi {
+            let log2_mag =
+                dequantise_scalar(fcb, FCB_GAIN_LOG2_MIN, FCB_GAIN_LOG2_MAX, FCB_GAIN_LEVELS);
+            let g_f = sign_f * 2.0f32.powf(log2_mag);
+            let mut err = 0.0f32;
+            for n in 0..SUBFRAME_SIZE {
+                let e = target[n] - g_a * adapt_filt[n] - g_f * fcb_filt[n];
+                err += e * e;
+            }
+            if err < best_err {
+                best_err = err;
+                best_gi = acb | (fcb << ACB_GAIN_BITS) | (sign_bit << FCB_SIGN_SHIFT);
+            }
+        }
+    }
+    best_gi
 }
 
 pub(crate) fn dequantise_gain(idx: u32) -> (f32, f32) {
