@@ -369,22 +369,18 @@ impl G7231Encoder {
 /// kernel, the encoder's analysis is provably in lockstep with what the
 /// decoder renders from the same bitstream.
 struct AnalysisState {
-    /// First-order HPF memory on the raw PCM input.
-    preemph_prev: f32,
     /// Shadow decoder state. `decoder.prev_lsp` is the previous frame's
     /// quantised LSP; `decoder.exc_history` is the excitation buffer that
-    /// will be used for ACB prediction of the next subframe.
+    /// will be used for ACB prediction of the next subframe;
+    /// `decoder.syn_mem` is the synthesis filter memory used to compute
+    /// the zero-input response.
     decoder: SynthesisState,
-    /// Weighted input filter memory for A(z/gamma) on the input side.
-    w_in_mem: [f32; LPC_ORDER],
 }
 
 impl AnalysisState {
     fn new() -> Self {
         Self {
-            preemph_prev: 0.0,
             decoder: SynthesisState::new(),
-            w_in_mem: [0.0; LPC_ORDER],
         }
     }
 
@@ -392,13 +388,11 @@ impl AnalysisState {
         // ---- 1. Pre-process: s16 -> f32 normalised to [-1, 1]. No HPF
         // is applied here because the decoder does not apply an inverse
         // HPF, so matching full-band signals directly keeps analysis and
-        // synthesis in the same signal domain and eliminates an otherwise
-        // unrecoverable 1st-order high-pass loss at reconstruction. ----
+        // synthesis in the same signal domain. ----
         let mut sig = [0.0f32; FRAME_SIZE_SAMPLES];
         for i in 0..FRAME_SIZE_SAMPLES {
             sig[i] = pcm[i] as f32 * (1.0 / 32_768.0);
         }
-        let _ = &self.preemph_prev; // field retained for future pre-emphasis
 
         // ---- 2. LPC analysis on the full 240-sample frame. ----
         let a = lpc_analysis(&sig);
@@ -478,12 +472,19 @@ impl AnalysisState {
             let mut adaptive = [0.0f32; SUBFRAME_SIZE];
             copy_adaptive(&self.decoder.exc_history, decoded_lag, &mut adaptive);
             let adapt_filtered = conv_causal(&adaptive, &h);
-            let g_adapt = lsq_gain(&adapt_filtered, &target).clamp(0.0, ACB_GAIN_MAX);
+            let g_adapt_open = lsq_gain(&adapt_filtered, &target).clamp(0.0, ACB_GAIN_MAX);
 
-            // Residual target after ACB contribution.
+            // Quantise the ACB gain alone so the FCB search sees the
+            // *real* residual the decoder will face after quantisation.
+            let acb_idx = quantise_scalar(g_adapt_open, 0.0, ACB_GAIN_MAX, ACB_GAIN_LEVELS);
+            let g_adapt_q = dequantise_scalar(acb_idx, 0.0, ACB_GAIN_MAX, ACB_GAIN_LEVELS);
+
+            // Residual target for the FCB search, using the quantised
+            // ACB gain so the pulse solver targets what the decoder will
+            // actually need from the FCB path.
             let mut target2 = [0.0f32; SUBFRAME_SIZE];
             for n in 0..SUBFRAME_SIZE {
-                target2[n] = target[n] - g_adapt * adapt_filtered[n];
+                target2[n] = target[n] - g_adapt_q * adapt_filtered[n];
             }
 
             // 4-pulse ACELP search on tracks T0..T3.
@@ -496,12 +497,22 @@ impl AnalysisState {
             pulses_per_subframe[s] = fcb_pulses;
             let fcb_filtered = conv_causal(&fcb_pulses, &h);
 
-            // FCB gain.
+            // FCB gain (optimal unconstrained) — will be quantised next.
             let fcb_mag_ceil = 2.0f32.powf(FCB_GAIN_LOG2_MAX);
             let g_fixed = lsq_gain(&fcb_filtered, &target2).clamp(-fcb_mag_ceil, fcb_mag_ceil);
 
-            // Quantise combined gain.
-            let gi = quantise_gain(g_adapt, g_fixed);
+            // Repack the two half-quantised gains back into the 12-bit
+            // codeword (acb_idx is already quantised; only the FCB sign
+            // and magnitude need quantising here).
+            let sign_bit = if g_fixed < 0.0 { 1u32 } else { 0 };
+            let mag = g_fixed.abs().max(2.0f32.powf(FCB_GAIN_LOG2_MIN));
+            let fcb_idx = quantise_scalar(
+                mag.log2(),
+                FCB_GAIN_LOG2_MIN,
+                FCB_GAIN_LOG2_MAX,
+                FCB_GAIN_LEVELS,
+            );
+            let gi = acb_idx | (fcb_idx << ACB_GAIN_BITS) | (sign_bit << FCB_SIGN_SHIFT);
             gain_idx[s] = gi;
 
             // Advance the shadow decoder for the next subframe's ACB
@@ -555,7 +566,6 @@ impl AnalysisState {
         for i in 0..FRAME_SIZE_SAMPLES {
             sig[i] = pcm[i] as f32 * (1.0 / 32_768.0);
         }
-        let _ = &self.preemph_prev;
 
         // ---- 2. LPC analysis on full frame. ----
         let a = lpc_analysis(&sig);
@@ -607,11 +617,13 @@ impl AnalysisState {
             let mut adaptive = [0.0f32; SUBFRAME_SIZE];
             copy_adaptive(&self.decoder.exc_history, decoded_lag, &mut adaptive);
             let adapt_filtered = conv_causal(&adaptive, &h);
-            let g_adapt = lsq_gain(&adapt_filtered, &target).clamp(0.0, ACB_GAIN_MAX);
+            let g_adapt_open = lsq_gain(&adapt_filtered, &target).clamp(0.0, ACB_GAIN_MAX);
+            let acb_idx = quantise_scalar(g_adapt_open, 0.0, ACB_GAIN_MAX, ACB_GAIN_LEVELS);
+            let g_adapt_q = dequantise_scalar(acb_idx, 0.0, ACB_GAIN_MAX, ACB_GAIN_LEVELS);
 
             let mut target2 = [0.0f32; SUBFRAME_SIZE];
             for n in 0..SUBFRAME_SIZE {
-                target2[n] = target[n] - g_adapt * adapt_filtered[n];
+                target2[n] = target[n] - g_adapt_q * adapt_filtered[n];
             }
 
             let n_pulses = if s % 2 == 0 {
@@ -635,7 +647,15 @@ impl AnalysisState {
             let fcb_mag_ceil = 2.0f32.powf(FCB_GAIN_LOG2_MAX);
             let g_fixed = lsq_gain(&fcb_filtered, &target2).clamp(-fcb_mag_ceil, fcb_mag_ceil);
 
-            let gi = quantise_gain(g_adapt, g_fixed);
+            let sign_bit = if g_fixed < 0.0 { 1u32 } else { 0 };
+            let mag = g_fixed.abs().max(2.0f32.powf(FCB_GAIN_LOG2_MIN));
+            let fcb_idx = quantise_scalar(
+                mag.log2(),
+                FCB_GAIN_LOG2_MIN,
+                FCB_GAIN_LOG2_MAX,
+                FCB_GAIN_LEVELS,
+            );
+            let gi = acb_idx | (fcb_idx << ACB_GAIN_BITS) | (sign_bit << FCB_SIGN_SHIFT);
             gain_idx[s] = gi;
 
             let (g_adapt_q, g_fixed_q) = dequantise_gain(gi);
@@ -998,19 +1018,20 @@ const LSP_BITS_SPLIT_2: [u32; LSP_SPLIT_2] = [2, 2, 2, 2];
 
 /// Per-dim (omega = acos(lsp)) quantisation ranges in radians, over the
 /// full LPC_ORDER=10 vector. Chosen so that typical voiced/unvoiced speech
-/// LSP angles land inside the range and consecutive dims never collide.
+/// LSP angles land inside the range and consecutive dims overlap only
+/// slightly, keeping the monotonicity constraint cheap to enforce.
 #[rustfmt::skip]
 const LSP_OMEGA_RANGES: [(f32, f32); LPC_ORDER] = [
-    (0.08, 0.60),  // dim 0 — first formant region, narrow
-    (0.35, 1.10),  // dim 1
-    (0.70, 1.50),  // dim 2
-    (1.05, 1.75),  // dim 3
-    (1.30, 2.00),  // dim 4
-    (1.55, 2.25),  // dim 5
-    (1.80, 2.45),  // dim 6
-    (2.05, 2.65),  // dim 7
-    (2.30, 2.85),  // dim 8
-    (2.55, 3.05),  // dim 9 — last formant region, up near pi
+    (0.10, 0.45),  // dim 0 — pitch/sub-100 Hz region
+    (0.30, 0.85),  // dim 1 — first formant low
+    (0.55, 1.20),  // dim 2 — first formant high
+    (0.90, 1.55),  // dim 3 — second formant
+    (1.25, 1.85),  // dim 4 — between F2/F3
+    (1.55, 2.15),  // dim 5 — third formant
+    (1.85, 2.40),  // dim 6 — F3/F4 region
+    (2.15, 2.65),  // dim 7 — fourth formant
+    (2.40, 2.85),  // dim 8 — above F4
+    (2.65, 3.05),  // dim 9 — near-pi tail
 ];
 
 /// Return `(start_dim, bits)` for each split in a unified table.
@@ -1044,6 +1065,21 @@ fn quantise_lsp(lsp: &[f32; LPC_ORDER]) -> ([u32; 3], [f32; LPC_ORDER]) {
     }
     let quantised = dequantise_lsp(&idx);
     (idx, quantised)
+}
+
+/// Measure the angle-domain L2 distance from the quantised LSP back to
+/// the unquantised LSP, in radians. Used by tests / diagnostics.
+#[cfg(test)]
+pub(crate) fn lsp_quant_distance(lsp: &[f32; LPC_ORDER]) -> f32 {
+    let (idx, _) = quantise_lsp(lsp);
+    let q = dequantise_lsp(&idx);
+    let mut d = 0.0f32;
+    for i in 0..LPC_ORDER {
+        let o = lsp[i].clamp(-1.0, 1.0).acos();
+        let oq = q[i].clamp(-1.0, 1.0).acos();
+        d += (o - oq).powi(2);
+    }
+    d.sqrt()
 }
 
 pub(crate) fn dequantise_lsp(idx: &[u32; 3]) -> [f32; LPC_ORDER] {
@@ -1094,34 +1130,6 @@ fn dequantise_scalar(q: u32, lo: f32, hi: f32, levels: u32) -> f32 {
 
 // ---------- pitch + ACB ----------
 
-/// Open-loop pitch search on the 60-sample subframe target. The candidate
-/// at lag `L` is the excitation buffer `copy_adaptive(history, L)` — i.e.
-/// *identical* to what the decoder will reconstruct — so the encoder
-/// chooses lags that align with its own reference inverse.
-fn open_loop_pitch(target: &[f32], history: &[f32]) -> i32 {
-    let mut best_score = -f32::INFINITY;
-    let mut best_lag = PITCH_MIN as i32;
-    let mut cand = [0.0f32; SUBFRAME_SIZE];
-    for lag in PITCH_MIN..=PITCH_MAX {
-        copy_adaptive(history, lag as i32, &mut cand);
-        let mut num = 0.0f32;
-        let mut den = 1e-6f32;
-        for n in 0..SUBFRAME_SIZE {
-            num += target[n] * cand[n];
-            den += cand[n] * cand[n];
-        }
-        if den < 1e-6 {
-            continue;
-        }
-        let score = num * num / den;
-        if score > best_score {
-            best_score = score;
-            best_lag = lag as i32;
-        }
-    }
-    best_lag
-}
-
 /// Copy the adaptive codebook excitation for `lag`, handling wrap-around
 /// when `lag < SUBFRAME_SIZE` by re-reading the last `lag` samples
 /// periodically (the standard "periodic excitation" convention).
@@ -1162,67 +1170,150 @@ fn decode_delta_lag(code: u32, prev_lag: i32) -> i32 {
 
 // ---------- ACELP 4-pulse search ----------
 
-/// Four tracks of positions (G.723.1 ACELP §3.5.2). Each track holds
-/// positions on a 5-sample stride; the grid bit selects the even/odd grid.
+/// Four-pulse ACELP fixed-codebook search. Each of the 4 pulses lives on
+/// its own track with stride-8 positions (covering 8 positions per track);
+/// the grid bit shifts all pulses by +4 so the union of both grids spans
+/// all 60 subframe samples.
 ///
-/// Track t has positions t + 5k, k ∈ 0..12 when on the coarse grid.
-/// We use 8 candidate positions per track and 3 position bits per pulse
-/// → 3x4 = 12 position bits + 4 sign bits = 16 bits total.
+/// Track layout (grid 0):
+///
+/// ```text
+///   T0: 0,  8, 16, 24, 32, 40, 48, 56
+///   T1: 1,  9, 17, 25, 33, 41, 49, 57
+///   T2: 2, 10, 18, 26, 34, 42, 50, 58
+///   T3: 3, 11, 19, 27, 35, 43, 51, 59
+/// ```
+///
+/// Grid 1 shifts each position by 4. Combined, every position in
+/// `[0, SUBFRAME_SIZE)` is reachable by exactly one (track, grid, k)
+/// triple — so the 3-bit position code + 1-bit sign per track, plus the
+/// 1-bit grid per subframe, gives full per-sample coverage at the cost
+/// of searching 2 × 4 × 8 = 64 candidates rather than 32.
+///
+/// After the per-track greedy pick, the algorithm does two passes of
+/// coordinate-descent refinement: for each pulse in turn it re-optimises
+/// its (position, sign) given the other three fixed — so pulses that
+/// were sub-optimal because of correlation with another pulse on the
+/// grid get adjusted.
 fn acelp_4pulse_search(target: &[f32; SUBFRAME_SIZE], h: &[f32]) -> ([u32; 4], [i32; 4], u8) {
-    // Pre-compute correlations d[i] = <target, h_i> and H autocorrelation.
-    // h_i[n] = h[n - i] if n >= i, else 0 (causal impulse response
-    // convolved with a unit pulse at position i).
     let d = compute_correlations(target, h);
+    let stride: usize = 8;
+    let positions_per_track: usize = 8;
 
-    // Grid search: try grid=0 and grid=1, keep the better one.
     let mut best_grid = 0u8;
-    let mut best_energy = -f32::INFINITY;
+    let mut best_err = f32::INFINITY;
     let mut best_positions = [0u32; 4];
     let mut best_signs = [1i32; 4];
 
     for grid in 0..2u8 {
-        // Each track t uses positions `t + 5k + grid_offset`.
+        let grid_offset = grid as usize * 4;
+
+        // Pass 1: per-track greedy pick (initial solution).
         let mut positions = [0u32; 4];
         let mut signs = [1i32; 4];
-        let mut energy = 0.0f32;
-        let mut already = Vec::with_capacity(4);
-        for track in 0..4u32 {
-            // Build 8 candidate positions on this track.
+        for track in 0..4usize {
             let mut best_gain2 = 0.0f32;
-            let mut best_pos = 0u32;
+            let mut best_k = 0u32;
             let mut best_sign = 1i32;
-            for k in 0..8u32 {
-                let pos = (track + 5 * k) as usize + grid as usize;
+            for k in 0..positions_per_track {
+                let pos = track + stride * k + grid_offset;
                 if pos >= SUBFRAME_SIZE {
                     continue;
                 }
-                let dv = d[pos];
-                // Approximate gain = d[pos] / sqrt(h_autocorr[pos]).
                 let ap = autocorr_at(h, pos);
                 if ap < 1e-8 {
                     continue;
                 }
-                // Penalise reuse (forbid same position as earlier pulse).
-                if already.contains(&pos) {
-                    continue;
-                }
+                let dv = d[pos];
                 let score = dv * dv / ap;
                 if score > best_gain2 {
                     best_gain2 = score;
-                    best_pos = k;
+                    best_k = k as u32;
                     best_sign = if dv >= 0.0 { 1 } else { -1 };
-                    // (We store k, not pos, to fit the 3-bit code.)
-                    let _ = best_pos;
                 }
             }
-            let pos_abs = (track + 5 * best_pos) as usize + grid as usize;
-            positions[track as usize] = best_pos;
-            signs[track as usize] = best_sign;
-            energy += best_gain2;
-            already.push(pos_abs);
+            positions[track] = best_k;
+            signs[track] = best_sign;
         }
-        if energy > best_energy {
-            best_energy = energy;
+
+        // Pass 2-3: coordinate descent — for each track in turn, fix the
+        // others and pick the (k, sign) that minimises the residual
+        // between the target and the synthesised sum of pulses.
+        for _pass in 0..2 {
+            for track in 0..4usize {
+                let mut others = [0.0f32; SUBFRAME_SIZE];
+                for t2 in 0..4usize {
+                    if t2 == track {
+                        continue;
+                    }
+                    let pos = t2 + stride * positions[t2] as usize + grid_offset;
+                    if pos < SUBFRAME_SIZE {
+                        let sgn = signs[t2] as f32;
+                        for n in pos..SUBFRAME_SIZE {
+                            others[n] += sgn * h[n - pos];
+                        }
+                    }
+                }
+                let mut resid = [0.0f32; SUBFRAME_SIZE];
+                for n in 0..SUBFRAME_SIZE {
+                    resid[n] = target[n] - others[n];
+                }
+                // Find best (k, sign) for this track against resid.
+                let mut best_err2 = f32::INFINITY;
+                let mut best_k = positions[track];
+                let mut best_sign = signs[track];
+                for k in 0..positions_per_track {
+                    let pos = track + stride * k + grid_offset;
+                    if pos >= SUBFRAME_SIZE {
+                        continue;
+                    }
+                    // Best sign at this position minimises |resid - sign*h_pos|^2.
+                    // sign* = sign(<resid, h_pos>); resulting err = |resid|^2 - <resid, h_pos>^2 / |h_pos|^2.
+                    let ap = autocorr_at(h, pos);
+                    if ap < 1e-8 {
+                        continue;
+                    }
+                    let mut corr = 0.0f32;
+                    for n in pos..SUBFRAME_SIZE {
+                        corr += resid[n] * h[n - pos];
+                    }
+                    let sign_v: i32 = if corr >= 0.0 { 1 } else { -1 };
+                    let gain = sign_v as f32 * corr.abs() / ap;
+                    let mut err = 0.0f32;
+                    for n in 0..SUBFRAME_SIZE {
+                        let h_at = if n >= pos { h[n - pos] } else { 0.0 };
+                        let e = resid[n] - gain * h_at;
+                        err += e * e;
+                    }
+                    if err < best_err2 {
+                        best_err2 = err;
+                        best_k = k as u32;
+                        best_sign = sign_v;
+                    }
+                }
+                positions[track] = best_k;
+                signs[track] = best_sign;
+            }
+        }
+
+        // Score this grid: compute reconstruction error.
+        let mut syn = [0.0f32; SUBFRAME_SIZE];
+        for track in 0..4usize {
+            let pos = track + stride * positions[track] as usize + grid_offset;
+            if pos < SUBFRAME_SIZE {
+                let sgn = signs[track] as f32;
+                for n in pos..SUBFRAME_SIZE {
+                    syn[n] += sgn * h[n - pos];
+                }
+            }
+        }
+        let mut err = 0.0f32;
+        for n in 0..SUBFRAME_SIZE {
+            let e = target[n] - syn[n];
+            err += e * e;
+        }
+        if err < best_err {
+            best_err = err;
             best_grid = grid;
             best_positions = positions;
             best_signs = signs;
@@ -1281,19 +1372,22 @@ pub(crate) fn unpack_fcb_bits(v: u32) -> ([u32; 4], [i32; 4]) {
     (positions, signs)
 }
 
-/// Place 4 pulses at positions specified by tracks + grid bit.
+/// Place 4 pulses at positions specified by tracks + grid bit. Must
+/// mirror the layout used by [`acelp_4pulse_search`].
 pub(crate) fn place_pulses(
     positions: &[u32; 4],
     signs: [i32; 4],
     grid: u8,
     out: &mut [f32; SUBFRAME_SIZE],
 ) {
+    let stride: usize = 8;
+    let grid_offset = grid as usize * 4;
     out.fill(0.0);
-    for track in 0..4u32 {
-        let k = positions[track as usize];
-        let pos = (track + 5 * k) as usize + grid as usize;
+    for track in 0..4usize {
+        let k = positions[track] as usize;
+        let pos = track + stride * k + grid_offset;
         if pos < SUBFRAME_SIZE {
-            out[pos] = signs[track as usize] as f32;
+            out[pos] = signs[track] as f32;
         }
     }
 }
@@ -1534,30 +1628,13 @@ fn lsq_gain(pred: &[f32; SUBFRAME_SIZE], target: &[f32]) -> f32 {
     num / den
 }
 
-fn weighted_signal(
-    a: &[f32; LPC_ORDER + 1],
-    sig: &[f32; FRAME_SIZE_SAMPLES],
-    mem: &mut [f32; LPC_ORDER],
-    out: &mut [f32; FRAME_SIZE_SAMPLES],
-) {
-    // A(z/gamma) applied to sig.
-    let aw = bandwidth_expand(a, 0.9);
-    for i in 0..FRAME_SIZE_SAMPLES {
-        let mut acc = sig[i];
-        for k in 0..LPC_ORDER {
-            acc += aw[k + 1] * mem[k];
-        }
-        for k in (1..LPC_ORDER).rev() {
-            mem[k] = mem[k - 1];
-        }
-        mem[0] = sig[i];
-        out[i] = acc;
-    }
-}
-
 /// Advance the 1/A(z) synthesis filter memory with `exc` so cross-subframe
 /// state stays in sync with what the decoder will render.
-fn advance_syn_mem(a: &[f32; LPC_ORDER + 1], exc: &[f32; SUBFRAME_SIZE], mem: &mut [f32; LPC_ORDER]) {
+fn advance_syn_mem(
+    a: &[f32; LPC_ORDER + 1],
+    exc: &[f32; SUBFRAME_SIZE],
+    mem: &mut [f32; LPC_ORDER],
+) {
     for i in 0..SUBFRAME_SIZE {
         let mut s = exc[i];
         for k in 0..LPC_ORDER {
@@ -1853,7 +1930,14 @@ impl SynthesisState {
         }
 
         let mut pcm_f = [0.0f32; FRAME_SIZE_SAMPLES];
-        self.synthesise(&lsp_q, &lags, &grid, &gain, &pulses_per_subframe, &mut pcm_f);
+        self.synthesise(
+            &lsp_q,
+            &lags,
+            &grid,
+            &gain,
+            &pulses_per_subframe,
+            &mut pcm_f,
+        );
         Ok(to_i16_frame(&pcm_f))
     }
 
@@ -1912,7 +1996,14 @@ impl SynthesisState {
         let lags = [lag0, lag1, lag2, lag3];
 
         let mut pcm_f = [0.0f32; FRAME_SIZE_SAMPLES];
-        self.synthesise(&lsp_q, &lags, &grid, &gain, &pulses_per_subframe, &mut pcm_f);
+        self.synthesise(
+            &lsp_q,
+            &lags,
+            &grid,
+            &gain,
+            &pulses_per_subframe,
+            &mut pcm_f,
+        );
         Ok(to_i16_frame(&pcm_f))
     }
 }
@@ -2233,34 +2324,66 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_encode_silence_then_low_tone() {
-        // Isolate which stage blows up the amplitude: start with pure
-        // silence (where encoder pipeline should output near-zero) then
-        // move to a low-amplitude tone and print the first-frame decoded
-        // output amplitude.
+    fn silence_encodes_to_near_silence() {
+        // Regression for the `lsp_to_lpc` p/2 buffer-truncation bug. Two
+        // 30 ms frames of zero PCM should decode to near-zero output —
+        // with the old 6th-order truncated filter the silent LSP had
+        // |h_peak| > 1e19 and the decoder saturated at ±32768. A stable
+        // 10th-order LPC keeps the reconstruction bounded by quantisation
+        // noise (~50 LSBs in practice).
         let mut enc = make_encoder(&params(Some(6300))).unwrap();
         let pcm = vec![0i16; FRAME_SIZE_SAMPLES * 2];
         enc.send_frame(&audio_frame(&pcm)).unwrap();
         enc.flush().unwrap();
         let mut dec = SynthesisState::new();
-        let mut frame_idx = 0;
         while let Ok(pkt) = enc.receive_packet() {
             let out = dec.decode_mpmlq(&pkt.data).unwrap();
             let max = out.iter().map(|&s| s.unsigned_abs()).max().unwrap_or(0);
-            let e: f64 = out.iter().map(|&s| (s as f64).powi(2)).sum();
-            eprintln!("silence frame {frame_idx}: max |s|={max}, energy={e:.3e}");
-            frame_idx += 1;
+            assert!(
+                max < 1000,
+                "silence decoded to max |s|={max}, expected <1000"
+            );
         }
+    }
 
-        // Also check the raw LPC filter gain for the silent default LSP.
-        let silent_lsp = dequantise_lsp(&[0, 0, 0]);
-        let a = lsp_to_lpc(&silent_lsp);
-        let h = impulse_response(&a, 240);
-        let h_peak = h.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-        let h_energy: f32 = h.iter().map(|&v| v * v).sum();
-        eprintln!("silent LSP filter: h_peak={h_peak:.3e} h_energy={h_energy:.3e}");
-        eprintln!("silent LSP cos = {silent_lsp:?}");
-        eprintln!("silent LPC a = {a:?}");
+    #[test]
+    fn acelp_roundtrip_voiced_psnr_floor() {
+        // ACELP (5.3 kbit/s) equivalent of `mpmlq_roundtrip_voiced_psnr_floor`.
+        const FRAMES: usize = 16;
+        let input = voiced_signal(FRAMES);
+        let mut enc = make_encoder(&params(Some(5300))).unwrap();
+        enc.send_frame(&audio_frame(&input)).unwrap();
+        enc.flush().unwrap();
+
+        let mut dec = SynthesisState::new();
+        let mut decoded: Vec<i16> = Vec::with_capacity(FRAMES * FRAME_SIZE_SAMPLES);
+        while let Ok(pkt) = enc.receive_packet() {
+            assert_eq!(pkt.data.len(), ACELP_PAYLOAD_BYTES);
+            assert_eq!(pkt.data[0] & 0b11, 0b01, "discriminator must be 01");
+            decoded.extend_from_slice(&dec.decode_acelp(&pkt.data).unwrap());
+        }
+        assert_eq!(decoded.len(), input.len());
+
+        let n = input.len();
+        let mut mse = 0.0f64;
+        for i in 0..n {
+            let e = decoded[i] as f64 - input[i] as f64;
+            mse += e * e;
+        }
+        mse /= n as f64;
+        let peak = 32_767.0f64;
+        let psnr = 10.0 * (peak * peak / mse).log10();
+        let mut sig_e = 0.0f64;
+        for &s in &input {
+            sig_e += (s as f64).powi(2);
+        }
+        sig_e /= n as f64;
+        let snr = 10.0 * (sig_e / mse.max(1e-10)).log10();
+        eprintln!("acelp_roundtrip_voiced: PSNR = {psnr:.2} dB, SNR = {snr:.2} dB");
+        assert!(
+            psnr >= 15.0,
+            "ACELP voiced-signal PSNR = {psnr:.2} dB, expected >= 15 dB"
+        );
     }
 
     #[test]
@@ -2300,21 +2423,17 @@ mod tests {
         // Documented floor for the simplified codebooks. Observed PSNR is
         // ~6.5 dB on this signal; require at least 0 dB so the test fails
         // loudly only if the pipeline stops producing any signal at all.
-        // Compute signal-energy-based SNR too for diagnosis.
+        // Compute signal-energy SNR too.
         let mut sig_e = 0.0f64;
-        for &s in &input { sig_e += (s as f64).powi(2); }
+        for &s in &input {
+            sig_e += (s as f64).powi(2);
+        }
         sig_e /= n as f64;
         let snr = 10.0 * (sig_e / mse.max(1e-10)).log10();
         eprintln!("mpmlq_roundtrip_voiced: SNR = {snr:.2} dB");
-        // Also print first few samples for correlation check.
-        eprintln!(
-            "mpmlq_roundtrip_voiced: input[240..245]={:?} decoded[240..245]={:?}",
-            &input[240..245],
-            &decoded[240..245],
-        );
         assert!(
-            psnr >= 0.0,
-            "MP-MLQ voiced-signal PSNR = {psnr:.2} dB, expected >= 0 dB"
+            psnr >= 15.0,
+            "MP-MLQ voiced-signal PSNR = {psnr:.2} dB, expected >= 15 dB"
         );
         assert!(psnr.is_finite(), "PSNR must be finite (MSE was {mse})");
         // Emit the measured value so `cargo test -- --nocapture` surfaces

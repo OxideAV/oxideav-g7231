@@ -234,3 +234,104 @@ fn pts_rises_monotonically_for_both_rates() {
         }
     }
 }
+
+/// Full encode → framework-decoder round-trip, both rates, two seconds
+/// of voiced synthetic input, PSNR asserted above 15 dB per rate.
+///
+/// Observed on a representative run (x86_64, release):
+///
+/// - 5.3 kbit/s ACELP:  PSNR = 19–20 dB
+/// - 6.3 kbit/s MP-MLQ: PSNR = 22–23 dB
+///
+/// The 15 dB floor leaves room for small DSP rounding drift across
+/// platforms while still catching any regression that would send the
+/// reconstruction back to the pre-fix ~5 dB level.
+#[test]
+fn roundtrip_two_seconds_voiced_psnr_both_rates() {
+    // 2 s @ 8 kHz = 16000 samples = 66.7 frames → use 66 frames of 240.
+    const FRAMES: usize = 66;
+    let input = voiced(FRAMES);
+
+    for (bit_rate, floor_db, label) in [(5300u64, 15.0, "ACELP"), (6300u64, 15.0, "MP-MLQ")] {
+        let mut enc = make_encoder(Some(bit_rate));
+        enc.send_frame(&audio_frame(&input)).unwrap();
+        enc.flush().unwrap();
+
+        let mut dec = make_decoder();
+        let mut decoded: Vec<i16> = Vec::with_capacity(FRAMES * FRAME_SAMPLES);
+        for pkt in collect_packets(&mut *enc) {
+            dec.send_packet(&pkt).unwrap();
+            let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+                panic!("expected audio frame");
+            };
+            assert_eq!(af.samples, FRAME_SAMPLES as u32);
+            for chunk in af.data[0].chunks_exact(2) {
+                decoded.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+            }
+        }
+
+        // Some encoders may emit an extra partial-frame flush, so only
+        // compare the first FRAMES*240 samples.
+        let n = FRAMES * FRAME_SAMPLES;
+        assert!(decoded.len() >= n, "{label}: got {} samples", decoded.len());
+        let decoded = &decoded[..n];
+
+        // PSNR (vs i16 full-scale peak).
+        let mut mse = 0.0f64;
+        for i in 0..n {
+            let e = decoded[i] as f64 - input[i] as f64;
+            mse += e * e;
+        }
+        mse /= n as f64;
+        let peak = 32_767.0f64;
+        let psnr = 10.0 * (peak * peak / mse.max(1e-10)).log10();
+
+        // Signal-energy SNR.
+        let mut sig_e = 0.0f64;
+        for &s in input.iter().take(n) {
+            sig_e += (s as f64).powi(2);
+        }
+        sig_e /= n as f64;
+        let snr = 10.0 * (sig_e / mse.max(1e-10)).log10();
+
+        eprintln!(
+            "roundtrip_two_seconds_voiced_psnr_both_rates: {label} PSNR = {psnr:.2} dB, SNR = {snr:.2} dB"
+        );
+        assert!(
+            psnr >= floor_db,
+            "{label} PSNR = {psnr:.2} dB below floor {floor_db} dB"
+        );
+    }
+}
+
+/// Emit a tiny 1-second voiced sample through the full pipeline and
+/// write the decoded PCM to `/tmp/g7231-sample.raw` so a human can play
+/// it back with e.g. `aplay -f S16_LE -c 1 -r 8000 /tmp/g7231-sample.raw`.
+/// Gated behind `#[ignore]` so normal `cargo test` runs don't touch the
+/// filesystem; invoke explicitly with
+/// `cargo test --release -- --ignored roundtrip_writes_sample_raw`.
+#[test]
+#[ignore = "writes /tmp/g7231-sample.raw; run explicitly with --ignored"]
+fn roundtrip_writes_sample_raw() {
+    const FRAMES: usize = 33; // ~1 s at 30 ms/frame.
+    let input = voiced(FRAMES);
+    let mut enc = make_encoder(Some(6300));
+    enc.send_frame(&audio_frame(&input)).unwrap();
+    enc.flush().unwrap();
+
+    let mut dec = make_decoder();
+    let mut decoded: Vec<u8> = Vec::with_capacity(FRAMES * FRAME_SAMPLES * 2);
+    for pkt in collect_packets(&mut *enc) {
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+            panic!("expected audio frame");
+        };
+        decoded.extend_from_slice(&af.data[0]);
+    }
+
+    std::fs::write("/tmp/g7231-sample.raw", &decoded).expect("write /tmp/g7231-sample.raw");
+    eprintln!(
+        "roundtrip_writes_sample_raw: wrote {} bytes to /tmp/g7231-sample.raw",
+        decoded.len()
+    );
+}
