@@ -4,8 +4,8 @@
 //!
 //! - 6.3 kbit/s MP-MLQ (24-byte frames, discriminator `00`)
 //! - 5.3 kbit/s ACELP  (20-byte frames, discriminator `01`)
-//! - SID / untransmitted framing accepted (silence output, CNG + erasure
-//!   concealment are future work)
+//! - SID / untransmitted framing handled by a shared erasure concealment
+//!   path (attenuated gains, extrapolated lag, pseudo-random innovation)
 //!
 //! # Encoder pipeline
 //!
@@ -38,10 +38,15 @@
 //! # Decoder
 //!
 //! [`Decoder::send_packet`] dispatches on the rate discriminator and
-//! routes the payload through [`encoder::SynthesisState::decode_acelp`] /
-//! [`encoder::SynthesisState::decode_mpmlq`]. Synthesis state (excitation
-//! history, LPC filter memory, previous-frame LSP) persists across
-//! packets, and `reset()` reinitialises to silence.
+//! routes ACELP / MP-MLQ payloads through the matching
+//! [`encoder::SynthesisState`] entry points. The pipeline is
+//! synthesis → pitch post-filter → formant post-filter
+//! (A(z/γ₁)/A(z/γ₂)) → first-order tilt compensation → smoothed AGC.
+//! SID / untransmitted packets feed [`encoder::SynthesisState::decode_erased`],
+//! which extrapolates the last lag, attenuates the gains on a per-frame
+//! schedule, and seeds a pseudo-random innovation so repeated loss decays
+//! without audible clicks.  Decoder state persists across packets and
+//! `reset()` reinitialises to silence.
 //!
 //! # Not bit-compatible with ITU-T reference tables
 //!
@@ -106,14 +111,18 @@ fn make_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 ///
 /// - `00` → 6.3 kbit/s MP-MLQ, routed through [`encoder::SynthesisState::decode_mpmlq`]
 /// - `01` → 5.3 kbit/s ACELP,  routed through [`encoder::SynthesisState::decode_acelp`]
-/// - `10` → SID (comfort noise) — emits silence for now (future: CNG)
-/// - `11` → Untransmitted (erasure) — emits silence repeating the last
-///          excitation (future: erasure concealment)
+/// - `10` → SID (silence-insertion descriptor) — handled by the same
+///          concealment path as erasures ([`encoder::SynthesisState::decode_erased`])
+///          since we do not yet parse SID parameters
+/// - `11` → Untransmitted (erasure) — [`encoder::SynthesisState::decode_erased`]
+///          extrapolates the last frame with attenuated gains and a
+///          pseudo-random innovation so repeated loss fades smoothly
 ///
 /// State (excitation history, previous-frame LSP, synthesis filter
-/// memory) persists across packets via [`encoder::SynthesisState`] so a
-/// steady stream of packets decodes without per-frame cold-start
-/// transients. `reset()` reinitialises the synthesiser to silence.
+/// memory, post-filter memory) persists across packets via
+/// [`encoder::SynthesisState`] so a steady stream of packets decodes
+/// without per-frame cold-start transients. `reset()` reinitialises the
+/// synthesiser to silence.
 struct G7231Decoder {
     codec_id: CodecId,
     synthesis: encoder::SynthesisState,
@@ -151,18 +160,6 @@ impl G7231Decoder {
         })
     }
 
-    fn silence_frame(&self, pts: Option<i64>) -> Frame {
-        let bytes_len = FRAME_SIZE_SAMPLES * SampleFormat::S16.bytes_per_sample();
-        Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: SAMPLE_RATE_HZ,
-            samples: FRAME_SIZE_SAMPLES as u32,
-            pts,
-            time_base: self.time_base,
-            data: vec![vec![0u8; bytes_len]],
-        })
-    }
 }
 
 impl Decoder for G7231Decoder {
@@ -202,11 +199,14 @@ impl Decoder for G7231Decoder {
                 self.audio_frame_from_pcm(&pcm, pts)
             }
             FrameType::SidFrame | FrameType::Untransmitted => {
-                // Comfort-noise generation / erasure concealment are not
-                // yet wired up; emit silence and leave the synthesis
-                // state untouched so the next real packet resumes
-                // smoothly.
-                self.silence_frame(pts)
+                // Frame erasure / comfort-noise concealment: reuse the
+                // previous-frame LSP, extrapolate the last pitch lag,
+                // attenuate the gains per frame of the erased run, and
+                // drive the synthesis with a pseudo-random innovation so
+                // there's no audible click at the seam. After ~5 erased
+                // frames in a row the concealment fades to silence.
+                let pcm = self.synthesis.decode_erased();
+                self.audio_frame_from_pcm(&pcm, pts)
             }
         };
         self.pending.push_back(frame);

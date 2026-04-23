@@ -63,7 +63,8 @@ use oxideav_core::{
 use crate::bitreader::BitReader;
 use crate::tables::{
     FRAME_SIZE_SAMPLES, HIGH_RATE_BYTES, LOW_RATE_BYTES, LPC_ORDER, PITCH_MAX, PITCH_MIN,
-    SAMPLE_RATE_HZ, SUBFRAMES_PER_FRAME, SUBFRAME_SIZE,
+    POSTFILTER_GAMMA1, POSTFILTER_GAMMA2, POSTFILTER_TILT, SAMPLE_RATE_HZ, SUBFRAMES_PER_FRAME,
+    SUBFRAME_SIZE,
 };
 
 /// Total payload size for an ACELP (5.3 kbit/s) frame.
@@ -1890,10 +1891,37 @@ fn pack_mpmlq_frame(f: &MpMlqFrameFields) -> Vec<u8> {
 /// and [`SynthesisState::decode_mpmlq`] entry points and by the framework-facing
 /// [`crate::G7231Decoder`]. The encoder holds one of these too so that its
 /// analysis-by-synthesis loop sees the exact signal the decoder will.
+///
+/// The post-filter fields (`pf_*`) are updated only on the decoder entry
+/// points and left untouched by the bare [`SynthesisState::synthesise`]
+/// kernel, so the encoder's shadow-decoder pass stays on the pre-post-filter
+/// signal path (what the encoder's analysis-by-synthesis loop needs to see).
 pub struct SynthesisState {
     prev_lsp: [f32; LPC_ORDER],
     exc_history: [f32; PITCH_MAX + SUBFRAME_SIZE],
     syn_mem: [f32; LPC_ORDER],
+    // Post-filter state ---------------------------------------------------
+    /// Pre-post-filter synthesis history. Feeds the pitch post-filter's
+    /// long-term predictor when the current subframe's lag reaches back
+    /// beyond the subframe boundary.
+    pf_syn_hist: [f32; PITCH_MAX + SUBFRAME_SIZE],
+    /// Numerator memory for A(z/γ₁) of the formant post-filter.
+    pf_num_mem: [f32; LPC_ORDER],
+    /// Denominator memory for 1/A(z/γ₂).
+    pf_den_mem: [f32; LPC_ORDER],
+    /// First-order tilt compensation one-sample memory.
+    pf_tilt_prev: f32,
+    /// Smoothed AGC gain, preserving synthesis-signal energy across the
+    /// post-filter chain.
+    pf_agc_gain: f32,
+    // Frame-erasure / SID concealment state -------------------------------
+    /// Last decoded pitch lag — extrapolated during erasures.
+    pf_last_lag: i32,
+    /// Last decoded (g_adapt, g_fixed) — attenuated during erasures.
+    pf_last_gain_adapt: f32,
+    pf_last_gain_fixed: f32,
+    /// Number of consecutive erased frames (0 = good frame most recent).
+    pf_erased_run: u32,
 }
 
 impl SynthesisState {
@@ -1907,6 +1935,15 @@ impl SynthesisState {
             prev_lsp,
             exc_history: [0.0; PITCH_MAX + SUBFRAME_SIZE],
             syn_mem: [0.0; LPC_ORDER],
+            pf_syn_hist: [0.0; PITCH_MAX + SUBFRAME_SIZE],
+            pf_num_mem: [0.0; LPC_ORDER],
+            pf_den_mem: [0.0; LPC_ORDER],
+            pf_tilt_prev: 0.0,
+            pf_agc_gain: 1.0,
+            pf_last_lag: 60,
+            pf_last_gain_adapt: 0.0,
+            pf_last_gain_fixed: 0.0,
+            pf_erased_run: 0,
         }
     }
 
@@ -1963,6 +2000,239 @@ impl SynthesisState {
         self.prev_lsp = *lsp_q;
     }
 
+    /// Record the last frame's lag and gains for frame-erasure
+    /// extrapolation. Called by the decoder entry points *after* they have
+    /// decoded one good frame, so the next erased frame can repeat them.
+    fn record_last_frame(
+        &mut self,
+        lags: &[i32; SUBFRAMES_PER_FRAME],
+        gain_idx: &[u32; SUBFRAMES_PER_FRAME],
+    ) {
+        self.pf_last_lag = lags[SUBFRAMES_PER_FRAME - 1];
+        let (g_a, g_f) = dequantise_gain(gain_idx[SUBFRAMES_PER_FRAME - 1]);
+        self.pf_last_gain_adapt = g_a;
+        self.pf_last_gain_fixed = g_f;
+        self.pf_erased_run = 0;
+    }
+
+    /// Apply the G.723.1 post-filter chain to one subframe:
+    /// pitch-enhancement → formant A(z/γ₁)/A(z/γ₂) → first-order tilt
+    /// compensation → smoothed automatic-gain-control, updating the
+    /// post-filter memories in place. `syn` is the 60-sample synthesis
+    /// output of the current subframe; `lag` is the decoded pitch lag;
+    /// `a_sub` are the unquantised-polynomial LPC coefficients for the
+    /// subframe.
+    ///
+    /// The post-filter runs only on the decoder path; it is deliberately
+    /// separate from [`SynthesisState::synthesise`] so the encoder's shadow
+    /// synth (which needs the raw excitation-domain signal for closed-loop
+    /// analysis) never sees a post-filtered intermediate.
+    fn post_filter_subframe(
+        &mut self,
+        a_sub: &[f32; LPC_ORDER + 1],
+        syn: &[f32; SUBFRAME_SIZE],
+        lag: i32,
+        out: &mut [f32; SUBFRAME_SIZE],
+    ) {
+        // ---- 1. Pitch (long-term) post-filter: y[n] = x[n] + β · x[n - T]
+        // with a small β so we don't amplify LTP tracking errors. Uses the
+        // dedicated synthesis-domain history (`pf_syn_hist`) so the back
+        // reference is spectrally consistent (pre-post-filter).
+        let beta: f32 = 0.2;
+        let lag_u = lag.clamp(PITCH_MIN as i32, PITCH_MAX as i32) as usize;
+        let hist = self.pf_syn_hist;
+        let hlen = hist.len();
+        let mut after_pitch = [0.0f32; SUBFRAME_SIZE];
+        for n in 0..SUBFRAME_SIZE {
+            let past = if n >= lag_u {
+                syn[n - lag_u]
+            } else {
+                let k = lag_u - n;
+                if k <= hlen {
+                    hist[hlen - k]
+                } else {
+                    0.0
+                }
+            };
+            after_pitch[n] = syn[n] + beta * past;
+        }
+
+        // ---- 2. Formant post-filter A(z/γ₁) / A(z/γ₂). γ₁ < γ₂ widens
+        // the formant bandwidth on the numerator and narrows it on the
+        // denominator, emphasising the spectral peaks that carry speech
+        // formants without shifting their centre frequency.
+        let a_num = bandwidth_expand(a_sub, POSTFILTER_GAMMA1);
+        let a_den = bandwidth_expand(a_sub, POSTFILTER_GAMMA2);
+        let mut after_formant = [0.0f32; SUBFRAME_SIZE];
+        for n in 0..SUBFRAME_SIZE {
+            let x = after_pitch[n];
+            // y[n] = x[n] + Σ a_num[k] · x_hist[k] - Σ a_den[k] · y_hist[k]
+            let mut y = x;
+            for k in 0..LPC_ORDER {
+                y += a_num[k + 1] * self.pf_num_mem[k];
+            }
+            for k in 0..LPC_ORDER {
+                y -= a_den[k + 1] * self.pf_den_mem[k];
+            }
+            for k in (1..LPC_ORDER).rev() {
+                self.pf_num_mem[k] = self.pf_num_mem[k - 1];
+                self.pf_den_mem[k] = self.pf_den_mem[k - 1];
+            }
+            self.pf_num_mem[0] = x;
+            self.pf_den_mem[0] = y;
+            after_formant[n] = y;
+        }
+
+        // ---- 3. First-order tilt compensation: y[n] = x[n] − μ · x[n-1].
+        // Flattens the slight low-frequency boost introduced by the formant
+        // stage so the post-filter output has the same spectral tilt as the
+        // synthesis input.
+        let mut after_tilt = [0.0f32; SUBFRAME_SIZE];
+        let mut prev = self.pf_tilt_prev;
+        for n in 0..SUBFRAME_SIZE {
+            let x = after_formant[n];
+            after_tilt[n] = x - POSTFILTER_TILT * prev;
+            prev = x;
+        }
+        self.pf_tilt_prev = prev;
+
+        // ---- 4. Smoothed AGC: target `post-filter output energy` =
+        // `synthesis input energy` so the chain doesn't pump the level.
+        // The per-subframe gain is smoothed exponentially across samples
+        // (α = 0.85) to avoid audible gain steps at subframe boundaries.
+        let mut e_in = 1e-6f32;
+        let mut e_out = 1e-6f32;
+        for n in 0..SUBFRAME_SIZE {
+            e_in += syn[n] * syn[n];
+            e_out += after_tilt[n] * after_tilt[n];
+        }
+        let target_gain = (e_in / e_out).sqrt().clamp(0.0, 4.0);
+        let alpha = 0.85f32;
+        for n in 0..SUBFRAME_SIZE {
+            self.pf_agc_gain = alpha * self.pf_agc_gain + (1.0 - alpha) * target_gain;
+            out[n] = after_tilt[n] * self.pf_agc_gain;
+        }
+
+        // Advance the post-filter synthesis-domain history with this
+        // subframe's *pre*-post-filter samples.
+        self.pf_syn_hist.rotate_left(SUBFRAME_SIZE);
+        let tail = self.pf_syn_hist.len() - SUBFRAME_SIZE;
+        self.pf_syn_hist[tail..].copy_from_slice(syn);
+    }
+
+    /// Run the post-filter across a full frame. `pcm` is the synthesis-
+    /// filter output in `[-1, 1]`-normalised f32. `lsp_q`/`lags` match the
+    /// decoded frame fields so per-subframe formant filters have the right
+    /// LPC coefficients.
+    fn apply_post_filter(
+        &mut self,
+        lsp_q: &[f32; LPC_ORDER],
+        lags: &[i32; SUBFRAMES_PER_FRAME],
+        pcm: &mut [f32; FRAME_SIZE_SAMPLES],
+    ) {
+        // The synthesise() pass already advanced self.prev_lsp to lsp_q;
+        // for per-subframe LPC we must re-interpolate against what *was*
+        // the previous LSP, so we reconstruct it from self.prev_lsp (which
+        // is the current frame's quantised LSP at this point — same for
+        // all subframes).  We pass `lsp_q` as both prev and cur so the
+        // interpolation degenerates to the per-subframe current value;
+        // this is a deliberate simplification — the post-filter only needs
+        // LPC coefficients that are close enough to the synthesis filter
+        // in the same subframe, not the precise interpolated curve.
+        for s in 0..SUBFRAMES_PER_FRAME {
+            let lsp_interp = interpolate_lsp(s, lsp_q, lsp_q);
+            let a_sub = lsp_to_lpc(&lsp_interp);
+            let start = s * SUBFRAME_SIZE;
+            let end = start + SUBFRAME_SIZE;
+            let mut syn = [0.0f32; SUBFRAME_SIZE];
+            syn.copy_from_slice(&pcm[start..end]);
+            let mut post = [0.0f32; SUBFRAME_SIZE];
+            self.post_filter_subframe(&a_sub, &syn, lags[s], &mut post);
+            pcm[start..end].copy_from_slice(&post);
+        }
+    }
+
+    /// Concealment path for SID / erased packets. Extrapolates the last
+    /// lag, attenuates the gains, seeds a pseudo-random innovation, runs
+    /// the usual synthesis + post-filter pipeline, and leaves attenuated
+    /// gains in `pf_last_gain_*` so repeated erasures decay smoothly.
+    ///
+    /// Returns 240 concealed S16 samples.
+    pub fn decode_erased(&mut self) -> [i16; FRAME_SIZE_SAMPLES] {
+        self.pf_erased_run = self.pf_erased_run.saturating_add(1);
+        // Attenuation schedule: halve per frame for the first few erasures,
+        // then mute. Anything louder would make repeated packet loss
+        // audible as "buzzing".
+        let atten = match self.pf_erased_run {
+            1 => 0.7f32,
+            2 => 0.5,
+            3 => 0.35,
+            4 => 0.2,
+            _ => 0.0,
+        };
+        let g_adapt = self.pf_last_gain_adapt * atten;
+        let g_fixed = self.pf_last_gain_fixed * atten;
+        let lsp_q = self.prev_lsp;
+        let lag = self.pf_last_lag.clamp(PITCH_MIN as i32, PITCH_MAX as i32);
+
+        // Pseudo-random innovation (deterministic LCG) so concealment is
+        // reproducible and doesn't introduce a tonal artefact.
+        let mut lcg = 0xDEADBEEFu32.wrapping_add(self.pf_erased_run.wrapping_mul(0x9E37_79B9));
+        let mut next_rand = || -> f32 {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((lcg >> 8) & 0xFFFF) as f32 / 32_768.0 - 1.0
+        };
+
+        let mut pcm = [0.0f32; FRAME_SIZE_SAMPLES];
+        // Run four subframes manually so we bypass the usual gain-dequant
+        // step (we already know g_adapt / g_fixed in fp form).
+        for s in 0..SUBFRAMES_PER_FRAME {
+            let lsp_interp = interpolate_lsp(s, &self.prev_lsp, &lsp_q);
+            let a_sub = lsp_to_lpc(&lsp_interp);
+
+            let mut adaptive = [0.0f32; SUBFRAME_SIZE];
+            copy_adaptive(&self.exc_history, lag, &mut adaptive);
+            let mut pulses = [0.0f32; SUBFRAME_SIZE];
+            for n in 0..SUBFRAME_SIZE {
+                pulses[n] = next_rand();
+            }
+            let mut exc = [0.0f32; SUBFRAME_SIZE];
+            for n in 0..SUBFRAME_SIZE {
+                exc[n] = g_adapt * adaptive[n] + g_fixed * pulses[n];
+            }
+
+            // 1/A(z) synthesis.
+            let mut syn = [0.0f32; SUBFRAME_SIZE];
+            for i in 0..SUBFRAME_SIZE {
+                let mut y = exc[i];
+                for k in 0..LPC_ORDER {
+                    y -= a_sub[k + 1] * self.syn_mem[k];
+                }
+                for k in (1..LPC_ORDER).rev() {
+                    self.syn_mem[k] = self.syn_mem[k - 1];
+                }
+                self.syn_mem[0] = y;
+                syn[i] = y;
+            }
+            // Post-filter.
+            let mut post = [0.0f32; SUBFRAME_SIZE];
+            self.post_filter_subframe(&a_sub, &syn, lag, &mut post);
+            let start = s * SUBFRAME_SIZE;
+            pcm[start..start + SUBFRAME_SIZE].copy_from_slice(&post);
+
+            // Advance excitation history with the concealed excitation.
+            self.exc_history.rotate_left(SUBFRAME_SIZE);
+            let tail = self.exc_history.len() - SUBFRAME_SIZE;
+            self.exc_history[tail..].copy_from_slice(&exc);
+        }
+
+        // Decay gains in place for the next erasure in a run.
+        self.pf_last_gain_adapt = g_adapt;
+        self.pf_last_gain_fixed = g_fixed;
+
+        to_i16_frame(&pcm)
+    }
+
     /// Decode one ACELP (5.3 kbit/s) frame into 240 PCM samples.
     pub fn decode_acelp(&mut self, payload: &[u8]) -> Result<[i16; FRAME_SIZE_SAMPLES]> {
         if payload.len() < ACELP_PAYLOAD_BYTES {
@@ -2017,6 +2287,12 @@ impl SynthesisState {
             &pulses_per_subframe,
             &mut pcm_f,
         );
+        // Post-filter chain: pitch + formant + tilt + AGC. Updates the
+        // `pf_*` post-filter memories; leaves `synthesise`'s state (exc
+        // history / syn_mem / prev_lsp) alone so the encoder's shadow
+        // synth sees the unmodified signal.
+        self.apply_post_filter(&lsp_q, &lags, &mut pcm_f);
+        self.record_last_frame(&lags, &gain);
         Ok(to_i16_frame(&pcm_f))
     }
 
@@ -2083,6 +2359,9 @@ impl SynthesisState {
             &pulses_per_subframe,
             &mut pcm_f,
         );
+        // Same post-filter pipeline as ACELP (pitch + formant + tilt + AGC).
+        self.apply_post_filter(&lsp_q, &lags, &mut pcm_f);
+        self.record_last_frame(&lags, &gain);
         Ok(to_i16_frame(&pcm_f))
     }
 }
@@ -2575,5 +2854,46 @@ mod tests {
         let (g_a, g_f) = dequantise_gain(idx);
         assert!((g_a - 0.48).abs() < 0.2); // 3-bit quantiser has ~0.16 step
         assert!(g_f < 0.0);
+    }
+
+    /// Post-filter AGC must preserve energy: decoded PCM energy for a
+    /// voiced input should be within a small factor of the pre-post-filter
+    /// synthesis energy. We measure this indirectly by asserting the
+    /// post-filter doesn't cause the decoded SNR floor to regress (covered
+    /// by `roundtrip_two_seconds_voiced_psnr_both_rates` in the
+    /// integration tests) and here check that the AGC state starts at
+    /// unity gain on a fresh state.
+    #[test]
+    fn post_filter_state_starts_at_unity_agc() {
+        let st = SynthesisState::new();
+        assert_eq!(st.pf_agc_gain, 1.0);
+        assert_eq!(st.pf_erased_run, 0);
+    }
+
+    /// Erased-frame concealment: a SID / Untransmitted frame must produce
+    /// a full 240-sample frame that decays with run length. The first
+    /// erasure keeps the gain close to the last good frame's; by the 5th
+    /// erasure the gain is fully muted.
+    #[test]
+    fn decode_erased_produces_decaying_output() {
+        let mut st = SynthesisState::new();
+        st.pf_last_gain_adapt = 0.5;
+        st.pf_last_gain_fixed = 0.2;
+        // Seed the excitation history so there's something to propagate.
+        for i in 0..st.exc_history.len() {
+            st.exc_history[i] = ((i as f32 * 0.17).sin()) * 0.1;
+        }
+        let e1 = st.decode_erased();
+        assert_eq!(e1.len(), FRAME_SIZE_SAMPLES);
+        assert_eq!(st.pf_erased_run, 1);
+
+        // Run a handful more to confirm repeated erasure decays and never
+        // panics. (Samples are i16, trivially finite.)
+        for _ in 0..10 {
+            let ek = st.decode_erased();
+            let _ = ek;
+        }
+        assert_eq!(st.pf_last_gain_adapt, 0.0);
+        assert_eq!(st.pf_last_gain_fixed, 0.0);
     }
 }

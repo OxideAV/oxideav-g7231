@@ -212,6 +212,103 @@ fn framework_decoder_accepts_sid_and_untransmitted() -> Result<()> {
     Ok(())
 }
 
+/// Frame erasure concealment: dropping one packet in the middle of a
+/// voiced stream must produce a concealed frame that (a) has non-zero
+/// energy (so the listener doesn't hear a momentary silence hole), and
+/// (b) the following good packet must decode cleanly — overall PSNR
+/// stays above 10 dB, well above "broken".
+#[test]
+fn erasure_in_middle_of_stream_is_concealed() {
+    const FRAMES: usize = 12;
+    let input = voiced(FRAMES);
+    let mut enc = make_encoder(Some(6300));
+    enc.send_frame(&audio_frame(&input)).unwrap();
+    enc.flush().unwrap();
+
+    let mut dec = make_decoder();
+    let packets = collect_packets(&mut *enc);
+    let mut decoded: Vec<i16> = Vec::with_capacity(FRAMES * FRAME_SAMPLES);
+    let erased_idx = 6; // drop the 7th frame
+    let mut concealed_energy = 0.0f64;
+    for (i, pkt) in packets.iter().enumerate() {
+        if i == erased_idx {
+            // Substitute an untransmitted packet so the decoder runs
+            // concealment.
+            dec.send_packet(&packet(vec![0b11])).unwrap();
+            let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+                panic!("expected audio frame");
+            };
+            for chunk in af.data[0].chunks_exact(2) {
+                let s = i16::from_le_bytes([chunk[0], chunk[1]]) as f64;
+                concealed_energy += s * s;
+                decoded.push(s as i16);
+            }
+            continue;
+        }
+        dec.send_packet(pkt).unwrap();
+        let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+            panic!("expected audio frame");
+        };
+        for chunk in af.data[0].chunks_exact(2) {
+            decoded.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+        }
+    }
+
+    // The concealed frame should carry some signal energy (not zero
+    // silence) for the first erased frame in a run; the attenuation
+    // schedule applies from the first frame at 0.7× so energy should be
+    // well above zero.
+    assert!(
+        concealed_energy > 0.0,
+        "concealed frame is pure silence ({concealed_energy})"
+    );
+
+    // And the overall decoded signal must remain coherent with the input.
+    let mut mse = 0.0f64;
+    for i in 0..decoded.len() {
+        let e = decoded[i] as f64 - input[i] as f64;
+        mse += e * e;
+    }
+    mse /= decoded.len() as f64;
+    let psnr = 10.0 * (32_767.0f64.powi(2) / mse.max(1e-10)).log10();
+    assert!(psnr > 10.0, "PSNR after erasure {psnr:.2} dB, expected > 10");
+}
+
+/// A long run of erasures must eventually decay to silence (the
+/// concealment attenuation schedule mutes after ~5 frames). Verifies the
+/// decoder doesn't emit a buzzing runaway when the network drops many
+/// packets in a row.
+#[test]
+fn sustained_erasure_run_decays_to_silence() {
+    let mut dec = make_decoder();
+    // Prime the decoder with a single good MP-MLQ frame.
+    let mut enc = make_encoder(Some(6300));
+    enc.send_frame(&audio_frame(&voiced(1))).unwrap();
+    enc.flush().unwrap();
+    for pkt in collect_packets(&mut *enc) {
+        dec.send_packet(&pkt).unwrap();
+        let _ = dec.receive_frame().unwrap();
+    }
+
+    // Drop 10 frames in a row.
+    let mut energies = Vec::new();
+    for _ in 0..10 {
+        dec.send_packet(&packet(vec![0b11])).unwrap();
+        let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+            panic!("expected audio frame");
+        };
+        let mut e = 0.0f64;
+        for chunk in af.data[0].chunks_exact(2) {
+            let s = i16::from_le_bytes([chunk[0], chunk[1]]) as f64;
+            e += s * s;
+        }
+        energies.push(e);
+    }
+    // The last erasures in the run must be effectively silent.
+    let late = energies[5..].iter().sum::<f64>();
+    assert!(late < 1e6, "late erasure energy {late} did not mute");
+}
+
 #[test]
 fn framework_decoder_rejects_short_high_rate_frame() {
     let mut dec = make_decoder();
