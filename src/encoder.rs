@@ -53,9 +53,9 @@
 
 use std::collections::VecDeque;
 
-use oxideav_codec::Encoder;
 #[cfg(test)]
 use oxideav_core::AudioFrame;
+use oxideav_core::Encoder;
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, MediaType, Packet, Result, SampleFormat, TimeBase,
 };
@@ -2515,7 +2515,7 @@ mod tests {
         let pcm = sine_mixture(2);
         enc.send_frame(&audio_frame(&pcm)).unwrap();
 
-        let mut reg = oxideav_codec::CodecRegistry::new();
+        let mut reg = oxideav_core::CodecRegistry::new();
         crate::register(&mut reg);
         let mut dec = reg
             .make_decoder(&params(None))
@@ -2543,7 +2543,7 @@ mod tests {
         let pcm = sine_mixture(2);
         enc.send_frame(&audio_frame(&pcm)).unwrap();
 
-        let mut reg = oxideav_codec::CodecRegistry::new();
+        let mut reg = oxideav_core::CodecRegistry::new();
         crate::register(&mut reg);
         let mut dec = reg
             .make_decoder(&params(None))

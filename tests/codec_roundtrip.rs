@@ -15,11 +15,11 @@
 //!      framing contract (rate discriminator, payload lengths, PTS) that
 //!      any future full decoder must satisfy.
 
-use oxideav_codec::{CodecRegistry, Decoder, Encoder};
 use oxideav_core::packet::PacketFlags;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Frame, Packet, Rational, Result, SampleFormat, TimeBase,
 };
+use oxideav_core::{CodecRegistry, Decoder, Encoder};
 use oxideav_g7231::encoder::{decode_acelp_local, decode_mpmlq_local};
 use oxideav_g7231::CODEC_ID_STR;
 
@@ -271,7 +271,10 @@ fn erasure_in_middle_of_stream_is_concealed() {
     }
     mse /= decoded.len() as f64;
     let psnr = 10.0 * (32_767.0f64.powi(2) / mse.max(1e-10)).log10();
-    assert!(psnr > 10.0, "PSNR after erasure {psnr:.2} dB, expected > 10");
+    assert!(
+        psnr > 10.0,
+        "PSNR after erasure {psnr:.2} dB, expected > 10"
+    );
 }
 
 /// A long run of erasures must eventually decay to silence (the

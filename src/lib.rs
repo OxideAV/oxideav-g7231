@@ -75,11 +75,11 @@ pub mod header;
 pub mod synthesis;
 pub mod tables;
 
-use oxideav_codec::{CodecInfo, CodecRegistry, Decoder};
 use oxideav_core::{
     AudioFrame, CodecCapabilities, CodecId, CodecParameters, CodecTag, Error, Frame, Packet,
     Rational, Result, SampleFormat, TimeBase,
 };
+use oxideav_core::{CodecInfo, CodecRegistry, Decoder};
 
 use crate::header::{parse_frame_type, FrameType};
 use crate::tables::{FRAME_SIZE_SAMPLES, SAMPLE_RATE_HZ};
@@ -159,7 +159,6 @@ impl G7231Decoder {
             data: vec![bytes],
         })
     }
-
 }
 
 impl Decoder for G7231Decoder {
