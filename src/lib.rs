@@ -77,7 +77,7 @@ pub mod tables;
 
 use oxideav_core::{
     AudioFrame, CodecCapabilities, CodecId, CodecParameters, CodecTag, Error, Frame, Packet,
-    Rational, Result, SampleFormat, TimeBase,
+    Rational, Result, TimeBase,
 };
 use oxideav_core::{CodecInfo, CodecRegistry, Decoder};
 

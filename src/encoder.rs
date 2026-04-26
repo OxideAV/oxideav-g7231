@@ -2401,7 +2401,7 @@ pub fn decode_mpmlq_local(payload: &[u8]) -> Result<Vec<i16>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_core::{CodecId, CodecParameters, Frame, SampleFormat, TimeBase};
+    use oxideav_core::{CodecId, CodecParameters, Frame, SampleFormat};
 
     fn params(bit_rate: Option<u64>) -> CodecParameters {
         let mut p = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
