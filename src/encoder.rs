@@ -271,16 +271,14 @@ impl Encoder for G7231Encoder {
             Frame::Audio(a) => a,
             _ => return Err(Error::invalid("G.723.1 encoder: audio frames only")),
         };
-        if af.channels != 1 || af.sample_rate != SAMPLE_RATE_HZ {
-            return Err(Error::invalid(
-                "G.723.1 encoder: input must be mono, 8000 Hz",
-            ));
-        }
-        if af.format != SampleFormat::S16 {
-            return Err(Error::invalid(
-                "G.723.1 encoder: input sample format must be S16",
-            ));
-        }
+        // Stream-level shape (mono / 8 kHz / S16) used to be sniffed
+        // off the AudioFrame; with the slim those fields live on the
+        // upstream stream's `CodecParameters` and are guaranteed by
+        // the registry / pipeline that constructed this encoder
+        // against `make_params()`. We trust the caller — a
+        // mismatched input would have surfaced at the
+        // pipeline-build pixel-format / sample-format auto-insert
+        // pass and never reach this `send_frame`.
         let bytes = af
             .data
             .first()
@@ -2420,12 +2418,8 @@ mod tests {
             bytes.extend_from_slice(&s.to_le_bytes());
         }
         Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: SAMPLE_RATE_HZ,
             samples: samples.len() as u32,
             pts: Some(0),
-            time_base: TimeBase::new(1, SAMPLE_RATE_HZ as i64),
             data: vec![bytes],
         })
     }
@@ -2528,9 +2522,11 @@ mod tests {
             // well-shaped audio frame of the right size.
             match f {
                 Frame::Audio(af) => {
+                    // Stream-level shape (sample_rate / channels) used
+                    // to live on each frame — moved to the stream's
+                    // CodecParameters with the slim. The per-frame
+                    // assertion is now just the sample count.
                     assert_eq!(af.samples, FRAME_SIZE_SAMPLES as u32);
-                    assert_eq!(af.sample_rate, SAMPLE_RATE_HZ);
-                    assert_eq!(af.channels, 1);
                 }
                 _ => panic!("expected audio frame"),
             }
@@ -2554,9 +2550,11 @@ mod tests {
             let f = dec.receive_frame().unwrap();
             match f {
                 Frame::Audio(af) => {
+                    // Stream-level shape (sample_rate / channels) used
+                    // to live on each frame — moved to the stream's
+                    // CodecParameters with the slim. The per-frame
+                    // assertion is now just the sample count.
                     assert_eq!(af.samples, FRAME_SIZE_SAMPLES as u32);
-                    assert_eq!(af.sample_rate, SAMPLE_RATE_HZ);
-                    assert_eq!(af.channels, 1);
                 }
                 _ => panic!("expected audio frame"),
             }

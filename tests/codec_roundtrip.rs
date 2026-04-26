@@ -50,13 +50,12 @@ fn audio_frame(samples: &[i16]) -> Frame {
     for &s in samples {
         bytes.extend_from_slice(&s.to_le_bytes());
     }
+    // Stream-level shape (S16 / mono / 8 kHz / time_base) lives on the
+    // stream's CodecParameters now; the encoder reads them off
+    // make_params() at construction.
     Frame::Audio(AudioFrame {
-        format: SampleFormat::S16,
-        channels: 1,
-        sample_rate: SAMPLE_RATE,
         samples: samples.len() as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, SAMPLE_RATE as i64),
         data: vec![bytes],
     })
 }
@@ -183,9 +182,15 @@ fn framework_decoder_consumes_both_rates() -> Result<()> {
             match f {
                 Frame::Audio(af) => {
                     assert_eq!(af.samples, FRAME_SAMPLES as u32);
-                    assert_eq!(af.sample_rate, SAMPLE_RATE);
-                    assert_eq!(af.channels, 1);
-                    assert_eq!(af.format, SampleFormat::S16);
+                    // Stream-level shape (sample_rate / channels /
+                    // format) used to live on the frame; with the
+                    // slim it lives on the stream's
+                    // `CodecParameters` and is set by the registry
+                    // factory off `make_params()`. The per-frame
+                    // contract here is just the sample count + byte
+                    // payload.
+                    assert_eq!(af.data.len(), 1);
+                    assert_eq!(af.data[0].len(), FRAME_SAMPLES * 2);
                 }
                 _ => panic!("expected audio frame"),
             }

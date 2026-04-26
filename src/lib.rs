@@ -149,13 +149,13 @@ impl G7231Decoder {
         for &s in pcm {
             bytes.extend_from_slice(&s.to_le_bytes());
         }
+        // Stream-level shape (S16 / mono / 8 kHz / time_base) lives on
+        // the stream's CodecParameters now, not per-frame. The
+        // decoder's `output_params` (synthesised in `Decoder::params`)
+        // surfaces it.
         Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: SAMPLE_RATE_HZ,
             samples: FRAME_SIZE_SAMPLES as u32,
             pts,
-            time_base: self.time_base,
             data: vec![bytes],
         })
     }
@@ -275,10 +275,12 @@ mod tests {
         let Frame::Audio(af) = dec.receive_frame().unwrap() else {
             panic!("expected audio frame");
         };
-        assert_eq!(af.sample_rate, SAMPLE_RATE_HZ);
-        assert_eq!(af.channels, 1);
+        // Stream-level shape (sample_rate / channels / format) used to
+        // be on the frame; with the slim it lives on the stream's
+        // `CodecParameters`. The factory builds those off
+        // `params_for_codec()` (8 kHz mono S16) — checked separately
+        // below. Here we only assert the per-frame sample contract.
         assert_eq!(af.samples, FRAME_SIZE_SAMPLES as u32);
-        assert_eq!(af.format, SampleFormat::S16);
         assert_eq!(af.data.len(), 1);
         assert_eq!(af.data[0].len(), FRAME_SIZE_SAMPLES * 2);
     }
@@ -291,8 +293,19 @@ mod tests {
         data[0] = 0b01;
         let pkt = packet(data);
         dec.send_packet(&pkt).unwrap();
-        let f = dec.receive_frame().unwrap();
-        assert_eq!(f.time_base().as_rational().den, SAMPLE_RATE_HZ as i64);
+        let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+            panic!("expected audio frame");
+        };
+        // The pre-slim assertion was
+        // `f.time_base().as_rational().den == SAMPLE_RATE_HZ`. With
+        // the slim there's no per-frame time_base and no
+        // `time_base()` accessor. The semantic equivalent is "the
+        // decoder produces a 240-sample frame at 8 kHz" — checked
+        // here via `samples` (which the decoder carries on every
+        // emitted AudioFrame). The encoder-side params ctor
+        // (`params_for_codec`) confirms 8 kHz / mono / S16 lives on
+        // the stream's CodecParameters.
+        assert_eq!(af.samples, FRAME_SIZE_SAMPLES as u32);
     }
 
     #[test]
