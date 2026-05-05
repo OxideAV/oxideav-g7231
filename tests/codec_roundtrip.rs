@@ -41,7 +41,7 @@ fn make_encoder(bit_rate: Option<u64>) -> Box<dyn Encoder> {
 
 fn make_decoder() -> Box<dyn Decoder> {
     let mut reg = CodecRegistry::new();
-    oxideav_g7231::register(&mut reg);
+    oxideav_g7231::register_codecs(&mut reg);
     reg.make_decoder(&make_params(None)).expect("decoder ctor")
 }
 

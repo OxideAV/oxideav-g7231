@@ -86,7 +86,7 @@ use crate::tables::{FRAME_SIZE_SAMPLES, SAMPLE_RATE_HZ};
 
 pub const CODEC_ID_STR: &str = "g723_1";
 
-pub fn register(reg: &mut CodecRegistry) {
+pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::audio("g723_1_sw")
         .with_lossy(true)
         .with_intra_only(false)
@@ -100,6 +100,12 @@ pub fn register(reg: &mut CodecRegistry) {
             .encoder(encoder::make_encoder)
             .tag(CodecTag::wave_format(0x0014)),
     );
+}
+
+/// Unified registration entry point — installs G.723.1 into the codec
+/// sub-registry of the supplied [`oxideav_core::RuntimeContext`].
+pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
 }
 
 fn make_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
@@ -256,9 +262,24 @@ mod tests {
     #[test]
     fn registers_in_registry() {
         let mut reg = CodecRegistry::new();
-        register(&mut reg);
+        register_codecs(&mut reg);
         assert!(reg.has_decoder(&CodecId::new(CODEC_ID_STR)));
         assert!(reg.has_encoder(&CodecId::new(CODEC_ID_STR)));
+    }
+
+    #[test]
+    fn register_via_runtime_context_installs_codec_factory() {
+        let mut ctx = oxideav_core::RuntimeContext::new();
+        register(&mut ctx);
+        let id = CodecId::new(CODEC_ID_STR);
+        assert!(
+            ctx.codecs.has_decoder(&id),
+            "decoder factory not installed via RuntimeContext"
+        );
+        assert!(
+            ctx.codecs.has_encoder(&id),
+            "encoder factory not installed via RuntimeContext"
+        );
     }
 
     #[test]

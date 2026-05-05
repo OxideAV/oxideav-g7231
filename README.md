@@ -113,13 +113,12 @@ separate piece of work from what this crate provides today.
 ## Quick use
 
 ```rust
-use oxideav_codec::CodecRegistry;
 use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Frame, SampleFormat, TimeBase,
+    AudioFrame, CodecId, CodecParameters, Frame, RuntimeContext, SampleFormat, TimeBase,
 };
 
-let mut reg = CodecRegistry::new();
-oxideav_g7231::register(&mut reg);
+let mut ctx = RuntimeContext::new();
+oxideav_g7231::register(&mut ctx);
 
 let mut params = CodecParameters::audio(CodecId::new(oxideav_g7231::CODEC_ID_STR));
 params.sample_rate = Some(8_000);
@@ -127,7 +126,7 @@ params.channels = Some(1);
 params.sample_format = Some(SampleFormat::S16);
 params.bit_rate = Some(6_300); // or Some(5_300) for ACELP
 
-let mut enc = reg.make_encoder(&params)?;
+let mut enc = ctx.codecs.make_encoder(&params)?;
 
 // 240 S16 samples = one 30 ms frame.
 let pcm = vec![0i16; 240];

@@ -2510,7 +2510,7 @@ mod tests {
         enc.send_frame(&audio_frame(&pcm)).unwrap();
 
         let mut reg = oxideav_core::CodecRegistry::new();
-        crate::register(&mut reg);
+        crate::register_codecs(&mut reg);
         let mut dec = reg
             .make_decoder(&params(None))
             .expect("decoder factory must exist");
@@ -2540,7 +2540,7 @@ mod tests {
         enc.send_frame(&audio_frame(&pcm)).unwrap();
 
         let mut reg = oxideav_core::CodecRegistry::new();
-        crate::register(&mut reg);
+        crate::register_codecs(&mut reg);
         let mut dec = reg
             .make_decoder(&params(None))
             .expect("decoder factory must exist");
