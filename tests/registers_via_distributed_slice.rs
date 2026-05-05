@@ -25,9 +25,10 @@ fn g7231_self_registers_into_runtime_context_via_slice() {
     let ctx = RuntimeContext::with_all_features();
     let id = CodecId::new(oxideav_g7231::CODEC_ID_STR);
     let params = CodecParameters::audio(id);
-    let _decoder = ctx.codecs.make_decoder(&params).expect(
-        "g7231 decoder factory should be installed via the linkme slice walker",
-    );
+    let _decoder = ctx
+        .codecs
+        .first_decoder(&params)
+        .expect("g7231 decoder factory should be installed via the linkme slice walker");
 }
 
 #[test]
@@ -46,7 +47,7 @@ fn g7231_can_be_filtered_out() {
     let id = CodecId::new(oxideav_g7231::CODEC_ID_STR);
     let params = CodecParameters::audio(id);
     assert!(
-        ctx.codecs.make_decoder(&params).is_err(),
+        ctx.codecs.first_decoder(&params).is_err(),
         "filter should suppress g7231 registration"
     );
 }

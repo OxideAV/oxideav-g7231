@@ -2512,7 +2512,7 @@ mod tests {
         let mut reg = oxideav_core::CodecRegistry::new();
         crate::register_codecs(&mut reg);
         let mut dec = reg
-            .make_decoder(&params(None))
+            .first_decoder(&params(None))
             .expect("decoder factory must exist");
 
         while let Ok(pkt) = enc.receive_packet() {
@@ -2542,7 +2542,7 @@ mod tests {
         let mut reg = oxideav_core::CodecRegistry::new();
         crate::register_codecs(&mut reg);
         let mut dec = reg
-            .make_decoder(&params(None))
+            .first_decoder(&params(None))
             .expect("decoder factory must exist");
 
         while let Ok(pkt) = enc.receive_packet() {
