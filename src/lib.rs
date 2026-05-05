@@ -104,9 +104,16 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
 
 /// Unified registration entry point — installs G.723.1 into the codec
 /// sub-registry of the supplied [`oxideav_core::RuntimeContext`].
+///
+/// Also auto-registered into [`oxideav_core::REGISTRARS`] via the
+/// [`oxideav_core::register!`] macro below so consumers calling
+/// [`oxideav_core::RuntimeContext::with_all_features`] pick G.723.1 up
+/// without any explicit umbrella plumbing.
 pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
     register_codecs(&mut ctx.codecs);
 }
+
+oxideav_core::register!("g7231", register);
 
 fn make_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(G7231Decoder::new()))
