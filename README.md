@@ -95,7 +95,7 @@ cargo test --release -- --ignored roundtrip_writes_sample_raw
 aplay -f S16_LE -c 1 -r 8000 /tmp/g7231-sample.raw
 ```
 
-## Not bit-compatible with ITU-T reference tables
+## Not bit-compatible with ITU-T reference tables (yet)
 
 The LSP split VQ, joint gain codebook, and fixed-codebook pulse track
 layout in this crate are a clean-room, pure-Rust design — internally
@@ -105,10 +105,43 @@ produced by this encoder decode cleanly with this crate's own decoder
 at the PSNR figures above, but not with an external, spec-table G.723.1
 reference decoder.
 
-Achieving that interoperability would mean porting the ITU-T tables
-verbatim (~6-8 KB of codebook data plus the Q13/Q15 fixed-point gain
-quantiser) while keeping the pure-Rust / no-FFI invariant. That's a
-separate piece of work from what this crate provides today.
+### Numeric-table staging (round 171)
+
+A first batch of 16 of the 27 ITU bit-exact tables published in the
+workspace's `docs/audio/g7231/tables/` directory are now vendored into
+`tables/` of this crate and exposed via the [`itu_tables`] module:
+
+| Group | Tables |
+|------|--------|
+| LPC analysis | Hamming window (180 entries), binomial lag window (10), bandwidth-expansion factors (10), LSP cosine lookup (512) |
+| LSP layout | DC-predicted LSP frequencies (10), band partition (3 × 2) |
+| Perceptual / postfilter | zero & pole coefficients per filter (4 × 10) |
+| Preprocessing | highpass-filter constants (2) |
+| Gain quantiser | decision factors (4) |
+| Bit allocation | segment boundaries (3) + base offsets (3) |
+| MP-MLQ | pulse count per subframe (4), max-position table (4) |
+
+Each accessor is a `pub fn name() -> &'static [T; N]` that parses the
+embedded CSV once on first call via `OnceLock`. The legal basis for
+table inclusion is *Feist Publications, Inc., v. Rural Telephone
+Service Co.* (1991) — pure numeric facts in source are not
+copyrightable expression. See `tables/README.md` for the per-file
+inventory + provenance.
+
+These tables are **staged but not yet wired into the encoder /
+decoder** — the current LPC analysis still uses a 240-sample
+floating-point Hamming approximation rather than the spec's
+180-sample Q15 window, and the perceptual / post-filter coefficients
+in the codec body are still derived from the simpler `γ₁ / γ₂`
+constants in `tables.rs`. Wiring is the natural next step.
+
+Bit-stream interoperability with an external spec-table decoder
+additionally needs the larger LSP split-VQ codebooks (768 + 768 +
+1024 = 2 560 entries), the rate-specific adaptive-codebook gain
+tables (1 700 + 3 400 entries), the joint gain codebook (24
+entries), and the MP-MLQ combinatorial table (180 entries). All
+remain staged in the workspace area but are not yet vendored into
+this crate.
 
 ## Quick use
 

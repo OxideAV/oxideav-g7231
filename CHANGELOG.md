@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `itu_tables` module: 16 small ITU-T G.723.1 bit-exact tables vendored
+  from `docs/audio/g7231/tables/` into a new `tables/` directory of
+  this crate and exposed as `OnceLock`-cached `pub fn name() ->
+  &'static [T; N]` accessors. Covers the LPC analysis primitives
+  (Hamming window, binomial lag window, bandwidth-expansion factors,
+  LSP cosine lookup), the LSP layout tables (DC-predicted frequencies,
+  band-info), the perceptual-weighting & post-filter pole/zero
+  coefficients, highpass-filter constants, gain-quantiser decision
+  factors, the bit-allocation segment table, and the MP-MLQ
+  pulse-count / max-position tables. 14 unit tests cover spot-values,
+  monotonicity / period / partition invariants, and accessor caching.
+- `tables/README.md`: per-table inventory mirroring the workspace
+  source-of-truth in `docs/audio/g7231/tables/`, with the *Feist v.
+  Rural* legal basis spelled out.
+- README §"Numeric-table staging (round 171)": documents the new
+  module and clarifies that the tables are staged but not yet wired
+  into the encoder / decoder bodies.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-g7231/compare/v0.0.5...v0.0.6) - 2026-05-06
 
 ### Other

@@ -72,6 +72,7 @@
 pub mod bitreader;
 pub mod encoder;
 pub mod header;
+pub mod itu_tables;
 pub mod synthesis;
 pub mod tables;
 
