@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-g7231/compare/v0.0.6...v0.0.7) - 2026-05-27
+
+### Other
+
+- stage 16 ITU G.723.1 numeric tables (round 171)
+
 ### Added
 
 - `itu_tables` module: 16 small ITU-T G.723.1 bit-exact tables vendored
