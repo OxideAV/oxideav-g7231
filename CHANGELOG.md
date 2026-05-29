@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-g7231/compare/v0.0.6...v0.0.7) - 2026-05-29
+
+### Other
+
+- drop dead synthesis module scaffold
+
 ### Removed
 
 - drop dead `synthesis` module — the standalone `LpcSynthesis` scaffold
