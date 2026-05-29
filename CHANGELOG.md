@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- drop dead `synthesis` module — the standalone `LpcSynthesis` scaffold
+  was never wired in (the real LPC synthesis filter lives inline inside
+  `encoder::SynthesisState`, used by both the encoder analysis-by-
+  synthesis loop and the registered decoder). Removing the unused
+  `pub mod synthesis` trims the public API surface and the misleading
+  "scaffold" docstring.
+
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-g7231/compare/v0.0.5...v0.0.6) - 2026-05-06
 
 ### Other
