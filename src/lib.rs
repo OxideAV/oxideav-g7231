@@ -72,6 +72,7 @@
 pub mod bitreader;
 pub mod encoder;
 pub mod header;
+pub mod spec_tables;
 pub mod tables;
 
 use oxideav_core::{

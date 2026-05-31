@@ -98,17 +98,54 @@ aplay -f S16_LE -c 1 -r 8000 /tmp/g7231-sample.raw
 ## Not bit-compatible with ITU-T reference tables
 
 The LSP split VQ, joint gain codebook, and fixed-codebook pulse track
-layout in this crate are a clean-room, pure-Rust design — internally
-consistent and decode-quality-equivalent to a reference G.723.1 codec,
-but **not** bit-compatible with ITU-T Tables 5 / 7 / 9. Bitstreams
-produced by this encoder decode cleanly with this crate's own decoder
-at the PSNR figures above, but not with an external, spec-table G.723.1
-reference decoder.
+layout currently driving the encoder / decoder are a clean-room,
+pure-Rust design — internally consistent and decode-quality-equivalent
+to a reference G.723.1 codec, but **not** bit-compatible with ITU-T
+Tables 5 / 7 / 9. Bitstreams produced by this encoder decode cleanly
+with this crate's own decoder at the PSNR figures above, but not with
+an external, spec-table G.723.1 reference decoder.
 
-Achieving that interoperability would mean porting the ITU-T tables
-verbatim (~6-8 KB of codebook data plus the Q13/Q15 fixed-point gain
-quantiser) while keeping the pure-Rust / no-FFI invariant. That's a
-separate piece of work from what this crate provides today.
+Achieving that interoperability requires the full ITU-T numeric tables
+to be in tree as static data, plus a Q13 / Q15 fixed-point bit-exact
+gain quantiser, plus the spec's bit-packing field order, while keeping
+the pure-Rust / no-FFI invariant.
+
+### Spec-table data is in tree (round 197)
+
+The 27 ITU-T G.723.1 normative numeric tables are now exposed in
+[`spec_tables`](src/spec_tables.rs) as `static` arrays of `i16` / `u32`
+in their published Q-formats:
+
+- §2.2 high-pass / input pre-filter constants.
+- §2.4 LPC analysis primitives (180-point Hamming window, 10-point
+  binomial lag window, 10-point bandwidth-expansion γ^i, 512-point
+  cosine lookup for LSP↔LSF conversion).
+- §2.6 LSP split-VQ — 3-band partition info, DC-predicted reference
+  vector, plus the three band codebooks (band 0/1 = 256 × 3, band 2 =
+  256 × 4) in Q13.
+- §2.9 perceptual-weighting filter A(z/γ₁)/A(z/γ₂) zero + pole tables.
+- §2.13 MP-MLQ pulse-count-per-subframe, max-position search bounds,
+  6 × 30 combinatorial C(n, k) table, 24-level FCB gain codebook.
+- §2.14 adaptive-codebook gain tables (85 × 20 at 5.3k, 170 × 20 at
+  6.3k) plus the small gain-quantizer decision-factor table.
+- §2.16 1-tap LTP selector + companion gain.
+- §2.17 taming-procedure gain (85 / 170 entries, rate-specific).
+- §2.18 adaptive postfilter zero + pole tables.
+- Bit-allocation segment base offsets + boundaries.
+
+Each constant carries a doc-comment naming the source CSV under
+`docs/audio/g7231/tables/` and the data SHA-256 from its `.meta`
+sidecar. Structural unit tests pin the lengths, symmetry of the
+Hamming window, antisymmetry of the LSP cosine lookup, monotonicity
+of the FCB gain codebook + bandwidth-expansion factors, the 3-band
+LSP partition summing to LpcOrder = 10, the 6/5/6/5 MP-MLQ pulse
+pattern, and the published bit-allocation constants {0, 32, 96} /
+{2048, 18432, 231233}.
+
+The data sits alongside (does not yet replace) [`tables`](src/tables.rs)'s
+internally-consistent codebooks. Threading these spec tables through
+the LPC / LSP / gain quantiser to produce a bit-exact spec-compatible
+bitstream is the next-round task.
 
 ## Quick use
 

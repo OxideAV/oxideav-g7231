@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `spec_tables` module exposing the 27 ITU-T G.723.1 normative numeric
+  tables (§2.2 high-pass; §2.4 LPC primitives — 180-pt Hamming, 10-pt
+  binomial lag, bandwidth-expansion γ^i, 512-pt LSP cosine lookup;
+  §2.6 LSP split-VQ DC predictor + 3-band codebooks Band0/1/2 in Q13;
+  §2.9 perceptual-weighting filter; §2.13 MP-MLQ pulse counts /
+  max-position / 6×30 combinatorial / FCB gain; §2.14 adaptive-codebook
+  gain at both rates + decision factors; §2.16 1-tap LTP selector +
+  gain; §2.17 taming gain at both rates; §2.18 postfilter; bit-allocation
+  segment base + boundaries). Each `pub const [iN; M]` carries a
+  doc-comment naming its source CSV under `docs/audio/g7231/tables/`
+  and the SHA-256 of the data. Compile-time `const _` asserts pin every
+  table's length; 17 unit tests pin structural invariants (Hamming
+  symmetry, LSP cosine antisymmetry, FCB-gain monotonicity, LSP
+  3-band partition summing to LpcOrder=10, MP-MLQ 6/5/6/5 pulse pattern,
+  bit-allocation {0,32,96} / {2048,18432,231233} constants, paired
+  LTP selector + gain dimensions, taming-gain floor of 1024). Data
+  lives alongside (does not yet replace) the existing internally-
+  consistent `tables` codebooks driving the encoder. Threading this
+  spec data through the LPC / LSP / gain quantiser to produce a
+  bit-exact spec-compatible bitstream is the next-round task.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-g7231/compare/v0.0.6...v0.0.7) - 2026-05-29
 
 ### Other
