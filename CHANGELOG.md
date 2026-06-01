@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Three Criterion bench harnesses (`benches/encode.rs`,
+  `benches/decode.rs`, `benches/roundtrip.rs`) covering both dual rates.
+  Inputs are synthesised in-bench from a deterministic sum-of-sinusoids
+  generator so the encoder takes the speech-like pitch path rather than
+  a near-silent shortcut; no `docs/` fixtures or external files are
+  read. Each harness exposes 3–4 scenarios (per-rate, voiced vs silence,
+  1 s / 5 s durations, plus a mixed-rate dispatch scenario in
+  `decode.rs`). Headline baseline (macOS aarch64, single-thread,
+  release): ~ 22 ms/s encode at either rate, ~ 170 µs/s decode at either
+  rate, ~ 20 ms/s round-trip — well above real-time at 8 kHz. Pinned to
+  `criterion = "0.5"` to match the rest of the OxideAV bench crates.
+  Run with `cargo bench -p oxideav-g7231 --bench {encode,decode,roundtrip}`.
 - `spec_tables` module exposing the 27 ITU-T G.723.1 normative numeric
   tables (§2.2 high-pass; §2.4 LPC primitives — 180-pt Hamming, 10-pt
   binomial lag, bandwidth-expansion γ^i, 512-pt LSP cosine lookup;

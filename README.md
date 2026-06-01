@@ -147,6 +147,51 @@ internally-consistent codebooks. Threading these spec tables through
 the LPC / LSP / gain quantiser to produce a bit-exact spec-compatible
 bitstream is the next-round task.
 
+## Benchmarks (round 203)
+
+Three Criterion harnesses cover the encoder, decoder, and full round-
+trip across both dual rates. Each scenario is self-contained: every PCM
+input is synthesised in-bench from a deterministic sum-of-sinusoids
+generator (180 Hz fundamental + harmonics, matching the integration-test
+voiced signal) and fed through the public encoder factory + the trait-
+surface decoder produced by `register_codecs` + `CodecRegistry::first_decoder`.
+No external fixtures.
+
+Run with:
+
+```bash
+cargo bench -p oxideav-g7231 --bench encode
+cargo bench -p oxideav-g7231 --bench decode
+cargo bench -p oxideav-g7231 --bench roundtrip
+```
+
+Baseline numbers on a release build (macOS aarch64, single-thread,
+1 s = 33 × 30 ms frames):
+
+| Bench                          | Time   | Input throughput |
+| :----------------------------- | -----: | ---------------: |
+| `encode_mpmlq_voiced_1s`       | 22 ms  | ~ 700 KiB/s      |
+| `encode_acelp_voiced_1s`       | 22 ms  | ~ 710 KiB/s      |
+| `encode_mpmlq_silence_1s`      | 19 ms  | ~ 815 KiB/s      |
+| `encode_acelp_voiced_5s`       | 113 ms | ~ 687 KiB/s      |
+| `decode_mpmlq_synth_1s`        | 170 µs | ~ 89 MiB/s       |
+| `decode_acelp_synth_1s`        | 168 µs | ~ 90 MiB/s       |
+| `decode_erased_5s`             | 789 µs | ~ 96 MiB/s       |
+| `decode_mixed_5s`              | 804 µs | ~ 94 MiB/s       |
+| `roundtrip_mpmlq_voiced_1s`    | 20 ms  | ~ 765 KiB/s      |
+| `roundtrip_acelp_voiced_1s`    | 22 ms  | ~ 714 KiB/s      |
+| `roundtrip_mpmlq_voiced_5s`    | 101 ms | ~ 770 KiB/s      |
+
+The encoder dominates the round-trip cost — analysis-by-synthesis (LPC,
+LSP split-VQ, pitch + ACB + FCB search per subframe, joint gain quant)
+is roughly two orders of magnitude more expensive than the decoder's
+excitation expansion + post-filter chain. Real-time at 8 kHz needs
+30 ms per 30 ms input frame; we currently spend ~ 0.7 ms / frame
+encoding and ~ 5 µs / frame decoding, so we're ~ 43 × faster than
+real-time encoding and ~ 6 000 × faster than real-time decoding.
+Future optimisation rounds can A/B-test their tweaks against these
+numbers.
+
 ## Quick use
 
 ```rust
