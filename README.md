@@ -71,6 +71,37 @@ The registered `Decoder` is a full synthesiser:
   silence (comfort-noise generation + erasure concealment are future
   work).
 
+### Pitch (long-term) post-filter — G.723.1 §3.6 (round 211)
+
+The pitch post-filter applied between synthesis and the formant /
+tilt / AGC stages now matches the spec's §3.6 shape:
+
+- Forward and backward cross-correlations are maximised over the
+  seven-lag window `M ∈ [L − 3, L + 3]` around the reference lag `L`
+  (`L = L_0` drives subframes 0 + 1; `L = L_2` drives 2 + 3, per
+  §3.6 prose), per `SynthesisState::ltp_search_forward` /
+  `SynthesisState::ltp_search_backward`.
+- The single-side weighting `(w_f, w_b) ∈ {(0,0), (0,1), (1,0)}` is
+  picked by per-side prediction gain (eq. 45–46), with the weaker
+  side ignored.
+- A 1.25 dB pitch-prediction-gain gate (`POSTFILTER_LTP_PRED_GAIN_DB_MIN`)
+  bypasses the LTP postfilter on subframes that wouldn't benefit
+  (broadband / unvoiced segments).
+- The LTP weighting `γ_ltp` switches by rate per §3.6: **0.1875** for
+  6.3 kbit/s MP-MLQ, **0.25** for 5.3 kbit/s ACELP, threaded through
+  `Rate::{High, Low}` from each decode entry point.
+- The output is energy-normalised by `g_p ≤ 1` (eq. 47), so the LTP
+  comb cannot inflate the subframe energy past the synthesis input.
+
+The decoded-PCM PSNR on the round-trip integration test is unchanged
+at ~17.4 dB (ACELP) / ~20.7 dB (MP-MLQ) on the synthetic voiced
+signal — the new postfilter is signal-adaptive (gates off where the
+fixed-`β` predecessor would have done harm; engages with the right
+γ_ltp where the predecessor was conservative). The shape now matches
+the spec; future rounds can tighten gain quantisation against the
+in-tree §2.14 / §2.17 Q-format codebooks for measurable bit-exactness
+gains.
+
 ### Round-trip quality
 
 On a 2 s voiced synthetic signal (150 Hz fundamental + three harmonics,

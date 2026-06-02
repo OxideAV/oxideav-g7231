@@ -55,6 +55,21 @@ pub const POSTFILTER_GAMMA1: f32 = 0.65;
 pub const POSTFILTER_GAMMA2: f32 = 0.75;
 pub const POSTFILTER_TILT: f32 = 0.25;
 
+/// Long-term (pitch) post-filter LTP weighting γ_ltp for the high rate
+/// (6.3 kbit/s, MP-MLQ) per G.723.1 §3.6 (clause 3.6). Multiplies the
+/// forward/backward LTP contribution in eq. 42 of the 1996 base edition.
+pub const POSTFILTER_LTP_GAMMA_HIGH: f32 = 0.1875;
+/// Long-term (pitch) post-filter LTP weighting γ_ltp for the low rate
+/// (5.3 kbit/s, ACELP) per G.723.1 §3.6 (clause 3.6).
+pub const POSTFILTER_LTP_GAMMA_LOW: f32 = 0.25;
+/// Minimum prediction-gain threshold (dB) below which the pitch
+/// post-filter is bypassed for a subframe (G.723.1 §3.6, eq. 45–46
+/// gate clause).
+pub const POSTFILTER_LTP_PRED_GAIN_DB_MIN: f32 = 1.25;
+/// Half-width of the forward/backward lag search window around the
+/// reference pitch lag (G.723.1 §3.6 eq. 43.1–43.2: `M_f ∈ [L − 3, L + 3]`).
+pub const POSTFILTER_LTP_SEARCH_RADIUS: i32 = 3;
+
 /// Bit-layout (high-rate, MP-MLQ) — field widths in bits, in packing order.
 ///
 /// Derived from ITU-T G.723.1 Annex B Table B.1. The implementation below

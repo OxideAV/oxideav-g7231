@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Pitch (long-term) post-filter reshaped to match G.723.1 §3.6**
+  (round 211). The decoder's pitch post-filter is no longer a fixed
+  `β = 0.2` LTP at the decoded lag; it now follows the spec shape:
+  forward + backward cross-correlations maximised over the seven-lag
+  window `M ∈ [L − 3, L + 3]` around the reference lag `L`
+  (`L = L_0` covers subframes 0,1 and `L = L_2` covers subframes 2,3
+  per §3.6 prose), one-sided weighting `(w_f, w_b) ∈ {(0,0), (0,1),
+  (1,0)}` driven by per-side prediction gain (eq. 45–46), a 1.25 dB
+  pitch-prediction-gain gate that bypasses the LTP postfilter on
+  subframes where it would harm signal quality, and the spec's
+  rate-specific LTP weighting `γ_ltp` (0.1875 for the high rate, 0.25
+  for the low rate) threaded through a new `pub(crate) Rate {Low,
+  High}` enum from each decode entry point. Output energy
+  normalisation `g_p ≤ 1` (eq. 47) means the LTP comb cannot inflate
+  the subframe energy past the synthesis input. Six new structural
+  unit tests pin the gate behaviour (silence + white-noise bypass,
+  periodic-signal engagement, rate-dependent deviation, forward and
+  backward search lock onto a sinusoid's period). Headline
+  integration-test PSNR is preserved (~17.4 dB ACELP / ~20.7 dB
+  MP-MLQ on the synthetic voiced signal); the postfilter is now
+  signal-adaptive instead of applying a single fixed β to every
+  subframe.
+- New `tables` constants: `POSTFILTER_LTP_GAMMA_HIGH = 0.1875`,
+  `POSTFILTER_LTP_GAMMA_LOW = 0.25`,
+  `POSTFILTER_LTP_PRED_GAIN_DB_MIN = 1.25`,
+  `POSTFILTER_LTP_SEARCH_RADIUS = 3`, all cited to G.723.1 §3.6.
+
 ### Added
 
 - Three Criterion bench harnesses (`benches/encode.rs`,
