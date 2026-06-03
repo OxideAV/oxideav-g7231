@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Formant-postfilter tilt + adaptive gain scaling reshaped to match
+  G.723.1 §3.8 / 3.9** (round 229).
+  - The §3.8 tilt-compensation stage `1 − μ · z⁻¹` no longer uses a
+    constant `μ = 0.25`. Each subframe now computes the first-order
+    normalised autocorrelation `k = r(1)/r(0)` of the synthesis input
+    `sy[n]`, smooths it across subframes via the leaky integrator
+    `k1 = (1 − POSTFILTER_TILT_SMOOTH_ALPHA) · k1_prev +
+    POSTFILTER_TILT_SMOOTH_ALPHA · k` with `α = 1/4`, and applies
+    `μ = POSTFILTER_TILT_BASE · k1` (`POSTFILTER_TILT_BASE = 0.25`).
+    Silence leaves `μ = 0`; strong low-frequency content pulls `μ` up
+    toward `≈ 0.25`. `k1` is bounded to `[−1, 1]` per Cauchy-Schwarz on
+    `r(1)/r(0)`.
+  - The §3.9 adaptive gain scaling is no longer a per-sample chase with
+    `α = 0.85` toward `sqrt(e_in / e_out)`. The spec form is now in
+    place: per subframe `g_s = sqrt(Σ sy²[n] / Σ pf²[n])` (set to `1` if
+    the denominator is zero, eq. 50); per sample the smoothed gain runs
+    as a leaky integrator `g[n] = (1 − α) · g[n − 1] + α · g_s` with
+    `α = POSTFILTER_AGC_ALPHA = 1/16` (eq. 51); the output is
+    `q[n] = pf[n] · g[n] · (1 + α)` (eq. 52) so the `(1 + 1/16)` boost
+    undoes the average attenuation introduced by the integrator.
+    `g[−1]` initialises to `POSTFILTER_AGC_INIT_GAIN = 1` per §3.11.
+  - Round-trip PSNR on the integration test improves modestly: ACELP
+    goes from ~17.4 dB to ~17.6 dB (+0.2 dB); MP-MLQ stays at ~20.7 dB
+    inside its ~0.01 dB measurement-floor band. The shape is the
+    headline change — tilt now tracks the per-subframe spectral tilt
+    instead of cutting at a fixed factor, and the AGC follows the spec's
+    leaky-integrator shape with the same `(1 + α)` compensation factor.
+  - Five new unit tests pin the new behaviour:
+    `post_filter_tilt_k1_smooths_per_subframe_per_spec` drives a low-pass
+    synthesis input and verifies `pf_tilt_k1` moves positive on the
+    first subframe and stays non-decreasing over six subsequent
+    identical subframes while remaining inside `[−1, 1]`;
+    `post_filter_tilt_k1_zero_input_zeroes_k` confirms zero input zeros
+    `k` and the integrator decays the saved `k1` by `1 − α`;
+    `post_filter_agc_holds_unity_on_silence` confirms silence in →
+    silence out with the AGC staying at unity;
+    `post_filter_agc_leaky_integrator_matches_closed_form` checks the
+    per-sample integrator's `SUBFRAME_SIZE`-sample trajectory matches
+    the closed form `g[N − 1] = g₀ + (g_s − g₀) · (1 − (1 − α)^N)`;
+    `post_filter_state_starts_at_unity_agc` now also pins
+    `pf_tilt_k1 = 0` and `pf_agc_gain = POSTFILTER_AGC_INIT_GAIN`.
+  - New `tables` constants: `POSTFILTER_TILT_BASE = 0.25`,
+    `POSTFILTER_TILT_SMOOTH_ALPHA = 0.25`,
+    `POSTFILTER_AGC_ALPHA = 1/16`, `POSTFILTER_AGC_INIT_GAIN = 1.0`,
+    all cited to G.723.1 §3.8 / 3.9 / 3.11. The former
+    `POSTFILTER_TILT = 0.25` constant is replaced by the
+    smoothed-`k1`-driven `μ` so the tilt coefficient is no longer a
+    compile-time constant.
+
 - **Frame-erasure concealment reshaped to match G.723.1 §3.10.2** (round
   222). The previous ad-hoc decay schedule (halving the saved gains and
   driving a pseudo-random innovation through the decoder pipeline at

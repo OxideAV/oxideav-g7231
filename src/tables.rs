@@ -50,10 +50,37 @@ pub const LSP_VQ_ENTRIES: usize = 256;
 pub const PERCEPTUAL_GAMMA1: f32 = 0.9;
 pub const PERCEPTUAL_GAMMA2: f32 = 0.5;
 
-/// Post-filter constants (§3.9).
+/// Formant post-filter zero / pole bandwidth-expansion factors (§3.8,
+/// eq. 49.1). `λ₁ = 0.65` widens the numerator, `λ₂ = 0.75` narrows the
+/// denominator so the filter emphasises spectral peaks (formants) without
+/// shifting their centre frequencies.
 pub const POSTFILTER_GAMMA1: f32 = 0.65;
 pub const POSTFILTER_GAMMA2: f32 = 0.75;
-pub const POSTFILTER_TILT: f32 = 0.25;
+
+/// First-order tilt-compensation base coefficient applied after the formant
+/// post-filter (G.723.1 §3.8, eq. 49.2): the tilt-compensation transfer
+/// `1 − μ·z^{-1}` uses `μ = POSTFILTER_TILT_BASE · k1`, where `k1` is the
+/// inter-subframe-smoothed first-order normalised autocorrelation of the
+/// synthesis input `sy[n]` (see [`POSTFILTER_TILT_SMOOTH_ALPHA`]).
+pub const POSTFILTER_TILT_BASE: f32 = 0.25;
+
+/// Inter-subframe smoothing factor on the §3.8 tilt-compensation coefficient
+/// (eq. 49.2): `k1[s] = (1 − α) · k1[s − 1] + α · k`, where `k` is the per-
+/// subframe first-order normalised autocorrelation `r(1)/r(0)` of the
+/// synthesis input. The spec specifies `α = 1/4`.
+pub const POSTFILTER_TILT_SMOOTH_ALPHA: f32 = 0.25;
+
+/// Adaptive gain-scaling smoothing factor for the post-filter output
+/// (G.723.1 §3.9, eq. 51): `g[n] = (1 − α) · g[n − 1] + α · g_s`. The spec
+/// specifies `α = 1/16`. The same factor scales the output magnitude in
+/// eq. 52 (`q[n] = pf[n] · g[n] · (1 + α)`) to compensate for the average
+/// attenuation introduced by the leaky integrator.
+pub const POSTFILTER_AGC_ALPHA: f32 = 1.0 / 16.0;
+
+/// Initial gain `g[−1]` for the post-filter AGC at decoder cold start
+/// (G.723.1 §3.11): the spec initialises the smoothed gain to unity so the
+/// first decoded frame does not start from a silent attenuation.
+pub const POSTFILTER_AGC_INIT_GAIN: f32 = 1.0;
 
 /// Long-term (pitch) post-filter LTP weighting γ_ltp for the high rate
 /// (6.3 kbit/s, MP-MLQ) per G.723.1 §3.6 (clause 3.6). Multiplies the

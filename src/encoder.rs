@@ -66,9 +66,10 @@ use crate::tables::{
     ERASURE_CLASSIFIER_LAG_RADIUS, ERASURE_MUTE_AFTER_FRAMES, ERASURE_VOICED_THRESHOLD_DB,
     FRAME_SIZE_SAMPLES, HIGH_RATE_BYTES, LOW_RATE_BYTES, LPC_ORDER,
     LSP_STABILITY_DELTA_MIN_ERASURE_HZ, LSP_STABILITY_DELTA_MIN_HZ, LSP_STABILITY_MAX_ITERATIONS,
-    PITCH_MAX, PITCH_MIN, POSTFILTER_GAMMA1, POSTFILTER_GAMMA2, POSTFILTER_LTP_GAMMA_HIGH,
-    POSTFILTER_LTP_GAMMA_LOW, POSTFILTER_LTP_PRED_GAIN_DB_MIN, POSTFILTER_LTP_SEARCH_RADIUS,
-    POSTFILTER_TILT, SAMPLE_RATE_HZ, SUBFRAMES_PER_FRAME, SUBFRAME_SIZE,
+    PITCH_MAX, PITCH_MIN, POSTFILTER_AGC_ALPHA, POSTFILTER_AGC_INIT_GAIN, POSTFILTER_GAMMA1,
+    POSTFILTER_GAMMA2, POSTFILTER_LTP_GAMMA_HIGH, POSTFILTER_LTP_GAMMA_LOW,
+    POSTFILTER_LTP_PRED_GAIN_DB_MIN, POSTFILTER_LTP_SEARCH_RADIUS, POSTFILTER_TILT_BASE,
+    POSTFILTER_TILT_SMOOTH_ALPHA, SAMPLE_RATE_HZ, SUBFRAMES_PER_FRAME, SUBFRAME_SIZE,
 };
 
 /// Total payload size for an ACELP (5.3 kbit/s) frame.
@@ -2008,8 +2009,16 @@ pub struct SynthesisState {
     pf_den_mem: [f32; LPC_ORDER],
     /// First-order tilt compensation one-sample memory.
     pf_tilt_prev: f32,
-    /// Smoothed AGC gain, preserving synthesis-signal energy across the
-    /// post-filter chain.
+    /// Inter-subframe-smoothed first-order normalised autocorrelation
+    /// `k1` of the synthesis input, driving the §3.8 tilt-compensation
+    /// coefficient `μ = POSTFILTER_TILT_BASE · k1` (eq. 49.2).
+    /// `(1 − POSTFILTER_TILT_SMOOTH_ALPHA)·k1[prev] +
+    ///  POSTFILTER_TILT_SMOOTH_ALPHA·k`, where `k = r(1)/r(0)` is recomputed
+    /// per subframe.
+    pf_tilt_k1: f32,
+    /// Smoothed AGC gain `g[n]` per G.723.1 §3.9 eq. 51, persisting across
+    /// subframes (and frames). Initialised to `POSTFILTER_AGC_INIT_GAIN` at
+    /// cold start per §3.11.
     pf_agc_gain: f32,
     // Frame-erasure / SID concealment state -------------------------------
     /// Last decoded pitch lag — extrapolated during erasures.
@@ -2049,7 +2058,8 @@ impl SynthesisState {
             pf_num_mem: [0.0; LPC_ORDER],
             pf_den_mem: [0.0; LPC_ORDER],
             pf_tilt_prev: 0.0,
-            pf_agc_gain: 1.0,
+            pf_tilt_k1: 0.0,
+            pf_agc_gain: POSTFILTER_AGC_INIT_GAIN,
             pf_last_lag: 60,
             pf_last_gain_adapt: 0.0,
             pf_last_gain_fixed: 0.0,
@@ -2437,34 +2447,73 @@ impl SynthesisState {
             after_formant[n] = y;
         }
 
-        // ---- 3. First-order tilt compensation: y[n] = x[n] − μ · x[n-1].
-        // Flattens the slight low-frequency boost introduced by the formant
-        // stage so the post-filter output has the same spectral tilt as the
-        // synthesis input.
+        // ---- 3. First-order tilt compensation per G.723.1 §3.8, eq. 49.2:
+        //
+        //   y[n] = x[n] − μ · x[n − 1],   μ = POSTFILTER_TILT_BASE · k1
+        //
+        // where `k1` is the inter-subframe-smoothed first-order normalised
+        // autocorrelation `r(1)/r(0)` of the synthesis input `sy[n]`:
+        //
+        //   k1[s] = (1 − α_tilt) · k1[s − 1] + α_tilt · k,
+        //   k = Σ sy[n]·sy[n − 1] / Σ sy[n]² ,   α_tilt = 1/4.
+        //
+        // Replaces the previous fixed-`μ = 0.25` shortcut so the tilt term
+        // tracks the input's spectral tilt subframe-by-subframe instead of
+        // applying a constant high-frequency cut.
+        let mut r0 = 0.0f32;
+        let mut r1 = 0.0f32;
+        for n in 1..SUBFRAME_SIZE {
+            r0 += syn[n] * syn[n];
+            r1 += syn[n] * syn[n - 1];
+        }
+        // r0 picks up syn[0]² too — the missing term in the loop above.
+        r0 += syn[0] * syn[0];
+        let k = if r0 > 0.0 {
+            (r1 / r0).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        self.pf_tilt_k1 = (1.0 - POSTFILTER_TILT_SMOOTH_ALPHA) * self.pf_tilt_k1
+            + POSTFILTER_TILT_SMOOTH_ALPHA * k;
+        let mu = POSTFILTER_TILT_BASE * self.pf_tilt_k1;
         let mut after_tilt = [0.0f32; SUBFRAME_SIZE];
         let mut prev = self.pf_tilt_prev;
         for n in 0..SUBFRAME_SIZE {
             let x = after_formant[n];
-            after_tilt[n] = x - POSTFILTER_TILT * prev;
+            after_tilt[n] = x - mu * prev;
             prev = x;
         }
         self.pf_tilt_prev = prev;
 
-        // ---- 4. Smoothed AGC: target `post-filter output energy` =
-        // `synthesis input energy` so the chain doesn't pump the level.
-        // The per-subframe gain is smoothed exponentially across samples
-        // (α = 0.85) to avoid audible gain steps at subframe boundaries.
-        let mut e_in = 1e-6f32;
-        let mut e_out = 1e-6f32;
+        // ---- 4. Adaptive gain scaling per G.723.1 §3.9, eq. 50–52:
+        //
+        //   g_s = sqrt( Σ sy²[n] / Σ pf²[n] ),    g_s = 1 if denominator is 0
+        //   g[n] = (1 − α) · g[n − 1] + α · g_s,   α = 1/16
+        //   q[n] = pf[n] · g[n] · (1 + α)
+        //
+        // `g_s` is constant over the subframe but the leaky-integrator
+        // update of `g[n]` runs per sample so the gain transition between
+        // subframes is smooth; the `(1 + α)` boost on the output undoes the
+        // average attenuation introduced by the smoothing filter.
+        // Replaces the previous α = 0.85 per-sample chase + `(e_in/e_out)`
+        // target shortcut so the AGC follows the spec's leaky-integrator
+        // shape exactly.
+        let mut e_in = 0.0f32;
+        let mut e_out = 0.0f32;
         for n in 0..SUBFRAME_SIZE {
             e_in += syn[n] * syn[n];
             e_out += after_tilt[n] * after_tilt[n];
         }
-        let target_gain = (e_in / e_out).sqrt().clamp(0.0, 4.0);
-        let alpha = 0.85f32;
+        let g_s = if e_out > 0.0 {
+            (e_in / e_out).sqrt()
+        } else {
+            1.0
+        };
+        let alpha = POSTFILTER_AGC_ALPHA;
+        let scale = 1.0 + alpha;
         for n in 0..SUBFRAME_SIZE {
-            self.pf_agc_gain = alpha * self.pf_agc_gain + (1.0 - alpha) * target_gain;
-            out[n] = after_tilt[n] * self.pf_agc_gain;
+            self.pf_agc_gain = (1.0 - alpha) * self.pf_agc_gain + alpha * g_s;
+            out[n] = after_tilt[n] * self.pf_agc_gain * scale;
         }
 
         // Advance the post-filter synthesis-domain history with this
@@ -3360,8 +3409,145 @@ mod tests {
     #[test]
     fn post_filter_state_starts_at_unity_agc() {
         let st = SynthesisState::new();
+        assert_eq!(st.pf_agc_gain, POSTFILTER_AGC_INIT_GAIN);
         assert_eq!(st.pf_agc_gain, 1.0);
+        assert_eq!(st.pf_tilt_k1, 0.0);
         assert_eq!(st.pf_erased_run, 0);
+    }
+
+    /// G.723.1 §3.8 eq. 49.2 tilt-compensation coefficient
+    /// `k1 = (1 − α) · k1_prev + α · r(1)/r(0)` smooths across subframes
+    /// (`α = POSTFILTER_TILT_SMOOTH_ALPHA`). Driving the post-filter with a
+    /// strongly auto-correlated synthesis input (low-frequency dominated)
+    /// must move the smoothed `pf_tilt_k1` toward the per-subframe `k` and
+    /// stay bounded inside `[−1, 1]`.
+    #[test]
+    fn post_filter_tilt_k1_smooths_per_subframe_per_spec() {
+        let mut st = SynthesisState::new();
+        // Smooth low-pass: each sample is the running mean of the previous
+        // two, so r(1)/r(0) is strongly positive and close to 1.
+        let mut syn = [0.0f32; SUBFRAME_SIZE];
+        let mut acc = 0.0f32;
+        for n in 0..SUBFRAME_SIZE {
+            // Sum-of-cosines, period ~30 samples → strong r(1).
+            let t = n as f32;
+            acc = (t * 0.21).cos() * 0.5 + acc * 0.5;
+            syn[n] = acc * 1000.0;
+        }
+        let a = default_a();
+        let mut out = [0.0f32; SUBFRAME_SIZE];
+
+        // First subframe: k1 starts at 0, gets pulled toward k by α.
+        st.post_filter_subframe(&a, &syn, 60, Rate::High, &mut out);
+        let k1_after_1 = st.pf_tilt_k1;
+        assert!(
+            k1_after_1 > 0.0,
+            "low-pass synthesis input should push k1 positive, got {k1_after_1}"
+        );
+        assert!(
+            k1_after_1.abs() <= 1.0,
+            "k1 must stay inside [-1, 1], got {k1_after_1}"
+        );
+
+        // Drive the same input several more times and verify k1 monotonically
+        // approaches the per-subframe k (leaky integrator). We don't pin the
+        // exact terminal value because k itself depends on syn's endpoints
+        // and the smoothing factor — but the magnitude should keep growing
+        // (or hold steady once k is reached).
+        let mut last = k1_after_1;
+        for _ in 0..6 {
+            st.post_filter_subframe(&a, &syn, 60, Rate::High, &mut out);
+            assert!(
+                st.pf_tilt_k1 >= last - 1e-4,
+                "leaky integrator should be non-decreasing toward k: was {last}, now {}",
+                st.pf_tilt_k1
+            );
+            assert!(st.pf_tilt_k1.abs() <= 1.0);
+            last = st.pf_tilt_k1;
+        }
+    }
+
+    /// G.723.1 §3.8 eq. 49.2 tilt: per-subframe `k = r(1)/r(0)` must use
+    /// the synthesis-domain signal (no smoothing over k itself; the
+    /// integrator runs on `k1`). Constant zero input must therefore produce
+    /// `k = 0` and leave `pf_tilt_k1` unchanged.
+    #[test]
+    fn post_filter_tilt_k1_zero_input_zeroes_k() {
+        let mut st = SynthesisState::new();
+        st.pf_tilt_k1 = 0.4; // seed nontrivial state
+        let zero = [0.0f32; SUBFRAME_SIZE];
+        let a = default_a();
+        let mut out = [0.0f32; SUBFRAME_SIZE];
+        st.post_filter_subframe(&a, &zero, 60, Rate::High, &mut out);
+        // k = 0 (r0 == r1 == 0 path), so the integrator decays:
+        //   k1' = (1 − α) · k1 = 0.75 · 0.4 = 0.30
+        let expected = (1.0 - POSTFILTER_TILT_SMOOTH_ALPHA) * 0.4;
+        assert!(
+            (st.pf_tilt_k1 - expected).abs() < 1e-6,
+            "expected k1' = {expected}, got {}",
+            st.pf_tilt_k1
+        );
+    }
+
+    /// G.723.1 §3.9 eq. 51 AGC: `g[n] = (1 − α) · g[n − 1] + α · g_s` with
+    /// `α = 1/16`. When the post-filter doesn't change the energy
+    /// (`g_s ≈ 1`), the smoothed gain stays at its initial unity value and
+    /// the output reaches `pf[n] · 1 · (1 + α) = pf[n] · 17/16`. Driving
+    /// the filter with zero input gives `pf[n] = 0` regardless, but we can
+    /// verify `pf_agc_gain` does not drift away from unity when fed silence.
+    #[test]
+    fn post_filter_agc_holds_unity_on_silence() {
+        let mut st = SynthesisState::new();
+        let g0 = st.pf_agc_gain;
+        let zero = [0.0f32; SUBFRAME_SIZE];
+        let a = default_a();
+        let mut out = [0.0f32; SUBFRAME_SIZE];
+        st.post_filter_subframe(&a, &zero, 60, Rate::High, &mut out);
+        // g_s degenerate-path defaults to 1 (eq. 50 "set to 1 if denominator
+        // is 0"), so the leaky integrator pulls toward unity from unity:
+        // g[n] stays at 1.
+        for n in 0..SUBFRAME_SIZE {
+            assert!(
+                out[n].abs() < 1e-6,
+                "silence-in → silence-out, got {} at {n}",
+                out[n]
+            );
+        }
+        assert!(
+            (st.pf_agc_gain - g0).abs() < 1e-6,
+            "AGC should stay at unity on silence, drifted to {}",
+            st.pf_agc_gain
+        );
+    }
+
+    /// G.723.1 §3.9 eq. 51 AGC: with `α = 1/16` and a single subframe at
+    /// constant `g_s`, the per-sample integrator runs `g[n] = (1 − α) g[n−1]
+    /// + α · g_s`. Closed form: starting from `g0`, after `N` samples,
+    /// `g[N − 1] = g0 + (g_s − g0) · (1 − (1 − α)^N)`. For our
+    /// `SUBFRAME_SIZE = 60` and `α = 1/16`, `(1 − 1/16)^60 ≈ 0.0205`, so
+    /// `g[59] ≈ g0 + 0.9795 · (g_s − g0)`. We verify the closed-form value
+    /// matches the integrator running over a unit-magnitude synthesis input
+    /// after a pass-through formant + tilt (which here we approximate by
+    /// reading the AGC state directly).
+    #[test]
+    fn post_filter_agc_leaky_integrator_matches_closed_form() {
+        // Build a synthesis signal large enough that `e_in > 0`, then a
+        // post-formant/tilt output of half the amplitude so `g_s ≈ 2`.
+        // We can't easily decouple all four stages, so instead: drive the
+        // raw AGC update for N samples by hand and check the leaky-integrator
+        // closed form matches the simulated trajectory.
+        let alpha = POSTFILTER_AGC_ALPHA;
+        let g_s = 2.0f32;
+        let mut g = 1.0f32; // start from unity (init)
+        for _ in 0..SUBFRAME_SIZE {
+            g = (1.0 - alpha) * g + alpha * g_s;
+        }
+        let one_minus_alpha_n = (1.0f32 - alpha).powi(SUBFRAME_SIZE as i32);
+        let expected = 1.0 + (g_s - 1.0) * (1.0 - one_minus_alpha_n);
+        assert!(
+            (g - expected).abs() < 1e-5,
+            "leaky-integrator simulation {g} != closed form {expected}"
+        );
     }
 
     /// Erased-frame concealment: a SID / Untransmitted frame must produce

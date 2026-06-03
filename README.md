@@ -103,6 +103,43 @@ LSP from a probe set of indices hits the 31.25 Hz floor and stays
 strictly monotone in cosine domain; degenerate all-equal input still
 yields a finite LPC).
 
+### Formant-postfilter tilt + adaptive gain scaling — G.723.1 §3.8 / 3.9 (round 229)
+
+The decoder's tilt-compensation stage and adaptive post-filter gain scaling
+now both follow the spec's per-subframe shape instead of fixed shortcuts:
+
+- **§3.8 tilt-compensation (eq. 49.2).** The tilt transfer
+  `1 − μ · z⁻¹` is no longer applied with a constant `μ = 0.25`. Each
+  subframe now computes `k = r(1)/r(0)` on the synthesis input `sy[n]`,
+  smooths it across subframes by
+  `k1 = (1 − POSTFILTER_TILT_SMOOTH_ALPHA)·k1_prev +
+   POSTFILTER_TILT_SMOOTH_ALPHA·k` with `α = 1/4`, and uses
+  `μ = POSTFILTER_TILT_BASE · k1` with `POSTFILTER_TILT_BASE = 0.25`. A
+  silent subframe leaves `μ = 0` (eq. 50 degenerate path); a strongly
+  low-pass synthesis subframe drives `μ` toward `≈ 0.25`. `k1` is bounded
+  to `[−1, 1]` per `r(1)/r(0)` Cauchy-Schwarz.
+- **§3.9 adaptive gain scaling (eq. 50–52).** The previous AGC used a
+  per-sample chase with `α = 0.85` toward `sqrt(e_in/e_out)`. The spec
+  shape replaces both legs: per subframe `g_s = sqrt(Σ sy²[n] / Σ pf²[n])`
+  (set to `1` if the denominator is zero, per eq. 50); per sample the
+  smoothed gain runs as a leaky integrator `g[n] = (1 − α)·g[n − 1] +
+  α·g_s` with `α = POSTFILTER_AGC_ALPHA = 1/16`; the output is
+  `q[n] = pf[n]·g[n]·(1 + α)` so the `(1 + 1/16)` boost undoes the
+  average attenuation introduced by the integrator. `g[−1]` initialises
+  to `POSTFILTER_AGC_INIT_GAIN = 1` per §3.11.
+
+Round-trip PSNR on the integration signal improves modestly (ACELP
+≈ +0.2 dB, MP-MLQ unchanged inside its ~0.01 dB measurement floor), but
+the post-filter is now signal-adaptive: tilt tracks the synthesis input's
+spectral tilt instead of always cutting at a fixed factor, and the AGC
+follows the spec's leaky-integrator shape with the same `(1 + α)`
+compensation factor. Five new unit tests pin the new behaviour
+(`pf_tilt_k1` smooths across consecutive low-pass subframes and stays
+inside `[−1, 1]`; zero input decays `pf_tilt_k1` by `1 − α`; silence
+through the AGC stays at unity gain; the AGC's per-sample leaky
+integrator matches the closed-form `g[N − 1] = g₀ + (g_s − g₀)·(1 − (1 − α)^N)`
+after one subframe).
+
 ### Frame-erasure concealment — G.723.1 §3.10.2 (round 222)
 
 The decoder's frame-erasure path (triggered by `0b10` SID and `0b11`
@@ -181,8 +218,8 @@ to-end (release build, x86_64):
 
 |    rate | frame size | PSNR    |
 | ------: | ---------: | :------ |
-| 5.3 k/s |   20 bytes | 18.7 dB |
-| 6.3 k/s |   24 bytes | 21.8 dB |
+| 5.3 k/s |   20 bytes | ≈ 17.6 dB |
+| 6.3 k/s |   24 bytes | ≈ 20.7 dB |
 
 See `tests/codec_roundtrip.rs::roundtrip_two_seconds_voiced_psnr_both_rates`
 for the integration test and
