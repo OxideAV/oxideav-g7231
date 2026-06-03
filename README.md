@@ -71,6 +71,37 @@ The registered `Decoder` is a full synthesiser:
   silence (comfort-noise generation + erasure concealment are future
   work).
 
+### LSP stability check — G.723.1 §3.1 / 2.6 (round 216)
+
+Decoded-LSP post-processing now matches the spec's iterative ordering
+procedure (eq. 6–7.3) instead of the previous ad-hoc cosine-domain
+`gap ≥ 0.01` clamp:
+
+- `enforce_lsp_stability(lsp_cos, Δ_min_hz)` converts the cosine LSPs
+  back to angular frequencies via `acos`, scans for the first pair
+  `(ω_j, ω_{j+1})` with `ω_{j+1} − ω_j < Δω_min`, spreads it around its
+  midpoint by `±Δω_min/2`, and iterates up to
+  `LSP_STABILITY_MAX_ITERATIONS = 10` passes — exactly the procedure
+  prescribed by §2.6.
+- `Δω_min` is `2π · Δ_min_hz / SAMPLE_RATE_HZ`, with
+  `Δ_min = 31.25 Hz` (`LSP_STABILITY_DELTA_MIN_HZ`) for the normal
+  decode path.
+- The frame-erasure / SID concealment path now applies the same
+  procedure with the spec's wider `Δ_min = 62.5 Hz`
+  (`LSP_STABILITY_DELTA_MIN_ERASURE_HZ`) per §3.10.1, pulling the
+  extrapolated previous-frame LSP back into a stable configuration
+  when repeated erasures drift its pairs closer together.
+
+Round-trip PSNR is unchanged at the headline figures below; the
+stability check is a numeric-discipline change in the LSP→LPC link,
+not a quality knob. Five new unit tests pin the procedure (no-op on
+already-stable input; one-pass convergence and midpoint-spread shape
+on a single inversion; erasure variant widens beyond the normal
+variant when the input violates the wider floor; every dequantised
+LSP from a probe set of indices hits the 31.25 Hz floor and stays
+strictly monotone in cosine domain; degenerate all-equal input still
+yields a finite LPC).
+
 ### Pitch (long-term) post-filter — G.723.1 §3.6 (round 211)
 
 The pitch post-filter applied between synthesis and the formant /

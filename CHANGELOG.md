@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **LSP stability check reshaped to match G.723.1 §3.1 / 2.6** (round 216).
+  The decoded-LSP post-processing in `dequantise_lsp` is no longer an
+  ad-hoc cosine-domain `gap ≥ 0.01` clamp; it now follows the spec's
+  procedure (eq. 6–7.3). New `pub(crate) enforce_lsp_stability` operates
+  in angular-frequency space: convert cosines → ω via `acos`, find each
+  pair `(ω_j, ω_{j+1})` with `ω_{j+1} − ω_j < Δω_min`, spread it around
+  its midpoint by `±Δω_min/2`, iterate up to
+  `LSP_STABILITY_MAX_ITERATIONS = 10` passes, then re-convert to cosines.
+  `Δω_min` is `2π · Δ_min_hz / SAMPLE_RATE_HZ`. The normal path uses
+  `Δ_min = 31.25 Hz` (`LSP_STABILITY_DELTA_MIN_HZ`); the erasure
+  concealment path now applies the same procedure with the spec's wider
+  `Δ_min = 62.5 Hz` (`LSP_STABILITY_DELTA_MIN_ERASURE_HZ`) per §3.10.1,
+  pulling the extrapolated previous-frame LSP back into a stable
+  configuration when repeated erasures drift its pairs closer together.
+  Five new unit tests pin the procedure: already-stable input is a
+  no-op, a single inversion converges in one pass with the spreading
+  applied around the midpoint, the erasure variant widens minimum gaps
+  beyond the normal variant when the input violates the wider floor,
+  every dequantised LSP from a probe set of indices hits the 31.25 Hz
+  floor and is strictly monotone-decreasing in cosine domain, and an
+  all-equal degenerate input still yields a finite LPC via `lsp_to_lpc`.
+  No PSNR regression on the round-trip integration test.
 - **Pitch (long-term) post-filter reshaped to match G.723.1 §3.6**
   (round 211). The decoder's pitch post-filter is no longer a fixed
   `β = 0.2` LTP at the decoded lag; it now follows the spec shape:

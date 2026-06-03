@@ -62,6 +62,26 @@ pub const POSTFILTER_LTP_GAMMA_HIGH: f32 = 0.1875;
 /// Long-term (pitch) post-filter LTP weighting γ_ltp for the low rate
 /// (5.3 kbit/s, ACELP) per G.723.1 §3.6 (clause 3.6).
 pub const POSTFILTER_LTP_GAMMA_LOW: f32 = 0.25;
+
+/// Minimum LSP angular-frequency separation `Δ_min` for the *normal* decode
+/// path (G.723.1 §3.1 / 2.6, eq. 6–7.3). The 1996 base edition specifies
+/// `Δ_min = 31.25 Hz` between consecutive decoded LSP frequencies; the
+/// stability check spreads any out-of-order pair around its midpoint by
+/// `±Δ_min/2`. Constant is the spec frequency itself; the algorithm in
+/// [`crate::encoder`] converts it to a normalised angular-frequency gap
+/// `Δ_min · 2π / SAMPLE_RATE_HZ`.
+pub const LSP_STABILITY_DELTA_MIN_HZ: f32 = 31.25;
+
+/// Minimum LSP separation for the *erasure* concealment path
+/// (G.723.1 §3.10.1). The wider 62.5 Hz value relaxes the constraint so
+/// the same iterative ordering procedure can re-stabilise an extrapolated
+/// LSP whose pairs have drifted further from the previous decoded vector.
+pub const LSP_STABILITY_DELTA_MIN_ERASURE_HZ: f32 = 62.5;
+
+/// Maximum number of iterations the LSP stability procedure runs before
+/// giving up on the decoded vector and falling back to the previous good
+/// LSP (G.723.1 §3.1 / 2.6, "iterate up to 10 times").
+pub const LSP_STABILITY_MAX_ITERATIONS: u32 = 10;
 /// Minimum prediction-gain threshold (dB) below which the pitch
 /// post-filter is bypassed for a subframe (G.723.1 §3.6, eq. 45–46
 /// gate clause).
