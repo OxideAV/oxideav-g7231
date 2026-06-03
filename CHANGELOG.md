@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Frame-erasure concealment reshaped to match G.723.1 §3.10.2** (round
+  222). The previous ad-hoc decay schedule (halving the saved gains and
+  driving a pseudo-random innovation through the decoder pipeline at
+  every erased frame) is replaced by the spec's voiced/unvoiced
+  classifier path:
+  - The decoder now keeps a saved trailing 120-sample window of
+    post-filtered output (`ERASURE_CLASSIFIER_HISTORY_LEN`), the saved
+    `L_2` (third-subframe lag), and the saved average of subframes 2
+    and 3 fixed-codebook gains.
+  - On erasure, a cross-correlation auto-search over `L_2 ± 3`
+    (`ERASURE_CLASSIFIER_LAG_RADIUS`) computes the best-lag prediction
+    gain in dB. If it exceeds `ERASURE_VOICED_THRESHOLD_DB = 0.58 dB`,
+    the frame is classified voiced and concealment regenerates a
+    periodic excitation at the classifier's pitch via the adaptive
+    codebook with the fixed innovation suppressed; otherwise the frame
+    is classified unvoiced and concealment regenerates a uniform
+    pseudo-random excitation scaled by the saved average gain.
+  - Attenuation follows the spec: 2.5 dB per consecutive erased frame
+    (`ERASURE_ATTENUATION_DB_PER_FRAME`), mute completely after 3
+    interpolated frames (`ERASURE_MUTE_AFTER_FRAMES`). Frames past the
+    mute threshold emit exact silence.
+  - LSP extrapolation continues to apply the wider §3.10.1 stability
+    procedure (`Δ_min = 62.5 Hz`) on the saved previous-frame LSP, but
+    the LSP itself is no longer perturbed by the gain schedule.
+  - Two new tests pin the new behaviour:
+    `decode_erased_attenuation_schedule_matches_spec` confirms the
+    erased-run counter advances and emits exact silence past the mute
+    threshold; `erasure_classifier_distinguishes_voiced_and_unvoiced`
+    seeds the trailing window with a pure 100 Hz sinusoid (voiced ⇒
+    classifier returns lag ≈ 80) and broadband-LCG noise (unvoiced ⇒
+    classifier returns voiced = false) and pins the empty-history
+    fallback.
+  - Both pre-existing integration tests
+    (`erasure_in_middle_of_stream_is_concealed`,
+    `sustained_erasure_run_decays_to_silence`) continue to pass without
+    modification — the spec attenuation schedule still mutes a long
+    erasure run well within their 10-frame envelopes.
 - **LSP stability check reshaped to match G.723.1 §3.1 / 2.6** (round 216).
   The decoded-LSP post-processing in `dequantise_lsp` is no longer an
   ad-hoc cosine-domain `gap ≥ 0.01` clamp; it now follows the spec's

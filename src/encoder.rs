@@ -62,6 +62,8 @@ use oxideav_core::{
 
 use crate::bitreader::BitReader;
 use crate::tables::{
+    ERASURE_ATTENUATION_DB_PER_FRAME, ERASURE_CLASSIFIER_HISTORY_LEN,
+    ERASURE_CLASSIFIER_LAG_RADIUS, ERASURE_MUTE_AFTER_FRAMES, ERASURE_VOICED_THRESHOLD_DB,
     FRAME_SIZE_SAMPLES, HIGH_RATE_BYTES, LOW_RATE_BYTES, LPC_ORDER,
     LSP_STABILITY_DELTA_MIN_ERASURE_HZ, LSP_STABILITY_DELTA_MIN_HZ, LSP_STABILITY_MAX_ITERATIONS,
     PITCH_MAX, PITCH_MIN, POSTFILTER_GAMMA1, POSTFILTER_GAMMA2, POSTFILTER_LTP_GAMMA_HIGH,
@@ -2017,6 +2019,19 @@ pub struct SynthesisState {
     pf_last_gain_fixed: f32,
     /// Number of consecutive erased frames (0 = good frame most recent).
     pf_erased_run: u32,
+    /// Saved `L_2` (last good frame's third-subframe lag) — feeds the
+    /// G.723.1 §3.10.2 voiced/unvoiced classifier and the voiced-path
+    /// periodic-excitation regenerator.
+    pf_last_lag2: i32,
+    /// Average of the last good frame's subframe-2 / subframe-3 fixed-
+    /// codebook gains — drives the unvoiced concealment branch of
+    /// §3.10.2 ("the saved average of subframe-2/3 gain indices").
+    pf_last_gain_unvoiced: f32,
+    /// Trailing 120 samples of post-filtered decoder output. The §3.10.2
+    /// classifier cross-correlates this with itself shifted by `L_2 ± 3`
+    /// to decide voiced vs unvoiced and to refine the pitch period used
+    /// for the voiced-path periodic regenerator.
+    pf_pcm_hist: [f32; ERASURE_CLASSIFIER_HISTORY_LEN],
 }
 
 impl SynthesisState {
@@ -2039,6 +2054,9 @@ impl SynthesisState {
             pf_last_gain_adapt: 0.0,
             pf_last_gain_fixed: 0.0,
             pf_erased_run: 0,
+            pf_last_lag2: 60,
+            pf_last_gain_unvoiced: 0.0,
+            pf_pcm_hist: [0.0; ERASURE_CLASSIFIER_HISTORY_LEN],
         }
     }
 
@@ -2098,6 +2116,16 @@ impl SynthesisState {
     /// Record the last frame's lag and gains for frame-erasure
     /// extrapolation. Called by the decoder entry points *after* they have
     /// decoded one good frame, so the next erased frame can repeat them.
+    ///
+    /// In addition to the last-subframe state used by the legacy
+    /// concealment path, this also captures:
+    ///
+    /// - `L_2` (third-subframe lag): drives the G.723.1 §3.10.2 voiced /
+    ///   unvoiced classifier's cross-correlation window `L_2 ± 3` and
+    ///   the voiced-path periodic regenerator's pitch period.
+    /// - The average fixed-codebook gain across subframes 2 and 3:
+    ///   spec-mandated drive level for the unvoiced concealment branch
+    ///   ("the saved average of subframe-2/3 gain indices is used").
     fn record_last_frame(
         &mut self,
         lags: &[i32; SUBFRAMES_PER_FRAME],
@@ -2107,7 +2135,23 @@ impl SynthesisState {
         let (g_a, g_f) = dequantise_gain(gain_idx[SUBFRAMES_PER_FRAME - 1]);
         self.pf_last_gain_adapt = g_a;
         self.pf_last_gain_fixed = g_f;
+        // G.723.1 §3.10.2 classifier inputs.
+        self.pf_last_lag2 = lags[2];
+        let (_, g_f2) = dequantise_gain(gain_idx[2]);
+        let (_, g_f3) = dequantise_gain(gain_idx[3]);
+        self.pf_last_gain_unvoiced = 0.5 * (g_f2 + g_f3);
         self.pf_erased_run = 0;
+    }
+
+    /// Update the trailing-PCM classifier history with the last
+    /// `ERASURE_CLASSIFIER_HISTORY_LEN` samples of a freshly synthesised
+    /// (post-filtered) frame. Called by the decoder entry points after
+    /// `apply_post_filter` so the §3.10.2 classifier sees the same
+    /// signal a downstream listener would.
+    fn record_pcm_history(&mut self, pcm_f: &[f32; FRAME_SIZE_SAMPLES]) {
+        let tail = FRAME_SIZE_SAMPLES - ERASURE_CLASSIFIER_HISTORY_LEN;
+        self.pf_pcm_hist
+            .copy_from_slice(&pcm_f[tail..tail + ERASURE_CLASSIFIER_HISTORY_LEN]);
     }
 
     /// Long-term (pitch) post-filter per G.723.1 §3.6 (eq. 42–47):
@@ -2472,59 +2516,107 @@ impl SynthesisState {
         }
     }
 
-    /// Concealment path for SID / erased packets. Extrapolates the last
-    /// lag, attenuates the gains, seeds a pseudo-random innovation, runs
-    /// the usual synthesis + post-filter pipeline, and leaves attenuated
-    /// gains in `pf_last_gain_*` so repeated erasures decay smoothly.
+    /// Concealment path for SID / erased packets — G.723.1 §3.10.
+    ///
+    /// Implements the spec's two-stage interpolation:
+    ///
+    /// 1. **LSP interpolation** (§3.10.1): reuse the previous decoded
+    ///    LSP vector, re-applying the §2.6 ordering procedure with the
+    ///    relaxed `Δ_min = 62.5 Hz` so extrapolation drift can be pulled
+    ///    back without destroying the envelope.
+    /// 2. **Residual interpolation** (§3.10.2): a voiced/unvoiced
+    ///    classifier cross-correlates the saved trailing 120 samples of
+    ///    post-filtered output with itself shifted by `L_2 ± 3`. The
+    ///    prediction gain (in dB) decides the branch:
+    ///    - prediction gain `> 0.58 dB` ⇒ voiced: regenerate a periodic
+    ///      excitation at the classifier's pitch period from the saved
+    ///      excitation history.
+    ///    - prediction gain `≤ 0.58 dB` ⇒ unvoiced: regenerate a uniform
+    ///      pseudo-random excitation scaled by the saved average gain
+    ///      across subframes 2 and 3 (`pf_last_gain_unvoiced`).
+    ///
+    /// Sustained erasure attenuates the regenerated vector by an extra
+    /// `2.5 dB` per consecutive interpolated frame and mutes completely
+    /// after `3` interpolated frames (`ERASURE_MUTE_AFTER_FRAMES`).
     ///
     /// Returns 240 concealed S16 samples.
     pub fn decode_erased(&mut self) -> [i16; FRAME_SIZE_SAMPLES] {
         self.pf_erased_run = self.pf_erased_run.saturating_add(1);
-        // Attenuation schedule: halve per frame for the first few erasures,
-        // then mute. Anything louder would make repeated packet loss
-        // audible as "buzzing".
-        let atten = match self.pf_erased_run {
-            1 => 0.7f32,
-            2 => 0.5,
-            3 => 0.35,
-            4 => 0.2,
-            _ => 0.0,
+
+        // §3.10.2 attenuation: 2.5 dB per consecutive erased frame, mute
+        // completely after `ERASURE_MUTE_AFTER_FRAMES` (3) frames.
+        let atten = if self.pf_erased_run > ERASURE_MUTE_AFTER_FRAMES {
+            0.0
+        } else {
+            let db = ERASURE_ATTENUATION_DB_PER_FRAME * self.pf_erased_run as f32;
+            10f32.powf(-db / 20.0)
         };
-        let g_adapt = self.pf_last_gain_adapt * atten;
-        let g_fixed = self.pf_last_gain_fixed * atten;
-        // Erasure-variant LSP stability check (G.723.1 §3.10.1): re-apply
-        // the §2.6 ordering procedure to the extrapolated LSP with the
-        // wider Δ_min = 62.5 Hz so the relaxed constraint allows pairs that
-        // drifted slightly out of order during repeated erasures to be
-        // pulled back without destroying the previous-frame envelope.
+
+        // §3.10.1: erasure-variant LSP stability check with the wider
+        // Δ_min = 62.5 Hz.
         let (lsp_q, _converged) =
             enforce_lsp_stability(&self.prev_lsp, LSP_STABILITY_DELTA_MIN_ERASURE_HZ);
-        let lag = self.pf_last_lag.clamp(PITCH_MIN as i32, PITCH_MAX as i32);
 
-        // Pseudo-random innovation (deterministic LCG) so concealment is
-        // reproducible and doesn't introduce a tonal artefact.
+        // §3.10.2 voiced/unvoiced classifier: cross-correlate the saved
+        // post-filtered PCM history with itself shifted by `L_2 ± 3` and
+        // take the largest prediction gain.
+        let (voiced, classifier_lag) = self.classify_erasure_voicing();
+
+        // Pseudo-random innovation generator for the unvoiced branch.
+        // Deterministic LCG so concealment is reproducible.
         let mut lcg = 0xDEADBEEFu32.wrapping_add(self.pf_erased_run.wrapping_mul(0x9E37_79B9));
         let mut next_rand = || -> f32 {
             lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             ((lcg >> 8) & 0xFFFF) as f32 / 32_768.0 - 1.0
         };
 
+        // Scaled drive level. The voiced branch reuses the saved
+        // last-subframe (g_adapt) since the excitation is already
+        // shaped through the adaptive codebook; the unvoiced branch
+        // uses the saved average of subframes 2 and 3 fixed gains per
+        // §3.10.2.
+        let g_adapt = self.pf_last_gain_adapt * atten;
+        let g_fixed_unvoiced = self.pf_last_gain_unvoiced * atten;
+        // Voiced uses the classifier-estimated pitch; unvoiced has no
+        // periodic structure, so fall back to the last good lag to keep
+        // the adaptive-codebook lookup well-defined (the contribution
+        // multiplies to zero anyway when the classifier reports unvoiced
+        // and the unvoiced branch suppresses `g_adapt`).
+        let lag = if voiced {
+            classifier_lag
+        } else {
+            self.pf_last_lag
+        }
+        .clamp(PITCH_MIN as i32, PITCH_MAX as i32);
+
         let mut pcm = [0.0f32; FRAME_SIZE_SAMPLES];
-        // Run four subframes manually so we bypass the usual gain-dequant
-        // step (we already know g_adapt / g_fixed in fp form).
         for s in 0..SUBFRAMES_PER_FRAME {
             let lsp_interp = interpolate_lsp(s, &self.prev_lsp, &lsp_q);
             let a_sub = lsp_to_lpc(&lsp_interp);
 
             let mut adaptive = [0.0f32; SUBFRAME_SIZE];
             copy_adaptive(&self.exc_history, lag, &mut adaptive);
-            let mut pulses = [0.0f32; SUBFRAME_SIZE];
-            for n in 0..SUBFRAME_SIZE {
-                pulses[n] = next_rand();
-            }
+
+            // §3.10.2 branch.
             let mut exc = [0.0f32; SUBFRAME_SIZE];
-            for n in 0..SUBFRAME_SIZE {
-                exc[n] = g_adapt * adaptive[n] + g_fixed * pulses[n];
+            if voiced {
+                // Voiced: periodic excitation at the classifier's pitch.
+                // The adaptive codebook tap already replays the periodic
+                // structure, so suppress the fixed-codebook innovation
+                // (clause text: "periodic excitation at the classifier's
+                // pitch period").
+                for (slot, a) in exc.iter_mut().zip(adaptive.iter()) {
+                    *slot = g_adapt * *a;
+                }
+            } else {
+                // Unvoiced: uniform random, scaled by the saved average
+                // fixed-codebook gain. The adaptive contribution is
+                // dropped — an unvoiced frame has no pitch structure to
+                // extend.
+                let _ = adaptive;
+                for slot in exc.iter_mut() {
+                    *slot = g_fixed_unvoiced * next_rand();
+                }
             }
 
             // 1/A(z) synthesis.
@@ -2555,11 +2647,79 @@ impl SynthesisState {
             self.exc_history[tail..].copy_from_slice(&exc);
         }
 
-        // Decay gains in place for the next erasure in a run.
-        self.pf_last_gain_adapt = g_adapt;
-        self.pf_last_gain_fixed = g_fixed;
+        // Update classifier history with the concealed PCM so a
+        // subsequent erasure in the same run sees a fresh tail.
+        self.record_pcm_history(&pcm);
 
         to_i16_frame(&pcm)
+    }
+
+    /// G.723.1 §3.10.2 voiced/unvoiced classifier.
+    ///
+    /// Cross-correlates the saved post-filtered PCM history with itself
+    /// shifted by `L_2 ± ERASURE_CLASSIFIER_LAG_RADIUS` and returns
+    /// `(voiced, best_lag)`:
+    ///
+    /// - `voiced = true` if the best-lag prediction gain (in dB) exceeds
+    ///   `ERASURE_VOICED_THRESHOLD_DB` (0.58 dB).
+    /// - `best_lag` is the lag in `L_2 ± 3` maximising the prediction
+    ///   gain — only meaningful when `voiced` is `true`; for unvoiced it
+    ///   still returns the maximising lag but callers should fall back
+    ///   to `pf_last_lag`.
+    fn classify_erasure_voicing(&self) -> (bool, i32) {
+        let hist = &self.pf_pcm_hist;
+        let n = hist.len();
+
+        // Total energy of the trailing window.
+        let mut energy: f32 = 0.0;
+        for &v in hist.iter() {
+            energy += v * v;
+        }
+        if energy <= 0.0 {
+            return (false, self.pf_last_lag2);
+        }
+
+        let centre = self.pf_last_lag2;
+        let radius = ERASURE_CLASSIFIER_LAG_RADIUS;
+        let mut best_lag = centre;
+        let mut best_gain_db = f32::NEG_INFINITY;
+        for d in -radius..=radius {
+            let lag = (centre + d).clamp(PITCH_MIN as i32, PITCH_MAX as i32);
+            let lag_u = lag as usize;
+            if lag_u >= n {
+                continue;
+            }
+            // Forward auto-correlation:
+            //   C = Σ_{k=lag..n} hist[k] · hist[k - lag]
+            //   E = Σ_{k=lag..n} hist[k - lag]^2
+            // Prediction gain (per the §3.6 / §3.10.2 prose):
+            //   −10·log10(1 − C² / (E · T_en))
+            // where `T_en` is the energy of the analysis segment.
+            let mut c: f32 = 0.0;
+            let mut e_lag: f32 = 0.0;
+            let mut t_en: f32 = 0.0;
+            for k in lag_u..n {
+                let cur = hist[k];
+                let prev = hist[k - lag_u];
+                c += cur * prev;
+                e_lag += prev * prev;
+                t_en += cur * cur;
+            }
+            if e_lag <= 0.0 || t_en <= 0.0 {
+                continue;
+            }
+            let ratio = (c * c) / (e_lag * t_en);
+            // ratio is bounded in [0, 1] by Cauchy–Schwarz; clamp for
+            // floating-point slop so the log is well-defined.
+            let one_minus = (1.0 - ratio).clamp(1.0e-30, 1.0);
+            let gain_db = -10.0 * one_minus.log10();
+            if gain_db > best_gain_db {
+                best_gain_db = gain_db;
+                best_lag = lag;
+            }
+        }
+
+        (best_gain_db > ERASURE_VOICED_THRESHOLD_DB, best_lag)
     }
 
     /// Decode one ACELP (5.3 kbit/s) frame into 240 PCM samples.
@@ -2623,6 +2783,7 @@ impl SynthesisState {
         // the pitch postfilter (G.723.1 §3.6).
         self.apply_post_filter(&lsp_q, &lags, Rate::Low, &mut pcm_f);
         self.record_last_frame(&lags, &gain);
+        self.record_pcm_history(&pcm_f);
         Ok(to_i16_frame(&pcm_f))
     }
 
@@ -2694,6 +2855,7 @@ impl SynthesisState {
         // (G.723.1 §3.6).
         self.apply_post_filter(&lsp_q, &lags, Rate::High, &mut pcm_f);
         self.record_last_frame(&lags, &gain);
+        self.record_pcm_history(&pcm_f);
         Ok(to_i16_frame(&pcm_f))
     }
 }
@@ -3205,12 +3367,17 @@ mod tests {
     /// Erased-frame concealment: a SID / Untransmitted frame must produce
     /// a full 240-sample frame that decays with run length. The first
     /// erasure keeps the gain close to the last good frame's; by the 5th
-    /// erasure the gain is fully muted.
+    /// G.723.1 §3.10.2 attenuation schedule: the regenerated
+    /// excitation is attenuated 2.5 dB per consecutive erased frame and
+    /// muted after `ERASURE_MUTE_AFTER_FRAMES` (3) frames. Verifies the
+    /// erased-run counter advances and that any frame past the mute
+    /// threshold emits exact silence.
     #[test]
-    fn decode_erased_produces_decaying_output() {
+    fn decode_erased_attenuation_schedule_matches_spec() {
         let mut st = SynthesisState::new();
         st.pf_last_gain_adapt = 0.5;
         st.pf_last_gain_fixed = 0.2;
+        st.pf_last_gain_unvoiced = 0.2;
         // Seed the excitation history so there's something to propagate.
         for i in 0..st.exc_history.len() {
             st.exc_history[i] = ((i as f32 * 0.17).sin()) * 0.1;
@@ -3219,14 +3386,57 @@ mod tests {
         assert_eq!(e1.len(), FRAME_SIZE_SAMPLES);
         assert_eq!(st.pf_erased_run, 1);
 
-        // Run a handful more to confirm repeated erasure decays and never
-        // panics. (Samples are i16, trivially finite.)
-        for _ in 0..10 {
-            let ek = st.decode_erased();
-            let _ = ek;
+        // Run frames 2..=ERASURE_MUTE_AFTER_FRAMES and one past.
+        for _ in 0..ERASURE_MUTE_AFTER_FRAMES {
+            let _ = st.decode_erased();
         }
-        assert_eq!(st.pf_last_gain_adapt, 0.0);
-        assert_eq!(st.pf_last_gain_fixed, 0.0);
+        // First frame past the mute threshold must be exact silence.
+        let muted = st.decode_erased();
+        assert!(
+            muted.iter().all(|&s| s == 0),
+            "expected silence after mute threshold"
+        );
+    }
+
+    /// G.723.1 §3.10.2 voiced/unvoiced classifier: a strongly periodic
+    /// trailing window should be reported as voiced with a lag close to
+    /// the seeded pitch period; a broadband-random trailing window
+    /// should be reported as unvoiced.
+    #[test]
+    fn erasure_classifier_distinguishes_voiced_and_unvoiced() {
+        // Voiced: pure 100 Hz sinusoid at 8 kHz ⇒ period ≈ 80 samples.
+        let mut st = SynthesisState::new();
+        st.pf_last_lag2 = 80;
+        for i in 0..st.pf_pcm_hist.len() {
+            let t = i as f32;
+            st.pf_pcm_hist[i] = (2.0 * std::f32::consts::PI * t / 80.0).sin();
+        }
+        let (voiced, lag) = st.classify_erasure_voicing();
+        assert!(voiced, "pure sinusoid should classify voiced");
+        assert!(
+            (lag - 80).abs() <= ERASURE_CLASSIFIER_LAG_RADIUS,
+            "expected lag near 80, got {lag}"
+        );
+
+        // Unvoiced: deterministic LCG broadband noise.
+        let mut st2 = SynthesisState::new();
+        st2.pf_last_lag2 = 80;
+        let mut lcg: u32 = 0x1234_5678;
+        for s in st2.pf_pcm_hist.iter_mut() {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *s = ((lcg >> 8) & 0xFFFF) as f32 / 32_768.0 - 1.0;
+        }
+        let (voiced2, _) = st2.classify_erasure_voicing();
+        assert!(
+            !voiced2,
+            "broadband noise should classify unvoiced (gain {})",
+            "n/a"
+        );
+
+        // Empty / zero history must return unvoiced without panicking.
+        let st3 = SynthesisState::new();
+        let (voiced3, _) = st3.classify_erasure_voicing();
+        assert!(!voiced3, "silent history must classify unvoiced");
     }
 
     /// Rate ↔ γ_ltp mapping must match the published §3.6 constants.

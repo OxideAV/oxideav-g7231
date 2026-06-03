@@ -90,6 +90,34 @@ pub const POSTFILTER_LTP_PRED_GAIN_DB_MIN: f32 = 1.25;
 /// reference pitch lag (G.723.1 §3.6 eq. 43.1–43.2: `M_f ∈ [L − 3, L + 3]`).
 pub const POSTFILTER_LTP_SEARCH_RADIUS: i32 = 3;
 
+/// Length in samples of the post-filtered PCM history used by the
+/// frame-erasure voiced/unvoiced classifier (G.723.1 §3.10.2). The spec
+/// cross-correlates the last 120 samples (= two 60-sample subframes) of
+/// the decoder's output with a lag-shifted copy around `L_2 ± 3`.
+pub const ERASURE_CLASSIFIER_HISTORY_LEN: usize = 120;
+
+/// Half-width of the lag search around `L_2` for the §3.10.2 voiced
+/// classifier — the spec cross-correlation runs over `L_2 ± 3`.
+pub const ERASURE_CLASSIFIER_LAG_RADIUS: i32 = 3;
+
+/// Voiced / unvoiced prediction-gain threshold for the frame-erasure
+/// classifier (G.723.1 §3.10.2). Above 0.58 dB the trailing 120 samples
+/// are deemed voiced and concealment regenerates a periodic excitation
+/// at the classifier's pitch period; below the threshold the frame is
+/// unvoiced and concealment regenerates a uniform-random excitation
+/// scaled by the saved average gain.
+pub const ERASURE_VOICED_THRESHOLD_DB: f32 = 0.58;
+
+/// Per-erased-frame attenuation in dB applied during sustained erasure
+/// (G.723.1 §3.10.2). The spec attenuates the regenerated vector by an
+/// extra 2.5 dB per consecutive erased frame.
+pub const ERASURE_ATTENUATION_DB_PER_FRAME: f32 = 2.5;
+
+/// Number of consecutive interpolated frames after which the concealed
+/// output is fully muted (G.723.1 §3.10.2: "mute completely after 3
+/// interpolated frames"). Erasure runs longer than this emit silence.
+pub const ERASURE_MUTE_AFTER_FRAMES: u32 = 3;
+
 /// Bit-layout (high-rate, MP-MLQ) — field widths in bits, in packing order.
 ///
 /// Derived from ITU-T G.723.1 Annex B Table B.1. The implementation below

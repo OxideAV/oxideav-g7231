@@ -67,9 +67,10 @@ The registered `Decoder` is a full synthesiser:
   LSP persist across packets, so a stream of packets decodes without
   per-frame cold-start transients.
 - `reset()` reinitialises the synthesiser to silence.
-- SID and untransmitted frames are accepted as framing-valid and emit
-  silence (comfort-noise generation + erasure concealment are future
-  work).
+- SID and untransmitted frames are accepted as framing-valid and feed
+  the spec-aligned §3.10.2 concealment path described below; comfort-
+  noise generation (Annex A SID parameter parsing) is future work, but
+  packets carrying only the discriminator no longer emit raw silence.
 
 ### LSP stability check — G.723.1 §3.1 / 2.6 (round 216)
 
@@ -101,6 +102,45 @@ variant when the input violates the wider floor; every dequantised
 LSP from a probe set of indices hits the 31.25 Hz floor and stays
 strictly monotone in cosine domain; degenerate all-equal input still
 yields a finite LPC).
+
+### Frame-erasure concealment — G.723.1 §3.10.2 (round 222)
+
+The decoder's frame-erasure path (triggered by `0b10` SID and `0b11`
+untransmitted discriminators) now follows the spec's two-stage
+interpolation rather than the previous fixed-decay-plus-random scheme:
+
+- A trailing 120-sample window of post-filtered output is kept across
+  good frames (`ERASURE_CLASSIFIER_HISTORY_LEN = 120`) along with the
+  saved third-subframe lag `L_2` and the average fixed-codebook gain
+  over subframes 2 and 3.
+- On erasure, `SynthesisState::classify_erasure_voicing` cross-
+  correlates the trailing window with itself shifted by `L_2 ± 3`
+  (`ERASURE_CLASSIFIER_LAG_RADIUS = 3`) and converts the best ratio
+  `C² / (E_lag · T_en)` to a prediction gain in dB. Above
+  `ERASURE_VOICED_THRESHOLD_DB = 0.58 dB` the trailing window is
+  deemed *voiced* and concealment regenerates a periodic excitation at
+  the classifier's pitch period through the adaptive codebook with the
+  fixed-codebook contribution suppressed; below the threshold the
+  trailing window is *unvoiced* and concealment regenerates a uniform
+  pseudo-random excitation scaled by the saved average gain.
+- Sustained erasure attenuates the regenerated excitation by an extra
+  `ERASURE_ATTENUATION_DB_PER_FRAME = 2.5 dB` per consecutive erased
+  frame; the run counter past `ERASURE_MUTE_AFTER_FRAMES = 3`
+  produces exact silence.
+- The §3.10.1 LSP-extrapolation stability pass with the wider
+  `Δ_min = 62.5 Hz` floor continues to apply on the previous-frame LSP
+  before the per-subframe LSP interpolation runs.
+
+Two new unit tests pin the behaviour:
+`erasure_classifier_distinguishes_voiced_and_unvoiced` confirms a pure
+100 Hz sinusoid is reported voiced with a lag inside `80 ± 3` while
+broadband-LCG noise is reported unvoiced and an empty history falls
+back to unvoiced; `decode_erased_attenuation_schedule_matches_spec`
+confirms the erased-run counter advances and that the first frame past
+the mute threshold emits exact zero samples. Both pre-existing
+integration tests (`erasure_in_middle_of_stream_is_concealed`,
+`sustained_erasure_run_decays_to_silence`) continue to pass against
+the new path without modification.
 
 ### Pitch (long-term) post-filter — G.723.1 §3.6 (round 211)
 
@@ -315,8 +355,13 @@ The output `CodecParameters` returned by the encoder always has
   on voiced speech-like input.
 - Decoder, both rates: full-synthesis, stateful across packets.
 - No VAD / CNG in the encoder — every frame is coded as speech.
-- Comfort-noise generation (SID) and erasure concealment (untransmitted
-  frames) in the decoder emit silence today; framing is accepted.
+- Erasure / SID concealment in the decoder now follows G.723.1 §3.10.2
+  (voiced/unvoiced classifier, periodic-vs-random regenerated
+  excitation, 2.5 dB/frame attenuation, mute after 3 frames). Annex A
+  SID parameter parsing (encoder-side comfort-noise descriptor
+  generation, decoder-side noise-fill seeding from saved SID
+  parameters) is still future work; raw silence is no longer the
+  fallback.
 
 ## License
 
