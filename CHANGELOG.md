@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-g7231/compare/v0.0.7...v0.0.8) - 2026-06-05
+
+### Other
+
+- add cargo-fuzz harness on the decoder's attacker surface
+- spec-shape tilt + AGC per G.723.1 §3.8 / 3.9
+- spec-shape frame-erasure path per G.723.1 §3.10.2
+- spec-shape LSP stability per G.723.1 §3.1 / 2.6
+- spec-shape pitch postfilter per G.723.1 §3.6
+- add Criterion bench harness (encode/decode/roundtrip, both rates)
+- land ITU-T G.723.1 spec-table data (27 tables, 17 invariant tests)
+
 ### Added
 
 - **`fuzz/` cargo-fuzz harness on the decoder's attacker surface**
