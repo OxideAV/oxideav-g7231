@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `cargo-fuzz` scaffold + a single `decode` target on the registered
+  G.723.1 decoder's attacker surface (round 236). Drives attacker-
+  supplied bytes through `Decoder::send_packet` as a sequence of up
+  to 16 variable-length packets (cap 64 B each), with sizes drawn
+  from the spec-legal `{0, 1, 4, 20, 24}` ladder per G.723.1 §3.7
+  plus an attacker-chosen length so the per-rate
+  length-validation rejection at `parse_frame_type` is reachable.
+  Each packet's first body byte is fed verbatim so the 2-bit rate
+  discriminator is attacker-controlled, forcing the decoder's
+  cross-packet state machine — `pending` VecDeque, `next_pts`
+  advance, `drained` flag, `SynthesisState`, frame-erasure run
+  counter (§3.10.2), formant-postfilter / AGC memory (§3.9) —
+  through the discriminator transitions a single-rate harness never
+  reaches. `flush()` and `reset()` are injected mid-stream at
+  deterministic hook points so the post-flush `Eof` path and the
+  silence re-seed are covered. The contract under test is purely
+  panic-freedom; output frames are discarded. Headline: ~200 000
+  runs in 13 s on macOS aarch64, no crashes. Run with
+  `cargo fuzz run decode` on a nightly toolchain.
+
 ### Changed
 
 - **Formant-postfilter tilt + adaptive gain scaling reshaped to match

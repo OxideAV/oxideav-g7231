@@ -331,6 +331,43 @@ real-time encoding and ~ 6 000 × faster than real-time decoding.
 Future optimisation rounds can A/B-test their tweaks against these
 numbers.
 
+## Fuzzing (round 236)
+
+A single `cargo-fuzz` target lives under `fuzz/fuzz_targets/decode.rs`
+and exercises the attacker surface of the registered G.723.1 decoder.
+The target drives attacker-supplied bytes through `Decoder::send_packet`
+as a sequence of up to 16 variable-length packets (capped at 64 B each
+to bound per-iteration allocation), with the packet size deterministic-
+ally drawn from the spec-legal `{0, 1, 4, 20, 24}` ladder plus an
+attacker-chosen length. Each packet's first body byte is fed verbatim
+so the 2-bit rate discriminator (`00` high / `01` low / `10` SID / `11`
+untransmitted, per G.723.1 §3.7) is attacker-controlled, and the
+decoder's cross-packet state machine — `pending` VecDeque, `next_pts`
+advance, `drained` flag, `SynthesisState`, frame-erasure run counter
+(§3.10.2), formant-postfilter / AGC memory (§3.9) — is forced through
+the discriminator transitions a single-rate harness never reaches.
+`flush()` and `reset()` are also injected mid-stream at deterministic
+hook points so the post-flush `Eof` path and the silence re-seed
+behaviour are covered.
+
+The contract under test is purely panic-freedom on every
+`Decoder` entry point. Output frames are discarded — PCM-shape sanity
+remains the domain of the integration test (`tests/codec_roundtrip.rs`)
+and the bench harness.
+
+Run with a nightly toolchain:
+
+```bash
+cargo fuzz run decode
+```
+
+Headline coverage on the empty corpus: ~200 000 runs in 13 s on
+macOS aarch64, no crashes, no leaks. The recommended dictionary
+libFuzzer emits at the end of a short session features the four rate
+discriminators in the low 2 bits of the first body byte, confirming
+the target is steering the input toward the rate-dispatch surface
+rather than getting stuck on a single branch.
+
 ## Quick use
 
 ```rust

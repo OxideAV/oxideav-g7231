@@ -1,0 +1,59 @@
+# cargo-fuzz manifest for the oxideav-g7231 decoder attacker surface.
+#
+# Round 236 depth-mode lane. The codec landed bench coverage in
+# round 203 (`crates/oxideav-g7231/benches/{encode,decode,roundtrip}.rs`)
+# and finished the spec-shape audio-quality work in rounds 211 / 216 /
+# 222 / 229 (pitch postfilter, LSP stability, frame-erasure
+# concealment, formant tilt + AGC). The remaining depth-mode lane
+# without coverage is libFuzzer on the public decoder trait surface.
+#
+# Spec basis for the targets: ITU-T G.723.1 Recommendation §3.7 (rate
+# discriminator decoding), §3.9 (postfilter + AGC steady-state), and
+# §3.10.2 (frame-erasure concealment). The harness drives
+# `oxideav_g7231::register_codecs` + the registered `Decoder` trait
+# object via attacker-supplied bytes; the contract under test is
+# panic-freedom on every public entry, irrespective of input shape.
+
+[package]
+name = "oxideav-g7231-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+
+[dependencies.oxideav-g7231]
+path = ".."
+
+# Self-contained workspace so the umbrella's `crates/*` member glob
+# (one level deep — this manifest is two levels deep and would not
+# match anyway) cannot pull this package in.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# ------------------------------------------------------------------
+# Fuzz targets.
+# ------------------------------------------------------------------
+
+# Target 1 — `decode`. Single libfuzzer entry that drives
+# attacker-controlled bytes through `Decoder::send_packet` on a
+# freshly registered G.723.1 decoder, splitting the input into
+# multiple variable-length packets so the cross-packet state machine
+# (pending queue, next_pts advance, drained flag, internal
+# SynthesisState, frame-erasure run counter) is exercised across a
+# mixed sequence of rate-discriminator branches (00 high / 01 low /
+# 10 SID / 11 untransmitted). Also exercises `flush()`, `reset()`,
+# and a forced double-flush so the post-flush `Eof` path is covered.
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
