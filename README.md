@@ -331,6 +331,54 @@ real-time encoding and ~ 6 000 × faster than real-time decoding.
 Future optimisation rounds can A/B-test their tweaks against these
 numbers.
 
+## Fuzzing (round 236)
+
+The decoder's attacker surface — `Decoder::send_packet` on a stream of
+0/1/4/20/24-byte packets — is covered by a panic-free cargo-fuzz
+harness under `fuzz/`. Each fuzz input is sliced into length-prefixed
+packets and fed through the registered decoder produced by
+`register_codecs(&mut CodecRegistry)` + `first_decoder`; `receive_frame`
+is drained to completion after every `send_packet` and `reset()` runs
+at the end of the stream so the per-input recovery path is exercised
+too. The contract under test is that every call *returns* —
+malformed framing surfaces as a typed `Error::invalid(...)` and
+well-formed packets produce `Ok(())` — and that neither path panics,
+integer-overflows in a debug build, indexes out of bounds, or
+allocates an attacker-controlled buffer. The cross-rate state
+transitions (MP-MLQ → ACELP → SID → erased → MP-MLQ ...) are
+reachable directly by the harness's sliced-packet shape, so the rate-
+discriminator dispatch branch and the previous-frame carry-over (LSP,
+adaptive-codebook excitation history, LPC synthesis filter memory,
+post-filter taps) are covered without a separate target.
+
+A seven-file seed corpus is checked in under
+`fuzz/corpus/decode/` to give libFuzzer a structurally-valid baseline
+to splice from:
+
+| Seed                        | Shape                                                          |
+| :-------------------------- | :------------------------------------------------------------- |
+| `mpmlq_5frames.bin`         | five 24-byte MP-MLQ packets, length-prefixed                   |
+| `acelp_5frames.bin`         | five 20-byte ACELP packets, length-prefixed                    |
+| `sid_10frames.bin`          | ten 4-byte SID packets (discriminator `10`)                    |
+| `erased_10frames.bin`       | ten 1-byte untransmitted packets (discriminator `11`)          |
+| `mixed_20frames.bin`        | round-robin MP-MLQ / ACELP / SID / erased — every transition   |
+| `single_empty_packet.bin`   | one zero-length packet → `Error::invalid("empty packet")`      |
+| `single_erased.bin`         | one 1-byte untransmitted packet, no preceding history          |
+
+Bring-up smoke run (macOS aarch64, release `cargo fuzz run decode --
+-max_total_time=60`): **327 331 iterations in 60 seconds, 0 crashes,
+1 594 new corpus units discovered** — confirms initial coverage on the
+MP-MLQ / ACELP / SID / erased / empty branches and the cross-rate
+state-transition cascade. The Daily Fuzz workflow
+(`.github/workflows/fuzz.yml`) runs the same harness on CI on a
+30-minute budget per day.
+
+Run locally with:
+
+```bash
+cargo +nightly fuzz run decode
+```
+
 ## Quick use
 
 ```rust

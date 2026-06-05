@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`fuzz/` cargo-fuzz harness on the decoder's attacker surface**
+  (round 236).
+  - New `decode` fuzz target under `fuzz/fuzz_targets/decode.rs`
+    walks attacker-supplied byte streams through the registered
+    `Decoder` trait surface. Each fuzz input is sliced into length-
+    prefixed packets (1-byte length, clamped to the remaining
+    slice) and fed through the decoder produced by
+    `register_codecs(&mut CodecRegistry)` + `first_decoder`;
+    `receive_frame` is drained to completion after every
+    `send_packet`, and `reset()` runs at the end of the stream so
+    the per-input recovery path is covered.
+  - The contract under test is panic-free behaviour across the four
+    rate-discriminator branches (MP-MLQ 192-bit unpack + dequant +
+    LPC synthesis, ACELP 158-bit unpack + dequant + LPC synthesis,
+    SID / untransmitted §3.10.2 concealment, empty-packet
+    rejection). The harness reaches the cross-rate state
+    transitions (MP-MLQ → ACELP → SID → erased → MP-MLQ ...)
+    directly via its sliced-packet shape, so the previous-frame
+    carry-over (LSP, adaptive-codebook excitation history, LPC
+    synthesis filter memory, post-filter taps) is covered without
+    a separate target.
+  - Seven-file seed corpus checked in at `fuzz/corpus/decode/`
+    (length-prefixed MP-MLQ, ACELP, SID, erased, mixed-rate,
+    single-empty-packet, single-erased) so libFuzzer has a
+    structurally-valid baseline to splice from.
+  - `.github/workflows/fuzz.yml` shim onto the `OxideAV/.github`
+    `crate-fuzz.yml` reusable workflow runs the harness daily on a
+    30-minute budget (07:37 UTC, jittered off the hour).
+  - Bring-up smoke run (macOS aarch64, release
+    `cargo fuzz run decode -- -max_total_time=60`): 327 331
+    iterations in 60 seconds, 0 crashes, 1 594 new corpus units
+    discovered, ~5 366 exec/sec steady-state — confirms initial
+    coverage on every dispatch branch plus the cross-rate cascade.
+
 ### Changed
 
 - **Formant-postfilter tilt + adaptive gain scaling reshaped to match

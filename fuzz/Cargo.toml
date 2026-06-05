@@ -1,0 +1,72 @@
+[package]
+name = "oxideav-g7231-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Round 236 (depth-mode fuzz lane). G.723.1's decoder is the attacker
+# surface worth fuzzing: a stream of 0/1/4/20/24-byte packets, each
+# whose 2-bit rate discriminator routes through one of four
+# `SynthesisState` entry points (MP-MLQ 192-bit unpack + dequant
+# pipeline, ACELP 158-bit unpack + dequant pipeline, the
+# SID / untransmitted frame-erasure concealment path, or the
+# `parse_frame_type` short-circuit on an empty packet). The LSP
+# inverse-quantiser, the adaptive- and fixed-codebook excitation
+# builders, the LPC synthesis filter, the pitch and formant post-
+# filters, the tilt compensator and the smoothed AGC are all driven
+# from attacker-controlled bytes via the registered `Decoder`
+# trait-object surface (`send_packet` / `receive_frame` / `reset`).
+#
+# A single fuzz target covers this:
+#
+# - **`decode`**: panic-free walk of the public `Decoder` surface on a
+#   stream of attacker-supplied packets. Each fuzz input is sliced
+#   into length-prefixed packets and fed through the registered
+#   decoder produced by `register_codecs(&mut CodecRegistry)` +
+#   `first_decoder`; receive_frame is drained to completion after
+#   each `send_packet`. The contract is that every call returns —
+#   typed `Err(oxideav_core::Error::…)` on malformed input, `Ok(())`
+#   on well-formed — and that neither path panics, integer-overflows
+#   in a debug build, indexes out of bounds, allocates an attacker-
+#   controlled buffer, or leaves the decoder in a state that
+#   subsequent calls cannot recover from. The cross-rate state
+#   transitions (MP-MLQ → ACELP → erased → SID → MP-MLQ …) are
+#   reachable directly by the fuzz harness's sliced-packet shape, so
+#   the rate-discriminator dispatch branch and the previous-frame
+#   carry-over (LSP, excitation history, post-filter memory) are
+#   covered without a separate target.
+#
+# No external library is consulted as a cross-decode oracle: the
+# clean-room wall bars reading the ITU-T G.723.1 reference C source
+# / FFmpeg / SpanDSP / any commercial G.723.1 implementation for any
+# reason, and the contract under test is purely panic-free behaviour,
+# not bit-equivalence to a third-party decoder. The harness is fed
+# from a small seed corpus (`corpus/decode/*`) containing the four
+# canonical packet shapes (MP-MLQ, ACELP, SID, untransmitted) plus
+# one mixed-rate stream so libFuzzer's structure-aware mutator has a
+# valid baseline to splice from.
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-g7231]
+path = ".."
+
+[dependencies.oxideav-core]
+version = "0.1"
+
+# Prevent this fuzz package from being pulled into the umbrella
+# workspace at `crates/*` glob-resolve time.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false

@@ -1,0 +1,24 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harness under fuzz/. G.723.1's
+# attacker surface is the registered Decoder trait's `send_packet`
+# entry point: a stream of 0/1/4/20/24-byte packets whose 2-bit rate
+# discriminator routes through one of four `SynthesisState` paths
+# (MP-MLQ unpack + dequant + synthesis, ACELP unpack + dequant +
+# synthesis, SID / untransmitted frame-erasure concealment, or the
+# empty-packet rejection branch). The clean-room wall bars reading
+# any external library source as a cross-decode oracle, so this is a
+# pure panic-free harness: one `decode` target gets the whole
+# 30-minute budget.
+
+on:
+  schedule:
+    - cron: "37 7 * * *"   # daily 07:37 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit
