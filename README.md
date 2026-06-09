@@ -286,6 +286,47 @@ internally-consistent codebooks. Threading these spec tables through
 the LPC / LSP / gain quantiser to produce a bit-exact spec-compatible
 bitstream is the next-round task.
 
+### Typed accessor primitives + deeper invariants (round 265)
+
+The `spec_tables` module now exposes typed accessor helpers on top of
+the raw arrays:
+
+- `LspBand` (`Band0` / `Band1` / `Band2`) with `start_and_length()`
+  pulling each band's `(start, dim)` pair out of `LSP_BAND_INFO`;
+  `lsp_codebook_entry(band, idx)` slicing one codeword row of the
+  correct dimension out of the 3-band split VQ.
+- `SpecRate::{High, Low}` driving `adaptive_codebook_gain_row` (returns
+  the 20-sample row, `None` past the rate-specific row count) and
+  `taming_gain` (returns the published i16 entry, `None` past the
+  table).
+- `fixed_codebook_gain(idx)` surfacing the 24 published levels.
+- `mpmlq_combinatorial(row, col)` exposing the C(n, k) table as a
+  typed 2-D lookup with bounds checks; `mpmlq_pulse_count(subframe)`
+  / `mpmlq_max_position(subframe)` returning the per-subframe published
+  values.
+
+Fourteen new unit tests pin previously-unverified structural invariants
+of the published data alongside the accessor behaviour:
+
+- LSP DC-predicted frequencies are strictly increasing and bounded in
+  Q15.
+- The perceptual-weighting pole table is exactly halving
+  (`p[i] = p[i − 1] / 2`).
+- The postfilter pole table is a 3/4-geometric sequence (matched to
+  within ±1 Q15 unit of rounding).
+- The postfilter zero table is strictly decreasing positive.
+- The fixed-codebook gain codebook is log-spaced with a per-step
+  ratio inside `[1.30, 1.70]` after the first few Q15-rounded entries,
+  spanning >1000× across the 24 levels.
+- The MP-MLQ combinatorial table satisfies the Pascal-rule recurrence
+  `T[r][c] = T[r][c+1] + T[r+1][c+1]` across its positive-support
+  window — confirming it is a contiguous binomial table.
+- Both taming-gain tables (5p3 and 6p3) are monotonically
+  non-decreasing with the published 1024 Q-unit floor.
+- `LspBand::ALL` covers indices 0..10 contiguously.
+
+Total lib-test count: **85** (up from 71).
+
 ## Benchmarks (round 203)
 
 Three Criterion harnesses cover the encoder, decoder, and full round-

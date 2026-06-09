@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed-accessor primitives + deeper invariant tests on the staged
+  G.723.1 spec-table data (round 265). The new accessors in
+  `spec_tables` wrap the published raw arrays with index-typed
+  lookups: `LspBand` (`Band0` / `Band1` / `Band2`) carrying the
+  `(start, length)` partition info; `lsp_codebook_entry(band, idx)`
+  slicing one codeword row of the correct dimension out of the
+  3-band split VQ; `SpecRate::{High, Low}` driving
+  `adaptive_codebook_gain_row` (returns the 20-sample row, `None`
+  past the rate-specific row count) and `taming_gain` (returns the
+  i16 entry, `None` past the table); `fixed_codebook_gain`
+  surfacing the 24 published levels; `mpmlq_combinatorial(row, col)`
+  exposing the C(n, k) table as a typed 2-D lookup with bounds
+  checks; `mpmlq_pulse_count` / `mpmlq_max_position` returning the
+  per-subframe published values. Constants surfaced:
+  `LSP_CODEBOOK_ENTRIES_PER_BAND = 256`, `LSP_CODEBOOK_MAX_INDEX`,
+  `ADAPTIVE_CODEBOOK_ROW_DIM = 20`, `ADAPTIVE_CODEBOOK_ROWS_5P3 =
+  85`, `ADAPTIVE_CODEBOOK_ROWS_6P3 = 170`,
+  `MPMLQ_COMBINATORIAL_ROWS = 6`, `MPMLQ_COMBINATORIAL_COLS = 30`.
+  Fourteen new unit tests pin both the accessor behaviour and
+  previously-unverified structural invariants of the data:
+  LSP DC-predicted-frequency strict monotonicity + Q15 bounds; the
+  perceptual-weighting pole table being an exact halving sequence;
+  the postfilter pole table being a 3/4-geometric sequence (±1 Q15
+  rounding); the postfilter zero table strictly decreasing positive;
+  the fixed-codebook gain codebook log-spaced with bounded step
+  ratio and >1000× span; the MP-MLQ combinatorial table satisfying
+  the Pascal-rule recurrence `T[r][c] = T[r][c+1] + T[r+1][c+1]`
+  across the positive-support window; taming-gain non-decreasing
+  with a 1024 floor for both rates; LSP band coverage contiguous
+  through `LspBand::ALL`; accessor round-trip tests for every
+  helper. Lib-test count: 71 → 85.
 - `cargo-fuzz` scaffold + a single `decode` target on the registered
   G.723.1 decoder's attacker surface (round 236). Drives attacker-
   supplied bytes through `Decoder::send_packet` as a sequence of up

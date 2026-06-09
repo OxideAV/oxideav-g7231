@@ -829,6 +829,143 @@ pub const BIT_ALLOCATION_SEGMENT_BASE: [i16; 3] = [0, 32, 96];
 pub const BIT_ALLOCATION_SEGMENT_BOUNDARIES: [i32; 3] = [2048, 18432, 231233];
 
 // ---------------------------------------------------------------------------
+// Typed accessor primitives
+// ---------------------------------------------------------------------------
+//
+// These wrap the raw arrays above with index-typed lookups. They surface the
+// `(start, length)` band-info pairs as a structured tuple, slice out one
+// codebook row given a band + 8-bit codeword index, and pick the correct
+// rate-specific adaptive-codebook / taming-procedure row by [`Rate63K`] /
+// [`Rate53K`] discriminator. They are pure facts derived from the published
+// dimensions; no algorithm logic is encoded here.
+
+/// Discriminator for the rate-specific spec tables.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SpecRate {
+    /// 6.3 kbit/s MP-MLQ.
+    High,
+    /// 5.3 kbit/s ACELP.
+    Low,
+}
+
+/// LSP split-VQ band index (0..=2).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LspBand {
+    /// First band, LSP indices 0..3 (dimension 3).
+    Band0,
+    /// Second band, LSP indices 3..6 (dimension 3).
+    Band1,
+    /// Third band, LSP indices 6..10 (dimension 4).
+    Band2,
+}
+
+impl LspBand {
+    /// All three band identifiers in order.
+    pub const ALL: [LspBand; 3] = [LspBand::Band0, LspBand::Band1, LspBand::Band2];
+
+    /// `(start, length)` pair into the 10-dim LSP vector.
+    pub const fn start_and_length(self) -> (usize, usize) {
+        match self {
+            LspBand::Band0 => (LSP_BAND_INFO[0] as usize, LSP_BAND_INFO[1] as usize),
+            LspBand::Band1 => (LSP_BAND_INFO[2] as usize, LSP_BAND_INFO[3] as usize),
+            LspBand::Band2 => (LSP_BAND_INFO[4] as usize, LSP_BAND_INFO[5] as usize),
+        }
+    }
+
+    /// Number of entries in this band's codebook (always 256).
+    pub const fn codebook_entries(self) -> usize {
+        256
+    }
+}
+
+/// Number of entries per LSP-VQ codebook (8-bit index).
+pub const LSP_CODEBOOK_ENTRIES_PER_BAND: usize = 256;
+
+/// Maximum supported codeword index for an LSP band's codebook.
+pub const LSP_CODEBOOK_MAX_INDEX: u8 = u8::MAX;
+
+/// Look up one LSP codebook entry as a slice of length equal to the band's
+/// dimension. `index` is the published 8-bit codeword index (0..=255).
+pub fn lsp_codebook_entry(band: LspBand, index: u8) -> &'static [i16] {
+    let (_, dim) = band.start_and_length();
+    let lo = index as usize * dim;
+    let hi = lo + dim;
+    match band {
+        LspBand::Band0 => &LSP_CODEBOOK_BAND0_Q13[lo..hi],
+        LspBand::Band1 => &LSP_CODEBOOK_BAND1_Q13[lo..hi],
+        LspBand::Band2 => &LSP_CODEBOOK_BAND2_Q13[lo..hi],
+    }
+}
+
+/// Dimension of an adaptive-codebook gain entry (each row has 20 i16 samples).
+pub const ADAPTIVE_CODEBOOK_ROW_DIM: usize = 20;
+
+/// Number of adaptive-codebook gain entries for the 5.3 kbit/s rate.
+pub const ADAPTIVE_CODEBOOK_ROWS_5P3: usize = 85;
+
+/// Number of adaptive-codebook gain entries for the 6.3 kbit/s rate.
+pub const ADAPTIVE_CODEBOOK_ROWS_6P3: usize = 170;
+
+/// Look up one adaptive-codebook gain row, slice of 20 i16 (§2.14).
+/// Returns `None` if `index` is out of range for the requested rate.
+pub fn adaptive_codebook_gain_row(rate: SpecRate, index: u32) -> Option<&'static [i16]> {
+    let (rows, table): (usize, &[i16]) = match rate {
+        SpecRate::Low => (ADAPTIVE_CODEBOOK_ROWS_5P3, &ADAPTIVE_CODEBOOK_GAIN_5P3),
+        SpecRate::High => (ADAPTIVE_CODEBOOK_ROWS_6P3, &ADAPTIVE_CODEBOOK_GAIN_6P3),
+    };
+    let i = index as usize;
+    if i >= rows {
+        return None;
+    }
+    let lo = i * ADAPTIVE_CODEBOOK_ROW_DIM;
+    let hi = lo + ADAPTIVE_CODEBOOK_ROW_DIM;
+    Some(&table[lo..hi])
+}
+
+/// Look up one taming-procedure gain (§2.17) by rate + index.
+/// Returns `None` for out-of-range indices.
+pub fn taming_gain(rate: SpecRate, index: u32) -> Option<i16> {
+    let table: &[i16] = match rate {
+        SpecRate::Low => &TAMING_GAIN_5P3,
+        SpecRate::High => &TAMING_GAIN_6P3,
+    };
+    table.get(index as usize).copied()
+}
+
+/// Look up one of the 24 published fixed-codebook gain levels (§2.13).
+/// Returns `None` for out-of-range indices.
+pub fn fixed_codebook_gain(index: u8) -> Option<i16> {
+    FIXED_CODEBOOK_GAIN_Q15.get(index as usize).copied()
+}
+
+/// MP-MLQ combinatorial table dimensions: 6 rows × 30 columns laid out
+/// row-major in [`MPMLQ_COMBINATORIAL`].
+pub const MPMLQ_COMBINATORIAL_ROWS: usize = 6;
+/// Number of columns in [`MPMLQ_COMBINATORIAL`].
+pub const MPMLQ_COMBINATORIAL_COLS: usize = 30;
+
+/// Look up one entry of the MP-MLQ combinatorial position table (§2.13)
+/// by `(row, column)` indices. Returns `None` if either index is out of range.
+pub fn mpmlq_combinatorial(row: usize, column: usize) -> Option<u32> {
+    if row >= MPMLQ_COMBINATORIAL_ROWS || column >= MPMLQ_COMBINATORIAL_COLS {
+        return None;
+    }
+    Some(MPMLQ_COMBINATORIAL[row * MPMLQ_COMBINATORIAL_COLS + column])
+}
+
+/// Per-subframe MP-MLQ pulse count (§2.13). Subframes 0+2 carry 6 pulses,
+/// subframes 1+3 carry 5.
+pub fn mpmlq_pulse_count(subframe: usize) -> Option<i16> {
+    MPMLQ_PULSE_COUNT_PER_SUBFRAME.get(subframe).copied()
+}
+
+/// Maximum codeword index for the MP-MLQ pulse-position search at one
+/// subframe (§2.13). Subframes 0+2 share one bound, 1+3 share another.
+pub fn mpmlq_max_position(subframe: usize) -> Option<u32> {
+    MPMLQ_MAX_POSITION.get(subframe).copied()
+}
+
+// ---------------------------------------------------------------------------
 // Compile-time invariants
 // ---------------------------------------------------------------------------
 
@@ -1033,6 +1170,296 @@ mod tests {
                 w[i - 1]
             );
             assert!(w[i] > 0);
+        }
+    }
+
+    /// DC-predicted LSP reference frequencies are strictly increasing —
+    /// equivalent to the LPC roots being ordered on the unit circle in
+    /// frequency. A monotonicity break here would mean the predictor
+    /// reference is unphysical.
+    #[test]
+    fn lsp_dc_predicted_frequencies_are_strictly_increasing() {
+        let f = &LSP_DC_PREDICTED_FREQ_Q15;
+        for i in 1..f.len() {
+            assert!(
+                f[i] > f[i - 1],
+                "LSP DC freq[{i}] = {} not > [{}] = {}",
+                f[i],
+                i - 1,
+                f[i - 1]
+            );
+        }
+        // Values are angular frequencies in Q15 — must stay non-negative
+        // and bounded below π/2-ish (the spec packs values up to about
+        // 27000 / 32768 ≈ 0.82, far inside the legal LSF domain).
+        for &v in f {
+            assert!(v >= 0);
+            assert!((v as i32) < (1i32 << 15));
+        }
+    }
+
+    /// Perceptual-weighting pole coefficients follow a γ^i pattern with
+    /// γ = 1/2, i.e. each entry is exactly half the previous one.
+    #[test]
+    fn perceptual_pole_is_halving_geometric_sequence() {
+        let p = &PERCEPTUAL_POLE_Q15;
+        for i in 1..p.len() {
+            assert_eq!(
+                p[i] as i32 * 2,
+                p[i - 1] as i32,
+                "perceptual pole[{i}] should be half of [{}]",
+                i - 1,
+            );
+        }
+        // Strictly positive — required for a stable pole.
+        for &v in p {
+            assert!(v > 0);
+        }
+    }
+
+    /// Postfilter pole coefficients follow a γ^i pattern with γ = 3/4.
+    /// Verified to within ±1 Q15 unit (rounding).
+    #[test]
+    fn postfilter_pole_is_three_quarters_geometric() {
+        let p = &POSTFILTER_POLE_Q15;
+        for i in 1..p.len() {
+            let predicted = (p[i - 1] as i32 * 3) / 4;
+            let actual = p[i] as i32;
+            let diff = (predicted - actual).abs();
+            assert!(
+                diff <= 1,
+                "postfilter pole[{i}] = {} not ≈ 3/4 × [{}] = {} (diff {diff})",
+                actual,
+                i - 1,
+                predicted,
+            );
+        }
+        for &v in p {
+            assert!(v > 0);
+        }
+    }
+
+    /// Postfilter zero coefficients are strictly decreasing positive — the
+    /// shape required for a stable formant-weighting numerator.
+    #[test]
+    fn postfilter_zero_is_strictly_decreasing_positive() {
+        let z = &POSTFILTER_ZERO_Q15;
+        for i in 1..z.len() {
+            assert!(
+                z[i] < z[i - 1],
+                "postfilter zero[{i}] = {} not < [{}] = {}",
+                z[i],
+                i - 1,
+                z[i - 1]
+            );
+            assert!(z[i] > 0);
+        }
+    }
+
+    /// Fixed-codebook gain table is approximately log-spaced: the ratio
+    /// `g[i+1] / g[i]` is bounded and close to a single power-of-`r`
+    /// schedule. We verify the global span (g[23] / g[0]) is large and
+    /// every step ratio stays inside `[1.3, 1.7]`.
+    #[test]
+    fn fcb_gain_codebook_is_log_spaced() {
+        let g = &FIXED_CODEBOOK_GAIN_Q15;
+        assert!(g[0] > 0);
+        let span = g[g.len() - 1] as f64 / g[0] as f64;
+        assert!(
+            span > 1000.0,
+            "FCB gain span = {span}, expected > 1000 across 24 levels"
+        );
+        // Skip the first few entries where Q15 quantisation rounds the
+        // step ratio (g[0]=1, g[1]=2 ⇒ ratio 2.0 from rounding only).
+        for i in 5..g.len() {
+            let r = g[i] as f64 / g[i - 1] as f64;
+            assert!(
+                (1.30..=1.70).contains(&r),
+                "FCB gain step ratio at {i} = {r} outside [1.30, 1.70]",
+            );
+        }
+    }
+
+    /// MP-MLQ combinatorial table is laid out row-major with 6 rows of 30
+    /// columns. Each row's positive prefix terminates in 1 (the highest-k
+    /// position is `1`), and the table satisfies the Pascal-rule
+    /// recurrence `T[r-1][c] = T[r-1][c+1] + T[r][c+1]` where defined
+    /// (interpreting the table as binomial coefficients with the rows
+    /// indexed by decreasing pulse count).
+    #[test]
+    fn mpmlq_combinatorial_satisfies_pascal_recurrence() {
+        assert_eq!(MPMLQ_COMBINATORIAL.len(), 180);
+        let at = |r: usize, c: usize| MPMLQ_COMBINATORIAL[r * 30 + c];
+        // Last row (r = 5) is constant 1 for positive columns and 0 in
+        // the tail — this is the C(n, 0) = 1 base case for n > 0.
+        for c in 0..29 {
+            assert_eq!(at(5, c), 1, "row 5 col {c} should be 1");
+        }
+        // Pascal: T[r][c] = T[r][c+1] + T[r+1][c+1], for any (r, c)
+        // where both successors lie inside the table.
+        for r in 0..5 {
+            for c in 0..29 {
+                let left = at(r, c);
+                let succ_right = at(r, c + 1);
+                let succ_diag = at(r + 1, c + 1);
+                if left == 0 || succ_right == 0 && succ_diag == 0 {
+                    // Already past the positive support — skip.
+                    continue;
+                }
+                let predicted = succ_right + succ_diag;
+                assert_eq!(
+                    left, predicted,
+                    "Pascal violated at ({r}, {c}): {left} ≠ {succ_right} + {succ_diag}",
+                );
+            }
+        }
+    }
+
+    /// Taming-procedure gain tables are monotonically non-decreasing.
+    #[test]
+    fn taming_gain_tables_are_monotone_non_decreasing() {
+        for table in [&TAMING_GAIN_5P3[..], &TAMING_GAIN_6P3[..]] {
+            for i in 1..table.len() {
+                assert!(
+                    table[i] >= table[i - 1],
+                    "taming gain monotonicity break at {i}: {} < {}",
+                    table[i],
+                    table[i - 1],
+                );
+            }
+            // The published floor is 1024 Q-units; nothing in the table
+            // dips below it.
+            assert!(*table.iter().min().unwrap() >= 1024);
+        }
+    }
+
+    /// LSP band-info coverage spans 0..10 contiguously — band 0 ends at
+    /// the start of band 1, band 1 ends at the start of band 2, and band
+    /// 2 ends at the LPC order.
+    #[test]
+    fn lsp_band_coverage_is_contiguous() {
+        let mut accumulated = 0usize;
+        for band in LspBand::ALL {
+            let (start, length) = band.start_and_length();
+            assert_eq!(start, accumulated, "band {band:?} start out of order");
+            accumulated += length;
+        }
+        assert_eq!(accumulated, 10);
+    }
+
+    /// Typed accessor — `lsp_codebook_entry` returns slices of the right
+    /// dimension for every band and the first row of every band is
+    /// the zero codeword (DC reference) per the table layout.
+    #[test]
+    fn lsp_codebook_entry_dimensions_and_zero_row() {
+        for band in LspBand::ALL {
+            let (_, dim) = band.start_and_length();
+            let row0 = lsp_codebook_entry(band, 0);
+            assert_eq!(row0.len(), dim);
+            for &v in row0 {
+                assert_eq!(v, 0, "LSP codebook {band:?} row 0 must be all-zero");
+            }
+            let row_last = lsp_codebook_entry(band, LSP_CODEBOOK_MAX_INDEX);
+            assert_eq!(row_last.len(), dim);
+        }
+    }
+
+    /// Typed accessor — `adaptive_codebook_gain_row` returns 20-sample
+    /// rows for both rates and rejects out-of-range indices.
+    #[test]
+    fn adaptive_codebook_gain_row_shape() {
+        let r0_low = adaptive_codebook_gain_row(SpecRate::Low, 0).unwrap();
+        let r0_high = adaptive_codebook_gain_row(SpecRate::High, 0).unwrap();
+        assert_eq!(r0_low.len(), ADAPTIVE_CODEBOOK_ROW_DIM);
+        assert_eq!(r0_high.len(), ADAPTIVE_CODEBOOK_ROW_DIM);
+        // Row 0 of both tables is the all-zero base entry.
+        assert!(r0_low.iter().all(|&v| v == 0));
+        assert!(r0_high.iter().all(|&v| v == 0));
+        // Index just past the end is rejected.
+        assert!(
+            adaptive_codebook_gain_row(SpecRate::Low, ADAPTIVE_CODEBOOK_ROWS_5P3 as u32).is_none()
+        );
+        assert!(
+            adaptive_codebook_gain_row(SpecRate::High, ADAPTIVE_CODEBOOK_ROWS_6P3 as u32).is_none()
+        );
+    }
+
+    /// Typed accessor — `taming_gain` returns the published values inside
+    /// range and `None` past the end.
+    #[test]
+    fn taming_gain_accessor_behaviour() {
+        assert_eq!(taming_gain(SpecRate::Low, 0), Some(TAMING_GAIN_5P3[0]));
+        assert_eq!(taming_gain(SpecRate::High, 0), Some(TAMING_GAIN_6P3[0]));
+        assert_eq!(
+            taming_gain(SpecRate::Low, TAMING_GAIN_5P3.len() as u32 - 1),
+            Some(TAMING_GAIN_5P3[TAMING_GAIN_5P3.len() - 1]),
+        );
+        assert_eq!(
+            taming_gain(SpecRate::High, TAMING_GAIN_6P3.len() as u32 - 1),
+            Some(TAMING_GAIN_6P3[TAMING_GAIN_6P3.len() - 1]),
+        );
+        assert_eq!(
+            taming_gain(SpecRate::Low, TAMING_GAIN_5P3.len() as u32),
+            None
+        );
+        assert_eq!(
+            taming_gain(SpecRate::High, TAMING_GAIN_6P3.len() as u32),
+            None
+        );
+    }
+
+    /// Typed accessor — `fixed_codebook_gain` returns the 24 published
+    /// values and `None` past the end.
+    #[test]
+    fn fixed_codebook_gain_accessor_behaviour() {
+        for i in 0..FIXED_CODEBOOK_GAIN_Q15.len() {
+            assert_eq!(
+                fixed_codebook_gain(i as u8),
+                Some(FIXED_CODEBOOK_GAIN_Q15[i]),
+            );
+        }
+        assert_eq!(
+            fixed_codebook_gain(FIXED_CODEBOOK_GAIN_Q15.len() as u8),
+            None
+        );
+    }
+
+    /// Typed accessor — `mpmlq_combinatorial` and the per-subframe
+    /// pulse-count / max-position helpers match the underlying arrays
+    /// and reject out-of-range indices.
+    #[test]
+    fn mpmlq_typed_accessors_match_arrays() {
+        for r in 0..MPMLQ_COMBINATORIAL_ROWS {
+            for c in 0..MPMLQ_COMBINATORIAL_COLS {
+                assert_eq!(
+                    mpmlq_combinatorial(r, c),
+                    Some(MPMLQ_COMBINATORIAL[r * MPMLQ_COMBINATORIAL_COLS + c]),
+                );
+            }
+        }
+        assert_eq!(mpmlq_combinatorial(MPMLQ_COMBINATORIAL_ROWS, 0), None);
+        assert_eq!(mpmlq_combinatorial(0, MPMLQ_COMBINATORIAL_COLS), None);
+
+        for sf in 0..4 {
+            assert_eq!(
+                mpmlq_pulse_count(sf),
+                Some(MPMLQ_PULSE_COUNT_PER_SUBFRAME[sf])
+            );
+            assert_eq!(mpmlq_max_position(sf), Some(MPMLQ_MAX_POSITION[sf]));
+        }
+        assert_eq!(mpmlq_pulse_count(4), None);
+        assert_eq!(mpmlq_max_position(4), None);
+    }
+
+    /// `SpecRate` round-trips through a small dispatcher — the typed-rate
+    /// helpers above all dispatch consistently for both arms.
+    #[test]
+    fn spec_rate_dispatcher_round_trip() {
+        for rate in [SpecRate::Low, SpecRate::High] {
+            let rows = adaptive_codebook_gain_row(rate, 0).unwrap();
+            assert_eq!(rows.len(), ADAPTIVE_CODEBOOK_ROW_DIM);
+            let t = taming_gain(rate, 0).unwrap();
+            assert_eq!(t, 1024);
         }
     }
 }
