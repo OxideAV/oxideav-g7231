@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Low-rate ACELP algebraic-codebook geometry + gain-word split
+  accessors on the staged spec-table data (round 273). `spec_tables`
+  now surfaces Table 1/G.723.1 as the typed `AcelpTrack`
+  (`Track0..Track3`) enum plus `acelp_track_position(track, idx,
+  shift)`, reproducing the four even-based stride-8 pulse tracks and
+  the 1-bit odd shift, and returning `None` for the boundary "(60)" /
+  "(62)" candidates that signify an absent pulse. The 1-tap LTP
+  short-pitch shortcut (§2.16) is exposed as `Pitch1TapLtp { gain,
+  selector }` via `pitch_1tap_ltp(index)`, pairing the published
+  β / ε arrays. The combined 12-bit gain word is split with
+  `pitch_gain_index` / `max_gain_index` (eq. 36 / 39, `GSize = 24`)
+  and the high-rate short-pitch variant `pitch_gain_index_short`
+  (eq. 40, impulse-train MSB masked off). Constants surfaced:
+  `ACELP_SUBFRAME_LEN = 60`, `ACELP_TRACK_STRIDE = 8`,
+  `ACELP_CANDIDATES_PER_TRACK = 8`, `ACELP_TRACK_BASES`,
+  `PITCH_1TAP_LTP_ENTRIES = 170`, `GAIN_TABLE_SIZE = 24`. Five new
+  unit tests pin the accessors against Table 1, the shift offset-by-one
+  invariant, the β/ε array pairing + non-negativity, the
+  `GIndex = PGIndex·GSize + MGIndex` round-trip across all 4096 gain
+  words (with `MGIndex` always a valid fixed-codebook-gain index), and
+  the short-pitch train-bit masking.
+
 - Typed-accessor primitives + deeper invariant tests on the staged
   G.723.1 spec-table data (round 265). The new accessors in
   `spec_tables` wrap the published raw arrays with index-typed

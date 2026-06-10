@@ -966,6 +966,134 @@ pub fn mpmlq_max_position(subframe: usize) -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------------
+// Low-rate ACELP algebraic codebook geometry (Table 1/G.723.1, §2.16)
+// ---------------------------------------------------------------------------
+//
+// The 5.3 kbit/s fixed-codebook vector holds at most four non-zero pulses, one
+// per "track". Each track owns eight candidate positions spaced 8 apart,
+// starting from an even base offset (0, 2, 4, 6). A single shift bit moves the
+// whole set up by one to occupy odd positions. The structure below is the pure
+// geometry of Table 1 — the four (base, stride) tracks and the global shift —
+// surfaced as index-typed lookups. No search algorithm is encoded here; the
+// encoder's coordinate-descent search lives in `encoder.rs`.
+
+/// Length of one 5.3 kbit/s ACELP subframe in samples. Candidate positions at
+/// or beyond this value (60, 62 on the last two tracks) are *absent* pulses.
+pub const ACELP_SUBFRAME_LEN: usize = 60;
+
+/// Spacing between successive candidate positions within one ACELP track.
+pub const ACELP_TRACK_STRIDE: usize = 8;
+
+/// Number of candidate positions enumerated per ACELP track (3-bit index).
+pub const ACELP_CANDIDATES_PER_TRACK: usize = 8;
+
+/// Even base offset of each ACELP track before the optional odd shift.
+pub const ACELP_TRACK_BASES: [usize; 4] = [0, 2, 4, 6];
+
+/// One of the four 5.3 kbit/s ACELP algebraic-codebook pulse tracks (Table 1).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AcelpTrack {
+    /// Track 0: base 0 → {0, 8, 16, 24, 32, 40, 48, 56}.
+    Track0,
+    /// Track 1: base 2 → {2, 10, 18, 26, 34, 42, 50, 58}.
+    Track1,
+    /// Track 2: base 4 → {4, 12, 20, 28, 36, 44, 52, (60)}.
+    Track2,
+    /// Track 3: base 6 → {6, 14, 22, 30, 38, 46, 54, (62)}.
+    Track3,
+}
+
+impl AcelpTrack {
+    /// All four track identifiers in order.
+    pub const ALL: [AcelpTrack; 4] = [
+        AcelpTrack::Track0,
+        AcelpTrack::Track1,
+        AcelpTrack::Track2,
+        AcelpTrack::Track3,
+    ];
+
+    /// Even base offset of this track (one of 0, 2, 4, 6).
+    pub const fn base(self) -> usize {
+        ACELP_TRACK_BASES[self as usize]
+    }
+}
+
+/// Candidate sample position of a pulse on `track` at 3-bit `position_index`
+/// (0..=7), with the global odd-`shift` applied (`shift = true` adds 1).
+///
+/// Returns `None` when the resulting position falls at or beyond the 60-sample
+/// subframe boundary — i.e. the Table-1 "(60)" / "(62)" entries that signify an
+/// absent pulse — or when `position_index >= 8`.
+pub fn acelp_track_position(
+    track: AcelpTrack,
+    position_index: usize,
+    shift: bool,
+) -> Option<usize> {
+    if position_index >= ACELP_CANDIDATES_PER_TRACK {
+        return None;
+    }
+    let pos = track.base() + ACELP_TRACK_STRIDE * position_index + usize::from(shift);
+    if pos >= ACELP_SUBFRAME_LEN {
+        return None;
+    }
+    Some(pos)
+}
+
+// ---------------------------------------------------------------------------
+// 1-tap LTP short-pitch shortcut (§2.16, eq. after eq. 35)
+// ---------------------------------------------------------------------------
+
+/// Number of entries in the paired 1-tap LTP gain / selector tables.
+pub const PITCH_1TAP_LTP_ENTRIES: usize = 170;
+
+/// Decoded β / ε parameters of the 1-tap LTP short-pitch shortcut applied when
+/// the pitch lag is below one subframe (§2.16): the codeword is modified by
+/// `v[n] ← v[n] + β·v[n − Lᵢ − ε]`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Pitch1TapLtp {
+    /// β — the 1-tap LTP gain (Q15).
+    pub gain: i16,
+    /// ε — the lag offset selector applied to the back-reference.
+    pub selector: i16,
+}
+
+/// Look up the paired β (gain) and ε (selector) of the 1-tap LTP short-pitch
+/// shortcut by `PGIndex` (§2.16). Returns `None` past the 170-entry table.
+pub fn pitch_1tap_ltp(index: usize) -> Option<Pitch1TapLtp> {
+    let gain = *PITCH_1TAP_LTP_GAIN.get(index)?;
+    let selector = *PITCH_1TAP_LTP_SELECTOR.get(index)?;
+    Some(Pitch1TapLtp { gain, selector })
+}
+
+// ---------------------------------------------------------------------------
+// Combined gain-word split (§2.17 eq. 36, §2.18 eq. 39–40)
+// ---------------------------------------------------------------------------
+
+/// `GSize` — the size of the fixed-codebook gain table `G`, used to split the
+/// combined 12-bit gain word into its pitch-gain and max-gain components.
+pub const GAIN_TABLE_SIZE: u32 = 24;
+
+/// Pitch-gain index `PGIndexᵢ = ⌊GIndexᵢ / GSize⌋` (eq. 39): the high part of a
+/// combined gain word, pointing into the adaptive-codebook gain-vector table.
+pub fn pitch_gain_index(combined: u32) -> u32 {
+    combined / GAIN_TABLE_SIZE
+}
+
+/// Max-gain (fixed-codebook gain) index `MGIndexᵢ = GIndexᵢ − PGIndexᵢ·GSize`
+/// (eq. 36): the low part of a combined gain word, i.e. `combined % GSize`.
+pub fn max_gain_index(combined: u32) -> u32 {
+    combined - pitch_gain_index(combined) * GAIN_TABLE_SIZE
+}
+
+/// High-rate short-pitch pitch-gain index `PGIndexᵢ = ⌊(GIndexᵢ & 0x7FF) / GSize⌋`
+/// (eq. 40): when `Lᵢ < 58` at the 6.3 kbit/s rate the top bit of the combined
+/// word carries the impulse-train flag, so it is masked off before the divide
+/// and the result points into the 85-entry gain-vector codebook.
+pub fn pitch_gain_index_short(combined: u32) -> u32 {
+    (combined & 0x7FF) / GAIN_TABLE_SIZE
+}
+
+// ---------------------------------------------------------------------------
 // Compile-time invariants
 // ---------------------------------------------------------------------------
 
@@ -999,6 +1127,10 @@ const _: () = {
     assert!(POSTFILTER_POLE_Q15.len() == 10);
     assert!(BIT_ALLOCATION_SEGMENT_BASE.len() == 3);
     assert!(BIT_ALLOCATION_SEGMENT_BOUNDARIES.len() == 3);
+    assert!(ACELP_TRACK_BASES.len() == 4);
+    assert!(AcelpTrack::ALL.len() == 4);
+    assert!(PITCH_1TAP_LTP_GAIN.len() == PITCH_1TAP_LTP_ENTRIES);
+    assert!(PITCH_1TAP_LTP_SELECTOR.len() == PITCH_1TAP_LTP_ENTRIES);
 };
 
 #[cfg(test)]
@@ -1461,5 +1593,146 @@ mod tests {
             let t = taming_gain(rate, 0).unwrap();
             assert_eq!(t, 1024);
         }
+    }
+
+    /// The four ACELP tracks reproduce Table 1/G.723.1 exactly at shift 0:
+    /// even base offsets 0/2/4/6, stride 8, eight candidates each, with the
+    /// last candidate of tracks 2 and 3 (60 / 62) falling outside the
+    /// subframe and therefore reported as an absent pulse (`None`).
+    #[test]
+    fn acelp_tracks_match_table_1() {
+        let expected: [[Option<usize>; 8]; 4] = [
+            [
+                Some(0),
+                Some(8),
+                Some(16),
+                Some(24),
+                Some(32),
+                Some(40),
+                Some(48),
+                Some(56),
+            ],
+            [
+                Some(2),
+                Some(10),
+                Some(18),
+                Some(26),
+                Some(34),
+                Some(42),
+                Some(50),
+                Some(58),
+            ],
+            // 60 is at the subframe boundary → absent.
+            [
+                Some(4),
+                Some(12),
+                Some(20),
+                Some(28),
+                Some(36),
+                Some(44),
+                Some(52),
+                None,
+            ],
+            // 62 is past the subframe boundary → absent.
+            [
+                Some(6),
+                Some(14),
+                Some(22),
+                Some(30),
+                Some(38),
+                Some(46),
+                Some(54),
+                None,
+            ],
+        ];
+        for (t, track) in AcelpTrack::ALL.iter().enumerate() {
+            assert_eq!(track.base(), ACELP_TRACK_BASES[t]);
+            for k in 0..ACELP_CANDIDATES_PER_TRACK {
+                assert_eq!(
+                    acelp_track_position(*track, k, false),
+                    expected[t][k],
+                    "track {t} candidate {k}"
+                );
+            }
+            // 3-bit index range is exactly 0..=7.
+            assert_eq!(
+                acelp_track_position(*track, ACELP_CANDIDATES_PER_TRACK, false),
+                None
+            );
+        }
+    }
+
+    /// The 1-bit global shift moves every present position up by exactly one,
+    /// and pushes the last in-range candidate of the even tracks (56→57,
+    /// 58→59) while never producing a position at or beyond the subframe.
+    #[test]
+    fn acelp_shift_offsets_positions_by_one() {
+        for track in AcelpTrack::ALL {
+            for k in 0..ACELP_CANDIDATES_PER_TRACK {
+                match (
+                    acelp_track_position(track, k, false),
+                    acelp_track_position(track, k, true),
+                ) {
+                    (Some(base), Some(shifted)) => assert_eq!(shifted, base + 1),
+                    (Some(base), None) => {
+                        // Only the boundary-adjacent candidate may drop out.
+                        assert_eq!(base + 1, ACELP_SUBFRAME_LEN);
+                    }
+                    (None, shifted) => assert_eq!(shifted, None),
+                }
+                // Shifted positions also respect the subframe boundary.
+                if let Some(p) = acelp_track_position(track, k, true) {
+                    assert!(p < ACELP_SUBFRAME_LEN);
+                }
+            }
+        }
+    }
+
+    /// The 1-tap LTP accessor pairs the published β / ε arrays element-wise
+    /// and reports `None` exactly past the 170-entry table.
+    #[test]
+    fn pitch_1tap_ltp_accessor_pairs_arrays() {
+        for i in 0..PITCH_1TAP_LTP_ENTRIES {
+            let e = pitch_1tap_ltp(i).unwrap();
+            assert_eq!(e.gain, PITCH_1TAP_LTP_GAIN[i]);
+            assert_eq!(e.selector, PITCH_1TAP_LTP_SELECTOR[i]);
+        }
+        assert_eq!(pitch_1tap_ltp(PITCH_1TAP_LTP_ENTRIES), None);
+        // The published gain entries are all non-negative Q15 magnitudes.
+        for &g in PITCH_1TAP_LTP_GAIN.iter() {
+            assert!(g >= 0);
+        }
+    }
+
+    /// The combined-gain split is the exact inverse of `GIndex = PGIndex·GSize
+    /// + MGIndex` for every representable 12-bit gain word, and `MGIndex` is
+    /// always a valid index into the 24-entry fixed-codebook gain table.
+    #[test]
+    fn gain_word_split_inverts_eq_36() {
+        for combined in 0u32..4096 {
+            let pg = pitch_gain_index(combined);
+            let mg = max_gain_index(combined);
+            assert!(mg < GAIN_TABLE_SIZE);
+            assert_eq!(pg * GAIN_TABLE_SIZE + mg, combined);
+            // MGIndex always indexes a real fixed-codebook gain.
+            assert!(fixed_codebook_gain(mg as u8).is_some());
+        }
+    }
+
+    /// The high-rate short-pitch split (eq. 40) masks the impulse-train MSB
+    /// before dividing, so it ignores bit 11 and the result stays within the
+    /// 85-entry short codebook for any gain word.
+    #[test]
+    fn short_pitch_gain_index_masks_train_bit() {
+        for low in [0u32, 23, 24, 2047] {
+            // Setting bit 11 (0x800) must not change the masked result.
+            assert_eq!(
+                pitch_gain_index_short(low),
+                pitch_gain_index_short(low | 0x800)
+            );
+        }
+        // Max masked value (2047) / 24 = 85, the top of the 85-entry table.
+        assert_eq!(pitch_gain_index_short(0x7FF), 85);
+        assert_eq!(pitch_gain_index_short(0xFFF), 85);
     }
 }
