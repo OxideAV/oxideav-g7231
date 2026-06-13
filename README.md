@@ -372,14 +372,22 @@ real-time encoding and ~ 6 000 × faster than real-time decoding.
 Future optimisation rounds can A/B-test their tweaks against these
 numbers.
 
-## Fuzzing (round 236)
+## Fuzzing (rounds 236, 286)
 
-A single `cargo-fuzz` target lives under `fuzz/fuzz_targets/decode.rs`
-and exercises the attacker surface of the registered G.723.1 decoder.
-The target drives attacker-supplied bytes through `Decoder::send_packet`
-as a sequence of up to 16 variable-length packets (capped at 64 B each
-to bound per-iteration allocation), with the packet size deterministic-
-ally drawn from the spec-legal `{0, 1, 4, 20, 24}` ladder plus an
+Three `cargo-fuzz` targets live under `fuzz/fuzz_targets/`, each an
+ASan-instrumented panic-freedom fuzzer over a different slice of the
+codec. The contract under test is uniform: every public entry returns
+a `Result` (never panics, never overflows in a debug build, never
+indexes out of bounds) on arbitrary input. Output frames / packets are
+discarded — PCM-shape and sample correctness remain the domain of the
+integration test (`tests/codec_roundtrip.rs`) and the bench harness.
+
+### `decode` (round 236) — decoder attacker surface
+
+Drives attacker-supplied bytes through `Decoder::send_packet` as a
+sequence of up to 16 variable-length packets (capped at 64 B each to
+bound per-iteration allocation), with the packet size deterministically
+drawn from the spec-legal `{0, 1, 4, 20, 24}` ladder plus an
 attacker-chosen length. Each packet's first body byte is fed verbatim
 so the 2-bit rate discriminator (`00` high / `01` low / `10` SID / `11`
 untransmitted, per G.723.1 §3.7) is attacker-controlled, and the
@@ -387,27 +395,50 @@ decoder's cross-packet state machine — `pending` VecDeque, `next_pts`
 advance, `drained` flag, `SynthesisState`, frame-erasure run counter
 (§3.10.2), formant-postfilter / AGC memory (§3.9) — is forced through
 the discriminator transitions a single-rate harness never reaches.
-`flush()` and `reset()` are also injected mid-stream at deterministic
-hook points so the post-flush `Eof` path and the silence re-seed
-behaviour are covered.
+`flush()` and `reset()` are injected mid-stream at deterministic hook
+points so the post-flush `Eof` path and the silence re-seed behaviour
+are covered.
 
-The contract under test is purely panic-freedom on every
-`Decoder` entry point. Output frames are discarded — PCM-shape sanity
-remains the domain of the integration test (`tests/codec_roundtrip.rs`)
-and the bench harness.
+### `roundtrip` (round 286) — closed-loop encode → decode
+
+Pushes arbitrary 16-bit PCM (full-scale square waves, all-`i16::MIN`
+blocks, ramps, silence) through the registered `Encoder` at a
+fuzzer-chosen rate, exercising the analysis path (autocorrelation,
+Levinson-Durbin, Chebyshev LSP root-finding, closed-loop pitch + FCB
+search, joint-gain quant, §2.2 frame assembly) on input the bench
+harness never feeds it, then routes every packet the encoder emits back
+through the `Decoder` so the self-produced bitstreams must also survive
+parse + synthesis. Covers mid-stream + idempotent `flush()` and
+reverse-order packet delivery.
+
+### `bitstream` (round 286) — structured parser corruption
+
+Constructs structurally near-legal frames (correct length + rate byte)
+then surgically corrupts one field (LSP split index, abs/delta lag,
+gain word, FCB pulse word, MP-MLQ reserved tail) or truncates the
+payload at an exact field boundary, probing the `BitReader::read_u32`
+out-of-bits guard on sub-byte remainders. Drives
+`header::parse_frame_type`, a direct field-shaped `BitReader` schedule,
+the stateless `decode_{acelp,mpmlq}_local` per-rate decoders, and a
+chained `Decoder::send_packet` sequence so field corruption is also
+seen by the cross-frame postfilter + erasure state.
 
 Run with a nightly toolchain:
 
 ```bash
 cargo fuzz run decode
+cargo fuzz run roundtrip
+cargo fuzz run bitstream
 ```
 
-Headline coverage on the empty corpus: ~200 000 runs in 13 s on
-macOS aarch64, no crashes, no leaks. The recommended dictionary
-libFuzzer emits at the end of a short session features the four rate
-discriminators in the low 2 bits of the first body byte, confirming
-the target is steering the input toward the rate-dispatch surface
-rather than getting stuck on a single branch.
+Round-286 ASan campaigns on macOS aarch64 (seeded from the in-tree
+corpus): `decode` ≈1.15 M runs / 120 s, `bitstream` ≈394 K runs / 180 s,
+`roundtrip` ≈22 K runs / 180 s (the encoder analysis pass is heavy, so
+its exec/s is lower) — ~1.56 M executions total, no crashes, no leaks,
+no OOM, no artifacts. The recommended dictionary libFuzzer emits for
+`decode` features the four rate discriminators in the low 2 bits of the
+first body byte, confirming the target steers toward the rate-dispatch
+surface rather than getting stuck on a single branch.
 
 ## Quick use
 

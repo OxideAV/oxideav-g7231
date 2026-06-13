@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Two new `cargo-fuzz` ASan targets extending the round-236 `decode`
+  fuzzer (round 286). `roundtrip` is a closed-loop encode → decode
+  fuzzer: it drives arbitrary 16-bit PCM (full-scale square waves,
+  all-`i16::MIN` blocks, ramps, silence) through the registered
+  `Encoder` at a fuzzer-chosen rate — exercising the analysis path
+  (autocorrelation, Levinson-Durbin, Chebyshev LSP root-finding,
+  closed-loop pitch + FCB search, joint-gain quant, §2.2 frame
+  assembly) on input the bench harness never feeds it — then routes
+  every emitted packet back through the `Decoder`, covering mid-stream
+  + idempotent `flush()` and reverse-order packet delivery.
+  `bitstream` is a structured parser-corruption fuzzer: it builds
+  structurally near-legal frames (correct length + rate byte), then
+  surgically corrupts one field (LSP split index, abs/delta lag, gain
+  word, FCB pulse word, MP-MLQ reserved tail) or truncates the payload
+  at an exact field boundary to probe the `BitReader::read_u32`
+  out-of-bits guard on sub-byte remainders. It drives
+  `header::parse_frame_type`, a direct field-shaped `BitReader`
+  schedule, the stateless `decode_{acelp,mpmlq}_local` per-rate
+  decoders, and a chained `Decoder::send_packet` sequence so field
+  corruption is also seen by the cross-frame postfilter + erasure
+  state. Round-286 ASan campaigns (seeded from the in-tree corpus):
+  `decode` ≈1.15 M runs, `bitstream` ≈394 K runs, `roundtrip` ≈22 K
+  runs — ~1.56 M executions, no crashes, leaks, OOM, or artifacts.
 - Low-rate ACELP algebraic-codebook geometry + gain-word split
   accessors on the staged spec-table data (round 273). `spec_tables`
   now surfaces Table 1/G.723.1 as the typed `AcelpTrack`

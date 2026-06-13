@@ -57,3 +57,36 @@ name = "decode"
 path = "fuzz_targets/decode.rs"
 test = false
 doc = false
+
+# Target 2 — `roundtrip`. Closed-loop encode→decode fuzzer. Drives
+# attacker-supplied 16-bit PCM through the registered `Encoder` at a
+# fuzzer-chosen rate (6.3 MP-MLQ / 5.3 ACELP), exercising the analysis
+# path (autocorrelation, Levinson-Durbin, Chebyshev LSP root-finding,
+# closed-loop pitch + FCB search, joint-gain quant, §2.2 frame
+# assembly) on PCM the bench harness never feeds it (full-scale square
+# waves, all-i16::MIN blocks, ramps). Every packet the encoder emits is
+# then routed back through the `Decoder`, so self-produced bitstreams
+# must also survive parse + synthesis. Covers mid-stream + idempotent
+# `flush()` and reverse-order packet delivery.
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+
+# Target 3 — `bitstream`. Structured adversarial fuzzer for the
+# bitstream parser below the trait surface. Constructs structurally
+# near-legal frames (correct length + rate byte) then surgically
+# corrupts one field (LSP split index, abs/delta lag, gain word, FCB
+# pulse word, MP-MLQ reserved tail) or truncates the payload at an
+# exact field boundary, probing the `BitReader::read_u32` out-of-bits
+# guard on sub-byte remainders. Drives `header::parse_frame_type`, a
+# direct field-shaped `BitReader` schedule, the stateless
+# `decode_{acelp,mpmlq}_local` per-rate decoders, and a chained
+# `Decoder::send_packet` sequence so field corruption is also seen by
+# the cross-frame postfilter + erasure state.
+[[bin]]
+name = "bitstream"
+path = "fuzz_targets/bitstream.rs"
+test = false
+doc = false
