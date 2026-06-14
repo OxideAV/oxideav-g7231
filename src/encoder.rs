@@ -64,7 +64,7 @@ use crate::bitreader::BitReader;
 use crate::tables::{
     ERASURE_ATTENUATION_DB_PER_FRAME, ERASURE_CLASSIFIER_HISTORY_LEN,
     ERASURE_CLASSIFIER_LAG_RADIUS, ERASURE_MUTE_AFTER_FRAMES, ERASURE_VOICED_THRESHOLD_DB,
-    FRAME_SIZE_SAMPLES, HIGH_RATE_BYTES, LOW_RATE_BYTES, LPC_ORDER,
+    FRAME_SIZE_SAMPLES, HIGH_RATE_BYTES, LOW_RATE_BYTES, LPC_ORDER, LSP_PREDICTOR_BE,
     LSP_STABILITY_DELTA_MIN_ERASURE_HZ, LSP_STABILITY_DELTA_MIN_HZ, LSP_STABILITY_MAX_ITERATIONS,
     PITCH_MAX, PITCH_MIN, POSTFILTER_AGC_ALPHA, POSTFILTER_AGC_INIT_GAIN, POSTFILTER_GAMMA1,
     POSTFILTER_GAMMA2, POSTFILTER_LTP_GAMMA_HIGH, POSTFILTER_LTP_GAMMA_LOW,
@@ -1199,6 +1199,37 @@ pub(crate) fn enforce_lsp_stability(
     (out, converged)
 }
 
+/// Erasure-concealment LSP extrapolation toward the long-term DC vector
+/// (G.723.1 §3.10.1).
+///
+/// With the decoded residual `ẽ_n` forced to zero, the concealed LSP is
+/// `p̃_n = b_e · (p̃_{n-1} − p_DC) + p_DC`, where `b_e = 23/32`
+/// ([`LSP_PREDICTOR_BE`]) and `p_DC` is the long-term DC vector. The
+/// predictor is defined on LSP *angular frequencies* (`ω`), so the stored
+/// cosine-domain `prev_lsp_cos` is mapped to `ω = acos(cos ω)`, the leak is
+/// applied component-wise against the DC vector's angular frequencies, and
+/// the result is mapped back to the cosine domain. Each erased frame pulls
+/// every LSP frequency a fraction `1 − b_e = 9/32` of the way toward its DC
+/// value, so a sustained erasure run relaxes the spectral envelope toward
+/// the long-term mean instead of freezing the last good envelope.
+///
+/// The returned vector is *not* stability-checked here; the caller runs the
+/// §3.10.1 wider-`Δ_min` ordering procedure on it.
+pub(crate) fn extrapolate_lsp_toward_dc(
+    prev_lsp_cos: &[f32; LPC_ORDER],
+    b_e: f32,
+) -> [f32; LPC_ORDER] {
+    let mut out = [0.0f32; LPC_ORDER];
+    for i in 0..LPC_ORDER {
+        let omega_prev = prev_lsp_cos[i].clamp(-1.0, 1.0).acos();
+        // DC vector in the same angular-frequency domain.
+        let omega_dc = crate::tables::lsp_dc_omega(i);
+        let omega = b_e * (omega_prev - omega_dc) + omega_dc;
+        out[i] = omega.clamp(0.0, std::f32::consts::PI).cos();
+    }
+    out
+}
+
 pub(crate) fn dequantise_lsp(idx: &[u32; 3]) -> [f32; LPC_ORDER] {
     let mut out = [0.0f32; LPC_ORDER];
     for s in 0..3 {
@@ -2045,11 +2076,11 @@ pub struct SynthesisState {
 
 impl SynthesisState {
     pub fn new() -> Self {
-        let mut prev_lsp = [0.0f32; LPC_ORDER];
-        let step = std::f32::consts::PI / (LPC_ORDER as f32 + 1.0);
-        for k in 0..LPC_ORDER {
-            prev_lsp[k] = ((k as f32 + 1.0) * step).cos();
-        }
+        // §3.11: every static decoder variable is zeroed *except* the
+        // previous LSP vector, which initialises to the long-term DC vector
+        // p_DC (the spec's predictor reference, not an evenly-spaced
+        // placeholder). Stored in the synthesiser's cosine domain.
+        let prev_lsp = crate::tables::lsp_dc_cosines();
         Self {
             prev_lsp,
             exc_history: [0.0; PITCH_MAX + SUBFRAME_SIZE],
@@ -2606,10 +2637,18 @@ impl SynthesisState {
             10f32.powf(-db / 20.0)
         };
 
-        // §3.10.1: erasure-variant LSP stability check with the wider
-        // Δ_min = 62.5 Hz.
+        // §3.10.1: erasure LSP interpolation. The decoded residual ẽ_n is
+        // forced to zero (step 1) and the predicted vector uses the
+        // erasure predictor b_e = 23/32 (step 2), giving
+        //   p̃_n = ẽ_n + p̄_n + p_DC = b_e · (p̃_{n-1} − p_DC) + p_DC.
+        // The predictor operates on LSP *angular frequencies*, so convert
+        // the stored cosine-domain previous LSP and the DC vector to ω,
+        // leak ω toward the DC frequencies at rate 1 − b_e per erased
+        // frame, then convert back. The wider Δ_min = 62.5 Hz stability
+        // procedure (step 3) re-orders the extrapolated vector.
+        let lsp_extrap = extrapolate_lsp_toward_dc(&self.prev_lsp, LSP_PREDICTOR_BE);
         let (lsp_q, _converged) =
-            enforce_lsp_stability(&self.prev_lsp, LSP_STABILITY_DELTA_MIN_ERASURE_HZ);
+            enforce_lsp_stability(&lsp_extrap, LSP_STABILITY_DELTA_MIN_ERASURE_HZ);
 
         // §3.10.2 voiced/unvoiced classifier: cross-correlate the saved
         // post-filtered PCM history with itself shifted by `L_2 ± 3` and
@@ -2700,6 +2739,14 @@ impl SynthesisState {
             let tail = self.exc_history.len() - SUBFRAME_SIZE;
             self.exc_history[tail..].copy_from_slice(&exc);
         }
+
+        // Persist the extrapolated LSP as the previous-frame vector so a
+        // sustained erasure run keeps leaking toward the DC vector frame
+        // after frame (§3.10.1: p̃_{n-1} is the previous *decoded* LSP, so
+        // each concealed frame feeds the next), and so a good frame that
+        // ends the run interpolates from the concealed envelope rather than
+        // the stale pre-erasure one.
+        self.prev_lsp = lsp_q;
 
         // Update classifier history with the concealed PCM so a
         // subsequent erasure in the same run sees a fresh tail.
@@ -3594,6 +3641,129 @@ mod tests {
             muted.iter().all(|&s| s == 0),
             "expected silence after mute threshold"
         );
+    }
+
+    /// G.723.1 §3.11: the decoder cold-starts its previous LSP vector at the
+    /// long-term DC vector p_DC (in the synthesiser cosine domain), not an
+    /// evenly-spaced placeholder. The resulting cosines must equal
+    /// `lsp_dc_cosines()` exactly and be a strictly-ordered LSP set
+    /// (strictly-decreasing cosines / strictly-increasing frequencies,
+    /// inside the open unit interval).
+    #[test]
+    fn cold_start_prev_lsp_is_dc_vector() {
+        let st = SynthesisState::new();
+        let dc = crate::tables::lsp_dc_cosines();
+        assert_eq!(st.prev_lsp, dc, "cold-start prev_lsp must equal p_DC");
+        for k in 0..LPC_ORDER {
+            assert!(
+                st.prev_lsp[k] > -1.0 && st.prev_lsp[k] < 1.0,
+                "DC cosine {k} out of (-1, 1): {}",
+                st.prev_lsp[k]
+            );
+            if k > 0 {
+                assert!(
+                    st.prev_lsp[k] < st.prev_lsp[k - 1],
+                    "DC cosines must be strictly decreasing at {k}"
+                );
+            }
+        }
+    }
+
+    /// G.723.1 §3.10.1: erasure LSP extrapolation leaks the previous LSP
+    /// toward the DC vector at rate `1 − b_e = 9/32` per frame. Each
+    /// extrapolated angular frequency must land exactly on the convex
+    /// combination `b_e·ω_prev + (1 − b_e)·ω_DC`, and a previous vector that
+    /// already equals the DC vector must be a fixed point.
+    #[test]
+    fn erasure_lsp_extrapolation_leaks_toward_dc() {
+        // A prev LSP deliberately offset from DC (each ω shifted +0.2 rad,
+        // re-clamped into (0, π) so it stays a valid ordered set).
+        let dc = crate::tables::lsp_dc_cosines();
+        let mut prev = [0.0f32; LPC_ORDER];
+        for k in 0..LPC_ORDER {
+            let omega_dc = (dc[k] as f32).clamp(-1.0, 1.0).acos();
+            let shifted = (omega_dc + 0.2).min(std::f32::consts::PI - 1e-3);
+            prev[k] = shifted.cos();
+        }
+
+        let out = extrapolate_lsp_toward_dc(&prev, LSP_PREDICTOR_BE);
+        for k in 0..LPC_ORDER {
+            let omega_prev = prev[k].clamp(-1.0, 1.0).acos();
+            let omega_dc = crate::tables::lsp_dc_omega(k);
+            let expected = (LSP_PREDICTOR_BE * (omega_prev - omega_dc) + omega_dc).cos();
+            assert!(
+                (out[k] - expected).abs() < 1e-5,
+                "dim {k}: got {}, expected {expected}",
+                out[k]
+            );
+            // The extrapolated frequency must sit strictly between prev and
+            // DC (a true leak toward DC, never overshoot).
+            let omega_out = out[k].clamp(-1.0, 1.0).acos();
+            let lo = omega_prev.min(omega_dc);
+            let hi = omega_prev.max(omega_dc);
+            assert!(
+                omega_out >= lo - 1e-4 && omega_out <= hi + 1e-4,
+                "dim {k}: leaked ω {omega_out} not between {lo} and {hi}"
+            );
+            assert!(
+                (omega_out - omega_dc).abs() <= (omega_prev - omega_dc).abs() + 1e-4,
+                "dim {k}: leak moved away from DC"
+            );
+        }
+
+        // Fixed point: prev == DC ⇒ output == DC.
+        let dc_cos = crate::tables::lsp_dc_cosines();
+        let fixed = extrapolate_lsp_toward_dc(&dc_cos, LSP_PREDICTOR_BE);
+        for k in 0..LPC_ORDER {
+            assert!(
+                (fixed[k] - dc_cos[k]).abs() < 1e-5,
+                "DC vector must be a fixed point of the erasure leak at {k}"
+            );
+        }
+    }
+
+    /// G.723.1 §3.10.1 across a sustained erasure run: because the concealed
+    /// LSP is persisted as the previous vector, each successive erased frame
+    /// pulls the spectral envelope monotonically closer to the DC vector.
+    #[test]
+    fn sustained_erasure_relaxes_lsp_toward_dc() {
+        let omega_dc: Vec<f32> = (0..LPC_ORDER).map(crate::tables::lsp_dc_omega).collect();
+
+        let mut st = SynthesisState::new();
+        // Start the previous LSP well away from DC so there is room to leak.
+        let mut prev = [0.0f32; LPC_ORDER];
+        for k in 0..LPC_ORDER {
+            let shifted = (omega_dc[k] + 0.25).min(std::f32::consts::PI - 1e-2);
+            prev[k] = shifted.cos();
+        }
+        st.prev_lsp = prev;
+        st.pf_last_gain_adapt = 0.3;
+        st.pf_last_gain_unvoiced = 0.1;
+        for i in 0..st.exc_history.len() {
+            st.exc_history[i] = (i as f32 * 0.13).sin() * 0.05;
+        }
+
+        let dist = |lsp: &[f32; LPC_ORDER]| -> f32 {
+            let mut acc = 0.0;
+            for k in 0..LPC_ORDER {
+                let w = lsp[k].clamp(-1.0, 1.0).acos();
+                acc += (w - omega_dc[k]).powi(2);
+            }
+            acc.sqrt()
+        };
+
+        let mut last = dist(&st.prev_lsp);
+        // Two leaks within the mute window (run counts 1 and 2). Each must
+        // strictly reduce the distance to DC.
+        for _ in 0..2 {
+            let _ = st.decode_erased();
+            let now = dist(&st.prev_lsp);
+            assert!(
+                now < last - 1e-4,
+                "sustained erasure must move LSP closer to DC: {now} !< {last}"
+            );
+            last = now;
+        }
     }
 
     /// G.723.1 §3.10.2 voiced/unvoiced classifier: a strongly periodic

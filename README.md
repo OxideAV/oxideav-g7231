@@ -65,7 +65,8 @@ The registered `Decoder` is a full synthesiser:
   payloads through `SynthesisState::decode_mpmlq`.
 - Excitation history, LPC synthesis filter memory, and previous-frame
   LSP persist across packets, so a stream of packets decodes without
-  per-frame cold-start transients.
+  per-frame cold-start transients. The previous-frame LSP cold-starts at
+  the long-term DC vector `p_DC` per §3.11 (see round 302 below).
 - `reset()` reinitialises the synthesiser to silence.
 - SID and untransmitted frames are accepted as framing-valid and feed
   the spec-aligned §3.10.2 concealment path described below; comfort-
@@ -102,6 +103,43 @@ variant when the input violates the wider floor; every dequantised
 LSP from a probe set of indices hits the 31.25 Hz floor and stays
 strictly monotone in cosine domain; degenerate all-equal input still
 yields a finite LPC).
+
+### Erasure LSP leaks toward the DC vector + §3.11 cold start (round 302)
+
+The frame-erasure LSP path now implements §3.10.1's predictor-based
+extrapolation instead of merely freezing the last good vector, and the
+decoder cold-starts the previous LSP at the long-term DC vector `p_DC`
+per §3.11:
+
+- **§3.11 cold start.** `SynthesisState::new` initialises the
+  previous-frame LSP to the long-term DC vector `p_DC`
+  (`tables::lsp_dc_cosines()`, derived from the canonical Q15 DC
+  frequencies in `spec_tables::LSP_DC_PREDICTED_FREQ_Q15`) rather than
+  an evenly-spaced placeholder. The spec (§3.11): "the previous LSP
+  vector ... should be initialized to LSP DC vector, pDC".
+- **§3.10.1 erasure LSP extrapolation.** With the decoded residual
+  `ẽ_n` forced to zero (step 1) and the erasure predictor `b_e = 23/32`
+  (`LSP_PREDICTOR_BE`, step 2), the concealed LSP becomes
+  `p̃_n = b_e·(p̃_{n-1} − p_DC) + p_DC` — a leak of every LSP angular
+  frequency a fraction `1 − b_e = 9/32` of the way toward its DC value.
+  `extrapolate_lsp_toward_dc` applies this in the angular-frequency
+  domain, then the §3.10.1 wider-`Δ_min = 62.5 Hz` ordering procedure
+  re-stabilises the result. Previously the erasure path reused the
+  frozen `prev_lsp` and applied only the wider stability check.
+- **Progressive relaxation across a run.** The extrapolated LSP is now
+  persisted as the previous-frame vector, so a sustained erasure run
+  relaxes the spectral envelope monotonically toward the long-term mean
+  (instead of holding the pre-erasure envelope constant), and a good
+  frame ending the run interpolates from the concealed envelope.
+
+Three new unit tests pin the behaviour: cold-start `prev_lsp` equals
+`p_DC` and is a strictly-ordered LSP set; the erasure extrapolation
+lands on the exact convex combination, never overshoots DC, and has
+`p_DC` as a fixed point; and a sustained erasure run strictly reduces
+the angular-frequency distance to `p_DC` frame after frame. Round-trip
+PSNR on clean (non-erased) streams is unchanged — the cold-start vector
+only affects the very first frame's previous-LSP reference and the
+erasure path is off for good frames.
 
 ### Formant-postfilter tilt + adaptive gain scaling — G.723.1 §3.8 / 3.9 (round 229)
 

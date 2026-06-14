@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Frame-erasure LSP concealment now implements §3.10.1's predictor-based
+  extrapolation toward the long-term DC vector instead of freezing the last
+  good vector, and the decoder cold-starts the previous-frame LSP at the DC
+  vector `p_DC` per §3.11 (round 302). With the decoded residual `ẽ_n` set
+  to zero and the erasure predictor `b_e = 23/32`, the concealed LSP becomes
+  `p̃_n = b_e·(p̃_{n-1} − p_DC) + p_DC` — a per-frame leak of every LSP
+  angular frequency a fraction `1 − b_e = 9/32` toward its DC value, applied
+  by the new `extrapolate_lsp_toward_dc` helper before the wider-`Δ_min`
+  (§3.10.1) ordering procedure. The extrapolated vector is persisted as the
+  previous LSP, so a sustained erasure run relaxes the spectral envelope
+  monotonically toward the long-term mean and a recovering good frame
+  interpolates from the concealed envelope. `SynthesisState::new` now seeds
+  `prev_lsp` from `tables::lsp_dc_cosines()` (derived from the canonical Q15
+  `spec_tables::LSP_DC_PREDICTED_FREQ_Q15`) rather than an evenly-spaced
+  placeholder. New constants `LSP_PREDICTOR_B` (12/32) and `LSP_PREDICTOR_BE`
+  (23/32). Three unit tests pin the behaviour (cold-start equals `p_DC` and
+  is strictly ordered; extrapolation hits the exact convex combination,
+  never overshoots, and has `p_DC` as a fixed point; sustained erasure
+  strictly reduces the angular-frequency distance to `p_DC`). Round-trip
+  PSNR on clean streams is unchanged.
+
 - Formant postfilter (§3.8) now uses the §3.3 / §2.7 (eq. 8) per-subframe
   interpolated synthesis filter `Ã_i(z)` instead of a frame-constant LSP
   (round 296). Previously `apply_post_filter` passed `lsp_q` as both the

@@ -105,6 +105,46 @@ pub const LSP_STABILITY_DELTA_MIN_HZ: f32 = 31.25;
 /// LSP whose pairs have drifted further from the previous decoded vector.
 pub const LSP_STABILITY_DELTA_MIN_ERASURE_HZ: f32 = 62.5;
 
+/// Angular frequency `ω = π · q / 32768` of the `i`-th long-term LSP DC
+/// component (G.723.1 §2.6 / §3.10.1 / §3.11), reading the canonical Q15
+/// DC table from [`crate::spec_tables::LSP_DC_PREDICTED_FREQ_Q15`]. The Q15
+/// values are normalised frequencies where `0x8000` maps to π (Nyquist).
+pub fn lsp_dc_omega(i: usize) -> f32 {
+    std::f32::consts::PI * crate::spec_tables::LSP_DC_PREDICTED_FREQ_Q15[i] as f32 / 32_768.0
+}
+
+/// The §2.6 long-term LSP DC vector `p_DC` expressed in the synthesiser's
+/// cosine domain (`cos ω`, the representation used throughout
+/// [`crate::encoder`] for stored LSP vectors). Because the canonical Q15
+/// frequencies are strictly ascending, the cosines are strictly descending
+/// and lie inside `(-1, 1)`, i.e. a well-ordered LSP set by construction.
+///
+/// This vector is the decoder cold-start value for the previous LSP
+/// (§3.11: "the previous LSP vector ... should be initialized to LSP DC
+/// vector, pDC") and the convergence target of the erasure-concealment LSP
+/// leak (§3.10.1).
+pub fn lsp_dc_cosines() -> [f32; LPC_ORDER] {
+    let mut out = [0.0f32; LPC_ORDER];
+    for i in 0..LPC_ORDER {
+        out[i] = lsp_dc_omega(i).cos();
+    }
+    out
+}
+
+/// First-order MA predictor coefficient `b = 12/32` applied to the
+/// DC-removed previous LSP vector during *normal* inverse quantisation
+/// (G.723.1 §2.6, eq. 3.3: `p̄_n = b · [p̃_{n-1} − p_DC]`).
+pub const LSP_PREDICTOR_B: f32 = 12.0 / 32.0;
+
+/// First-order MA predictor coefficient `b_e = 23/32` used in place of
+/// [`LSP_PREDICTOR_B`] during frame-erasure concealment (G.723.1 §3.10.1,
+/// step 2: "For p̄_n generation a different fixed predictor is used:
+/// b_e = 23/32"). With the decoded residual `ẽ_n` forced to zero, the
+/// concealed LSP becomes `p̃_n = b_e · (p̃_{n-1} − p_DC) + p_DC`, i.e. a
+/// leak of the previous LSP vector toward the DC vector at rate
+/// `1 − b_e = 9/32` per erased frame.
+pub const LSP_PREDICTOR_BE: f32 = 23.0 / 32.0;
+
 /// Maximum number of iterations the LSP stability procedure runs before
 /// giving up on the decoded vector and falling back to the previous good
 /// LSP (G.723.1 §3.1 / 2.6, "iterate up to 10 times").
