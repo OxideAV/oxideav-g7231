@@ -140,6 +140,37 @@ through the AGC stays at unity gain; the AGC's per-sample leaky
 integrator matches the closed-form `g[N − 1] = g₀ + (g_s − g₀)·(1 − (1 − α)^N)`
 after one subframe).
 
+### Formant postfilter uses interpolated LPC — G.723.1 §3.8 / 3.3 / 2.7 (round 296)
+
+The formant postfilter `A(z/γ₁)/A(z/γ₂)` (§3.8) now runs on the same
+per-subframe interpolated synthesis filter `Ã_i(z)` the LPC synthesis
+stage uses, instead of a frame-constant approximation:
+
+- Previously `apply_post_filter` passed the current-frame LSP as *both*
+  the previous and current vector to `interpolate_lsp`, so the §2.7
+  (eq. 8) interpolation degenerated to the current frame's LSP for every
+  subframe — a deliberate simplification noted in the source.
+- The decoder entry points now capture the previous frame's decoded LSP
+  *before* `synthesise` advances `self.prev_lsp = lsp_q`, then thread that
+  snapshot into `apply_post_filter`. The postfilter reproduces the exact
+  (0.75/0.25), (0.5/0.5), (0.25/0.75), (0/1) interpolation curve (§3.3 /
+  §2.7) the synthesis filter used, subframe-for-subframe, so the formant
+  filter is matched to the synthesis filter rather than drifting from it
+  across the frame.
+- The frame-erasure path (§3.10.2) already interpolated against the true
+  previous LSP — only the normal good-frame path carried the
+  simplification, now removed.
+
+Round-trip PSNR on the quasi-stationary voiced integration signal is
+unchanged (ACELP ≈ 17.58 dB, MP-MLQ ≈ 20.72 dB) because that signal's
+LSPs barely move frame-to-frame; the alignment matters across voiced
+transitions where the LSP changes between frames and the previous
+frame-constant formant filter diverged from the synthesis filter. The
+existing no-panic test moves to the new signature and a new test
+(`post_filter_uses_interpolated_lpc_across_the_frame`) confirms distinct
+previous/current LSP vectors change the prev-weighted early subframes
+while the last subframe (weight 0/1 on prev) diverges less.
+
 ### Frame-erasure concealment — G.723.1 §3.10.2 (round 222)
 
 The decoder's frame-erasure path (triggered by `0b10` SID and `0b11`
@@ -325,7 +356,8 @@ of the published data alongside the accessor behaviour:
   non-decreasing with the published 1024 Q-unit floor.
 - `LspBand::ALL` covers indices 0..10 contiguously.
 
-Total lib-test count: **85** (up from 71).
+Total lib-test count: **91** (round-265 accessors plus the round-296
+postfilter-interpolation tests).
 
 ## Benchmarks (round 203)
 

@@ -2526,8 +2526,10 @@ impl SynthesisState {
     /// Run the post-filter across a full frame. `pcm` is the synthesis-
     /// filter output in `[-1, 1]`-normalised f32. `lsp_q`/`lags` match the
     /// decoded frame fields so per-subframe formant filters have the right
-    /// LPC coefficients. `rate` selects the rate-specific LTP weighting in
-    /// the pitch postfilter (§3.6).
+    /// LPC coefficients. `prev_lsp` is the *previous frame's* decoded LSP
+    /// vector, captured before [`SynthesisState::synthesise`] advanced
+    /// `self.prev_lsp` to `lsp_q`. `rate` selects the rate-specific LTP
+    /// weighting in the pitch postfilter (§3.6).
     ///
     /// G.723.1 §3.6 specifies that the pitch postfilter uses `L_0` (the
     /// absolute lag of subframe 0) for subframes 0,1 and `L_2` (subframe
@@ -2535,22 +2537,25 @@ impl SynthesisState {
     /// delta-decoded lags. We respect that here.
     fn apply_post_filter(
         &mut self,
+        prev_lsp: &[f32; LPC_ORDER],
         lsp_q: &[f32; LPC_ORDER],
         lags: &[i32; SUBFRAMES_PER_FRAME],
         rate: Rate,
         pcm: &mut [f32; FRAME_SIZE_SAMPLES],
     ) {
-        // The synthesise() pass already advanced self.prev_lsp to lsp_q;
-        // for per-subframe LPC we must re-interpolate against what *was*
-        // the previous LSP, so we reconstruct it from self.prev_lsp (which
-        // is the current frame's quantised LSP at this point — same for
-        // all subframes).  We pass `lsp_q` as both prev and cur so the
-        // interpolation degenerates to the per-subframe current value;
-        // this is a deliberate simplification — the post-filter only needs
-        // LPC coefficients that are close enough to the synthesis filter
-        // in the same subframe, not the precise interpolated curve.
+        // The formant postfilter A(z/γ₁)/A(z/γ₂) (§3.8) operates on the
+        // same per-subframe quantised synthesis filter Ã_i(z) the LPC
+        // synthesis stage used.  Those coefficients come from the §3.3 /
+        // §2.7 (eq. 8) per-subframe LSP interpolation between the previous
+        // frame's decoded LSP and the current frame's, with weights
+        // (0.75/0.25), (0.5/0.5), (0.25/0.75), (0/1) for subframes 0..3 —
+        // *not* a frame-constant LSP.  `synthesise()` already advanced
+        // `self.prev_lsp` to `lsp_q`, so the caller passes the captured
+        // pre-synthesis previous LSP here and we reproduce the identical
+        // interpolation curve, keeping the postfilter's formant filter
+        // matched to the synthesis filter subframe-for-subframe.
         for s in 0..SUBFRAMES_PER_FRAME {
-            let lsp_interp = interpolate_lsp(s, lsp_q, lsp_q);
+            let lsp_interp = interpolate_lsp(s, prev_lsp, lsp_q);
             let a_sub = lsp_to_lpc(&lsp_interp);
             // Reference lag for the LTP postfilter: L_0 covers subframes
             // 0,1; L_2 covers subframes 2,3 (G.723.1 §3.6 prose).
@@ -2816,6 +2821,10 @@ impl SynthesisState {
             place_pulses(&positions, signs, grid[s], &mut pulses_per_subframe[s]);
         }
 
+        // Capture the previous frame's LSP before synthesise() advances
+        // self.prev_lsp to lsp_q, so the postfilter can reproduce the same
+        // §2.7 per-subframe interpolated formant filter the synthesis used.
+        let prev_lsp_snapshot = self.prev_lsp;
         let mut pcm_f = [0.0f32; FRAME_SIZE_SAMPLES];
         self.synthesise(
             &lsp_q,
@@ -2830,7 +2839,7 @@ impl SynthesisState {
         // history / syn_mem / prev_lsp) alone so the encoder's shadow
         // synth sees the unmodified signal.  ACELP uses γ_ltp = 0.25 in
         // the pitch postfilter (G.723.1 §3.6).
-        self.apply_post_filter(&lsp_q, &lags, Rate::Low, &mut pcm_f);
+        self.apply_post_filter(&prev_lsp_snapshot, &lsp_q, &lags, Rate::Low, &mut pcm_f);
         self.record_last_frame(&lags, &gain);
         self.record_pcm_history(&pcm_f);
         Ok(to_i16_frame(&pcm_f))
@@ -2890,6 +2899,9 @@ impl SynthesisState {
         let lag3 = decode_delta_lag(acl3, lag2);
         let lags = [lag0, lag1, lag2, lag3];
 
+        // Capture the previous frame's LSP before synthesise() advances
+        // self.prev_lsp to lsp_q (see decode_acelp for the rationale).
+        let prev_lsp_snapshot = self.prev_lsp;
         let mut pcm_f = [0.0f32; FRAME_SIZE_SAMPLES];
         self.synthesise(
             &lsp_q,
@@ -2902,7 +2914,7 @@ impl SynthesisState {
         // Same post-filter pipeline as ACELP (pitch + formant + tilt +
         // AGC).  MP-MLQ uses γ_ltp = 0.1875 in the pitch postfilter
         // (G.723.1 §3.6).
-        self.apply_post_filter(&lsp_q, &lags, Rate::High, &mut pcm_f);
+        self.apply_post_filter(&prev_lsp_snapshot, &lsp_q, &lags, Rate::High, &mut pcm_f);
         self.record_last_frame(&lags, &gain);
         self.record_pcm_history(&pcm_f);
         Ok(to_i16_frame(&pcm_f))
@@ -3809,16 +3821,79 @@ mod tests {
     fn apply_post_filter_does_not_panic_on_typical_lags() {
         let mut st = SynthesisState::new();
         let lsp_q = st.prev_lsp;
+        let prev_lsp = st.prev_lsp;
         let mut pcm = [0.0f32; FRAME_SIZE_SAMPLES];
         let two_pi = 2.0f32 * std::f32::consts::PI;
         for (n, s) in pcm.iter_mut().enumerate() {
             *s = (two_pi * (n as f32) / 50.0).sin() * 0.3;
         }
         let lags = [50, 51, 48, 49];
-        st.apply_post_filter(&lsp_q, &lags, Rate::High, &mut pcm);
+        st.apply_post_filter(&prev_lsp, &lsp_q, &lags, Rate::High, &mut pcm);
         for v in pcm.iter() {
             assert!(v.is_finite());
         }
+    }
+
+    /// The formant postfilter's per-subframe LPC must come from the §2.7
+    /// (eq. 8) interpolation between the *previous frame's* LSP and the
+    /// current frame's, not a frame-constant LSP.  With distinct prev/cur
+    /// LSP vectors the early subframes (weighted heavily toward `prev`)
+    /// must produce a measurably different postfiltered signal than when
+    /// `prev == cur`; the last subframe (weight 0/1 on `prev`) must be
+    /// (near-)identical between the two runs, since its interpolation
+    /// ignores `prev` entirely.
+    #[test]
+    fn post_filter_uses_interpolated_lpc_across_the_frame() {
+        let two_pi = 2.0f32 * std::f32::consts::PI;
+        let make_pcm = || {
+            let mut pcm = [0.0f32; FRAME_SIZE_SAMPLES];
+            for (n, s) in pcm.iter_mut().enumerate() {
+                *s = (two_pi * (n as f32) / 50.0).sin() * 0.3;
+            }
+            pcm
+        };
+        // Current-frame LSP (decoder default) and a deliberately different
+        // previous-frame LSP (omegas shifted up), both strictly ordered.
+        let cur = SynthesisState::new().prev_lsp;
+        let mut prev = [0.0f32; LPC_ORDER];
+        let step = std::f32::consts::PI / (LPC_ORDER as f32 + 1.0);
+        for k in 0..LPC_ORDER {
+            // Shift each omega by +0.15 rad → a distinct but ordered LSP.
+            prev[k] = ((k as f32 + 1.0) * step + 0.15).min(3.05).cos();
+        }
+        let lags = [50, 51, 48, 49];
+
+        // Run A: postfilter with the true previous-frame LSP.
+        let mut st_a = SynthesisState::new();
+        let mut pcm_a = make_pcm();
+        st_a.apply_post_filter(&prev, &cur, &lags, Rate::High, &mut pcm_a);
+
+        // Run B: postfilter with prev == cur (the old degenerate path).
+        let mut st_b = SynthesisState::new();
+        let mut pcm_b = make_pcm();
+        st_b.apply_post_filter(&cur, &cur, &lags, Rate::High, &mut pcm_b);
+
+        // Subframe 0 (weight 0.75 on prev) must differ when prev != cur.
+        let sub0_diff: f32 = (0..SUBFRAME_SIZE)
+            .map(|n| (pcm_a[n] - pcm_b[n]).abs())
+            .sum();
+        assert!(
+            sub0_diff > 1e-4,
+            "subframe 0 must reflect the previous-frame LSP via §2.7 interpolation (diff={sub0_diff})"
+        );
+
+        // Subframe 3 (weight 0/1 on prev) ignores prev, so the two runs
+        // must agree there — modulo the carried postfilter memory, which
+        // we bound loosely relative to the subframe-0 divergence.
+        let last = 3 * SUBFRAME_SIZE;
+        let sub3_diff: f32 = (0..SUBFRAME_SIZE)
+            .map(|n| (pcm_a[last + n] - pcm_b[last + n]).abs())
+            .sum();
+        assert!(
+            sub3_diff < sub0_diff,
+            "subframe 3 ignores prev (weight 0/1) so it must diverge less than subframe 0 \
+             (sub3={sub3_diff}, sub0={sub0_diff})"
+        );
     }
 
     // -- §3.1 / 2.6 LSP stability procedure (eq. 6–7.3) -----------------

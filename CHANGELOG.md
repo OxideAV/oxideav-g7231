@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Formant postfilter (§3.8) now uses the §3.3 / §2.7 (eq. 8) per-subframe
+  interpolated synthesis filter `Ã_i(z)` instead of a frame-constant LSP
+  (round 296). Previously `apply_post_filter` passed `lsp_q` as both the
+  previous and current LSP to the interpolation, degenerating it to the
+  current frame's LSP for every subframe — a deliberate simplification.
+  The decoder entry points (`decode_acelp` / `decode_mpmlq`) now capture
+  the previous frame's decoded LSP before `synthesise` advances
+  `self.prev_lsp`, and thread it through so the postfilter reproduces the
+  exact (0.75/0.25), (0.5/0.5), (0.25/0.75), (0/1) interpolation curve the
+  LPC synthesis stage used, subframe-for-subframe. Round-trip PSNR on the
+  quasi-stationary integration signal is unchanged (ACELP 17.58 dB,
+  MP-MLQ 20.72 dB); the alignment matters across voiced transitions where
+  the LSP moves frame-to-frame and the previous formant-constant filter
+  diverged from the synthesis filter. Two unit tests pin the behaviour:
+  the existing no-panic test moves to the new signature, and a new test
+  confirms that distinct previous/current LSP vectors change the early
+  (prev-weighted) subframes while leaving the last subframe (weight 0/1
+  on prev) less affected.
+
 ### Added
 
 - Two new `cargo-fuzz` ASan targets extending the round-236 `decode`
