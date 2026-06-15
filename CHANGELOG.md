@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- §3.6 pitch postfilter forward LTP reach now spans the whole-frame
+  synthesis signal (trace §8) instead of truncating the correlation
+  window at the subframe boundary
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-g7231/compare/v0.0.7...v0.0.8) - 2026-06-15
 
 ### Other

@@ -70,10 +70,12 @@ The registered `Decoder` is a full synthesiser:
   attenuates 2.5 dB per consecutive erased frame, and mutes after 3
   frames. The erasure LSP path leaks toward `p_DC` per §3.10.1.
 - **Post-filter chain**: §3.6 pitch (long-term) post-filter with
-  per-side prediction-gain weighting and rate-specific γ_ltp; §3.8
-  formant filter `A(z/γ₁)/A(z/γ₂)` running on the per-subframe
-  interpolated synthesis LPC; §3.8 signal-adaptive tilt compensation;
-  §3.9 leaky-integrator adaptive gain scaling.
+  per-side prediction-gain weighting and rate-specific γ_ltp — the
+  forward cross-correlation reads across the subframe boundary into the
+  whole-frame synthesis signal (§3.6 / trace §8) rather than truncating
+  the window at sample 60; §3.8 formant filter `A(z/γ₁)/A(z/γ₂)` running
+  on the per-subframe interpolated synthesis LPC; §3.8 signal-adaptive
+  tilt compensation; §3.9 leaky-integrator adaptive gain scaling.
 - `reset()` reinitialises the synthesiser to silence.
 - SID and untransmitted frames are accepted as framing-valid and feed
   the §3.10.2 concealment path; comfort-noise generation (Annex A SID
