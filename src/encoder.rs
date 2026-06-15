@@ -1310,25 +1310,44 @@ fn decode_delta_lag(code: u32, prev_lag: i32) -> i32 {
 
 // ---------- ACELP 4-pulse search ----------
 
-/// Four-pulse ACELP fixed-codebook search. Each of the 4 pulses lives on
-/// its own track with stride-8 positions (covering 8 positions per track);
-/// the grid bit shifts all pulses by +4 so the union of both grids spans
-/// all 60 subframe samples.
+/// Sample position of the ACELP pulse on `track` (0..=3) at 3-bit slot
+/// `k` (0..=7), with the global 1-bit `grid` shift applied. Returns
+/// `None` for the Table-1 "(60)" / "(62)" entries (track 2 / 3, `k = 7`
+/// on the even grid) that fall at or beyond the 60-sample subframe — i.e.
+/// the pulse is absent.
 ///
-/// Track layout (grid 0):
+/// This is the exact geometry of ITU-T G.723.1 §2.16 Table 1 (ACELP
+/// excitation codebook): the four tracks have even bases 0, 2, 4, 6 and
+/// stride 8, and "the positions of all pulses can be simultaneously
+/// shifted by one (to occupy odd positions)" via the grid bit. The
+/// canonical lookup lives in [`crate::spec_tables::acelp_track_position`];
+/// this thin wrapper adapts the encoder/decoder's `usize`/`u8` indices to
+/// the typed accessor.
+fn acelp_pos_of(track: usize, k: u32, grid: u8) -> Option<usize> {
+    let t = crate::spec_tables::AcelpTrack::ALL[track];
+    crate::spec_tables::acelp_track_position(t, k as usize, grid != 0)
+}
+
+/// Four-pulse ACELP fixed-codebook search. Each of the 4 pulses lives on
+/// its own track with stride-8 positions (8 candidate slots per track);
+/// the grid bit shifts the whole pulse set by +1 so both even and odd
+/// sample positions are reachable — the §2.16 Table 1 structure.
+///
+/// Track layout (grid 0, even positions):
 ///
 /// ```text
 ///   T0: 0,  8, 16, 24, 32, 40, 48, 56
-///   T1: 1,  9, 17, 25, 33, 41, 49, 57
-///   T2: 2, 10, 18, 26, 34, 42, 50, 58
-///   T3: 3, 11, 19, 27, 35, 43, 51, 59
+///   T1: 2, 10, 18, 26, 34, 42, 50, 58
+///   T2: 4, 12, 20, 28, 36, 44, 52, (60)
+///   T3: 6, 14, 22, 30, 38, 46, 54, (62)
 /// ```
 ///
-/// Grid 1 shifts each position by 4. Combined, every position in
-/// `[0, SUBFRAME_SIZE)` is reachable by exactly one (track, grid, k)
-/// triple — so the 3-bit position code + 1-bit sign per track, plus the
-/// 1-bit grid per subframe, gives full per-sample coverage at the cost
-/// of searching 2 × 4 × 8 = 64 candidates rather than 32.
+/// Grid 1 shifts each position by +1 (odd positions). Slots whose
+/// position lands at or beyond 60 — track 2 / 3 at `k = 7` on the even
+/// grid — encode an *absent* pulse per the Table 1 note. The 3-bit
+/// position code + 1-bit sign per track, plus the 1-bit grid per
+/// subframe, give the 17-bit algebraic codebook; the search scans
+/// 2 × 4 × 8 = 64 candidates.
 ///
 /// After the per-track greedy pick, the algorithm does two passes of
 /// coordinate-descent refinement: for each pulse in turn it re-optimises
@@ -1337,7 +1356,6 @@ fn decode_delta_lag(code: u32, prev_lag: i32) -> i32 {
 /// grid get adjusted.
 fn acelp_4pulse_search(target: &[f32; SUBFRAME_SIZE], h: &[f32]) -> ([u32; 4], [i32; 4], u8) {
     let d = compute_correlations(target, h);
-    let stride: usize = 8;
     let positions_per_track: usize = 8;
 
     let mut best_grid = 0u8;
@@ -1346,8 +1364,6 @@ fn acelp_4pulse_search(target: &[f32; SUBFRAME_SIZE], h: &[f32]) -> ([u32; 4], [
     let mut best_signs = [1i32; 4];
 
     for grid in 0..2u8 {
-        let grid_offset = grid as usize * 4;
-
         // Pass 1: per-track greedy pick (initial solution).
         let mut positions = [0u32; 4];
         let mut signs = [1i32; 4];
@@ -1356,10 +1372,10 @@ fn acelp_4pulse_search(target: &[f32; SUBFRAME_SIZE], h: &[f32]) -> ([u32; 4], [
             let mut best_k = 0u32;
             let mut best_sign = 1i32;
             for k in 0..positions_per_track {
-                let pos = track + stride * k + grid_offset;
-                if pos >= SUBFRAME_SIZE {
-                    continue;
-                }
+                let pos = match acelp_pos_of(track, k as u32, grid) {
+                    Some(p) => p,
+                    None => continue,
+                };
                 let ap = autocorr_at(h, pos);
                 if ap < 1e-8 {
                     continue;
@@ -1386,8 +1402,7 @@ fn acelp_4pulse_search(target: &[f32; SUBFRAME_SIZE], h: &[f32]) -> ([u32; 4], [
                     if t2 == track {
                         continue;
                     }
-                    let pos = t2 + stride * positions[t2] as usize + grid_offset;
-                    if pos < SUBFRAME_SIZE {
+                    if let Some(pos) = acelp_pos_of(t2, positions[t2], grid) {
                         let sgn = signs[t2] as f32;
                         for n in pos..SUBFRAME_SIZE {
                             others[n] += sgn * h[n - pos];
@@ -1403,10 +1418,10 @@ fn acelp_4pulse_search(target: &[f32; SUBFRAME_SIZE], h: &[f32]) -> ([u32; 4], [
                 let mut best_k = positions[track];
                 let mut best_sign = signs[track];
                 for k in 0..positions_per_track {
-                    let pos = track + stride * k + grid_offset;
-                    if pos >= SUBFRAME_SIZE {
-                        continue;
-                    }
+                    let pos = match acelp_pos_of(track, k as u32, grid) {
+                        Some(p) => p,
+                        None => continue,
+                    };
                     // Best sign at this position minimises |resid - sign*h_pos|^2.
                     // sign* = sign(<resid, h_pos>); resulting err = |resid|^2 - <resid, h_pos>^2 / |h_pos|^2.
                     let ap = autocorr_at(h, pos);
@@ -1439,8 +1454,7 @@ fn acelp_4pulse_search(target: &[f32; SUBFRAME_SIZE], h: &[f32]) -> ([u32; 4], [
         // Score this grid: compute reconstruction error.
         let mut syn = [0.0f32; SUBFRAME_SIZE];
         for track in 0..4usize {
-            let pos = track + stride * positions[track] as usize + grid_offset;
-            if pos < SUBFRAME_SIZE {
+            if let Some(pos) = acelp_pos_of(track, positions[track], grid) {
                 let sgn = signs[track] as f32;
                 for n in pos..SUBFRAME_SIZE {
                     syn[n] += sgn * h[n - pos];
@@ -1513,20 +1527,20 @@ pub(crate) fn unpack_fcb_bits(v: u32) -> ([u32; 4], [i32; 4]) {
 }
 
 /// Place 4 pulses at positions specified by tracks + grid bit. Must
-/// mirror the layout used by [`acelp_4pulse_search`].
+/// mirror the §2.16 Table 1 layout used by [`acelp_4pulse_search`] (even
+/// bases 0, 2, 4, 6; stride 8; the grid bit is the global +1 odd shift).
+/// A 3-bit slot whose position lands at or beyond the subframe boundary
+/// (the Table 1 "(60)" / "(62)" entries) places no pulse — i.e. an
+/// absent pulse.
 pub(crate) fn place_pulses(
     positions: &[u32; 4],
     signs: [i32; 4],
     grid: u8,
     out: &mut [f32; SUBFRAME_SIZE],
 ) {
-    let stride: usize = 8;
-    let grid_offset = grid as usize * 4;
     out.fill(0.0);
     for track in 0..4usize {
-        let k = positions[track] as usize;
-        let pos = track + stride * k + grid_offset;
-        if pos < SUBFRAME_SIZE {
+        if let Some(pos) = acelp_pos_of(track, positions[track], grid) {
             out[pos] = signs[track] as f32;
         }
     }
@@ -3344,6 +3358,48 @@ mod tests {
             psnr >= 15.0,
             "ACELP voiced-signal PSNR = {psnr:.2} dB, expected >= 15 dB"
         );
+    }
+
+    /// The ACELP fixed-codebook pulse geometry matches §2.16 Table 1:
+    /// four tracks with even bases 0, 2, 4, 6 and stride 8, with the grid
+    /// bit applying the global +1 odd shift. `acelp_pos_of` and
+    /// `place_pulses` must agree, and the search must never emit a slot
+    /// that decodes to a different sample than it placed.
+    #[test]
+    fn acelp_pulse_geometry_matches_table1() {
+        // Even grid (shift = 0): each track's k = 0 hits its Table 1 base.
+        assert_eq!(acelp_pos_of(0, 0, 0), Some(0));
+        assert_eq!(acelp_pos_of(1, 0, 0), Some(2));
+        assert_eq!(acelp_pos_of(2, 0, 0), Some(4));
+        assert_eq!(acelp_pos_of(3, 0, 0), Some(6));
+        // Stride 8 across the slots of track 0.
+        assert_eq!(acelp_pos_of(0, 7, 0), Some(56));
+        assert_eq!(acelp_pos_of(1, 7, 0), Some(58));
+        // Table 1 "(60)" / "(62)" — track 2 / 3 at k = 7 on the even grid
+        // fall outside the 60-sample subframe → absent pulse.
+        assert_eq!(acelp_pos_of(2, 7, 0), None);
+        assert_eq!(acelp_pos_of(3, 7, 0), None);
+        // Odd grid (shift = 1) moves the whole set up by one.
+        assert_eq!(acelp_pos_of(0, 0, 1), Some(1));
+        assert_eq!(acelp_pos_of(2, 6, 1), Some(53));
+        // Track 2 k = 7 was 60 (absent) on the even grid; on the odd grid
+        // it would be 61 → still absent.
+        assert_eq!(acelp_pos_of(2, 7, 1), None);
+
+        // place_pulses agrees with acelp_pos_of for every present slot and
+        // drops the absent ones.
+        let positions = [3u32, 7, 7, 2]; // T2/T3 k=7 are absent on even grid
+        let signs = [1i32, -1, 1, -1];
+        let mut out = [0.0f32; SUBFRAME_SIZE];
+        place_pulses(&positions, signs, 0, &mut out);
+        // T0 k=3 → 0 + 24 = 24 (+1); T1 k=7 → 58 (−1); T3 k=2 → 22 (−1).
+        assert_eq!(out[24], 1.0);
+        assert_eq!(out[58], -1.0);
+        assert_eq!(out[22], -1.0);
+        // The two absent pulses placed nothing — exactly three non-zero
+        // samples remain.
+        let nonzero = out.iter().filter(|&&v| v != 0.0).count();
+        assert_eq!(nonzero, 3);
     }
 
     #[test]

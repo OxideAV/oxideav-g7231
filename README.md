@@ -209,6 +209,38 @@ existing no-panic test moves to the new signature and a new test
 previous/current LSP vectors change the prev-weighted early subframes
 while the last subframe (weight 0/1 on prev) diverges less.
 
+### ACELP fixed codebook uses §2.16 Table 1 geometry (round 312)
+
+The 5.3 kbit/s ACELP algebraic-codebook pulse positions now follow the
+spec's §2.16 Table 1 exactly, replacing the earlier ad-hoc track layout:
+
+- **Table 1 tracks.** The four pulses sit on even bases `0, 2, 4, 6` with
+  stride 8 — `T0 = {0,8,…,56}`, `T1 = {2,10,…,58}`,
+  `T2 = {4,12,…,52,(60)}`, `T3 = {6,14,…,54,(62)}` — and the 1-bit grid
+  is the global "+1 odd shift" the spec describes ("the positions of all
+  pulses can be simultaneously shifted by one to occupy odd positions").
+  The previous layout used bases `0,1,2,3` with a `+4` grid offset, which
+  was internally consistent but not the Table 1 structure.
+- **Absent-pulse slots.** Per the Table 1 note, the last slot of tracks 2
+  and 3 lands at sample 60 / 62, outside the 60-sample subframe — those
+  3-bit codes now correctly signify an *absent* pulse rather than a
+  clamped one.
+- **Single source of geometry.** Both the encoder's coordinate-descent
+  pulse search (`acelp_4pulse_search`) and the decoder's pulse placement
+  (`place_pulses`) route through one helper, `acelp_pos_of`, which wraps
+  the typed `spec_tables::acelp_track_position` accessor (bases / stride /
+  shift / out-of-range handling all from the in-tree Table 1 data), so
+  encode and decode can never drift apart.
+
+Round-trip PSNR on the voiced integration signal is unchanged inside its
+band (ACELP ≈ 17.1 dB on the 2 s signal, ≈ 18.5 dB on the single-frame
+floor probe; MP-MLQ unchanged ≈ 21 dB) — this is a structural-conformance
+change in the fixed-codebook position model, not a quality knob. One new
+unit test (`acelp_pulse_geometry_matches_table1`) pins every Table 1 base,
+the stride-8 progression, the `(60)`/`(62)` absent-pulse slots on both
+grids, and the encode/decode agreement of `acelp_pos_of` with
+`place_pulses`.
+
 ### Frame-erasure concealment — G.723.1 §3.10.2 (round 222)
 
 The decoder's frame-erasure path (triggered by `0b10` SID and `0b11`
@@ -287,8 +319,8 @@ to-end (release build, x86_64):
 
 |    rate | frame size | PSNR    |
 | ------: | ---------: | :------ |
-| 5.3 k/s |   20 bytes | ≈ 17.6 dB |
-| 6.3 k/s |   24 bytes | ≈ 20.7 dB |
+| 5.3 k/s |   20 bytes | ≈ 17.1 dB |
+| 6.3 k/s |   24 bytes | ≈ 21.1 dB |
 
 See `tests/codec_roundtrip.rs::roundtrip_two_seconds_voiced_psnr_both_rates`
 for the integration test and
@@ -305,13 +337,15 @@ aplay -f S16_LE -c 1 -r 8000 /tmp/g7231-sample.raw
 
 ## Not bit-compatible with ITU-T reference tables
 
-The LSP split VQ, joint gain codebook, and fixed-codebook pulse track
-layout currently driving the encoder / decoder are a clean-room,
-pure-Rust design — internally consistent and decode-quality-equivalent
-to a reference G.723.1 codec, but **not** bit-compatible with ITU-T
-Tables 5 / 7 / 9. Bitstreams produced by this encoder decode cleanly
-with this crate's own decoder at the PSNR figures above, but not with
-an external, spec-table G.723.1 reference decoder.
+The LSP split VQ, joint gain codebook, and MP-MLQ pulse track layout
+currently driving the encoder / decoder are a clean-room, pure-Rust
+design — internally consistent and decode-quality-equivalent to a
+reference G.723.1 codec, but **not** bit-compatible with ITU-T
+Tables 5 / 7 / 9. (As of round 312 the 5.3 kbit/s ACELP fixed-codebook
+*positions* do follow §2.16 Table 1, but the surrounding gain word and
+bit packing remain the clean-room design.) Bitstreams produced by this
+encoder decode cleanly with this crate's own decoder at the PSNR figures
+above, but not with an external, spec-table G.723.1 reference decoder.
 
 Achieving that interoperability requires the full ITU-T numeric tables
 to be in tree as static data, plus a Q13 / Q15 fixed-point bit-exact
@@ -394,8 +428,9 @@ of the published data alongside the accessor behaviour:
   non-decreasing with the published 1024 Q-unit floor.
 - `LspBand::ALL` covers indices 0..10 contiguously.
 
-Total lib-test count: **91** (round-265 accessors plus the round-296
-postfilter-interpolation tests).
+Total lib-test count: **95** (round-265 accessors, the round-296
+postfilter-interpolation tests, and the round-312 ACELP Table 1 geometry
+test).
 
 ## Benchmarks (round 203)
 

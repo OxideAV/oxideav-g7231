@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The 5.3 kbit/s ACELP fixed-codebook pulse positions now follow ITU-T
+  G.723.1 §2.16 Table 1 exactly: four tracks on even bases `0, 2, 4, 6`
+  with stride 8, the 1-bit grid acting as the global "+1 odd shift", and
+  the last slot of tracks 2 / 3 (sample 60 / 62) correctly signifying an
+  absent pulse. The earlier layout used bases `0,1,2,3` with a `+4` grid
+  offset — internally consistent but not the Table 1 structure. Both the
+  encoder's coordinate-descent search (`acelp_4pulse_search`) and the
+  decoder's pulse placement (`place_pulses`) now route through one helper
+  (`acelp_pos_of`) wrapping the typed `spec_tables::acelp_track_position`
+  accessor, so encode and decode share a single Table-1-faithful geometry.
+  Round-trip PSNR is unchanged inside its band (ACELP ≈ 17.1 dB on the 2 s
+  voiced signal); a new unit test pins every Table 1 base, the stride-8
+  progression, the `(60)`/`(62)` absent-pulse slots, and the encode/decode
+  geometry agreement (round 312).
 - Frame-erasure LSP concealment now implements §3.10.1's predictor-based
   extrapolation toward the long-term DC vector instead of freezing the last
   good vector, and the decoder cold-starts the previous-frame LSP at the DC
