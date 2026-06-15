@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-g7231/compare/v0.0.7...v0.0.8) - 2026-06-15
+
+### Other
+
+- ACELP fixed codebook follows §2.16 Table 1 pulse geometry
+- erasure LSP leaks toward DC vector (§3.10.1) + §3.11 cold start
+- formant postfilter uses §2.7 interpolated LPC (round 296)
+- add roundtrip (encode→decode) + bitstream (structured parser) targets — round 286
+- low-rate ACELP track geometry + gain-word split accessors (r273)
+- typed accessors + deeper invariant tests (round 265)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- exempt fuzz/Cargo.lock from the library-level Cargo.lock block
+- add cargo-fuzz harness on the decoder's attacker surface
+- spec-shape tilt + AGC per G.723.1 §3.8 / 3.9
+- spec-shape frame-erasure path per G.723.1 §3.10.2
+- spec-shape LSP stability per G.723.1 §3.1 / 2.6
+- spec-shape pitch postfilter per G.723.1 §3.6
+- add Criterion bench harness (encode/decode/roundtrip, both rates)
+- land ITU-T G.723.1 spec-table data (27 tables, 17 invariant tests)
+
 ### Changed
 
 - The 5.3 kbit/s ACELP fixed-codebook pulse positions now follow ITU-T
