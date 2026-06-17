@@ -66,10 +66,10 @@ use crate::tables::{
     ERASURE_CLASSIFIER_LAG_RADIUS, ERASURE_MUTE_AFTER_FRAMES, ERASURE_VOICED_THRESHOLD_DB,
     FRAME_SIZE_SAMPLES, HIGH_RATE_BYTES, LOW_RATE_BYTES, LPC_ORDER, LSP_PREDICTOR_BE,
     LSP_STABILITY_DELTA_MIN_ERASURE_HZ, LSP_STABILITY_DELTA_MIN_HZ, LSP_STABILITY_MAX_ITERATIONS,
-    PITCH_MAX, PITCH_MIN, POSTFILTER_AGC_ALPHA, POSTFILTER_AGC_INIT_GAIN, POSTFILTER_GAMMA1,
-    POSTFILTER_GAMMA2, POSTFILTER_LTP_GAMMA_HIGH, POSTFILTER_LTP_GAMMA_LOW,
-    POSTFILTER_LTP_PRED_GAIN_DB_MIN, POSTFILTER_LTP_SEARCH_RADIUS, POSTFILTER_TILT_BASE,
-    POSTFILTER_TILT_SMOOTH_ALPHA, SAMPLE_RATE_HZ, SUBFRAMES_PER_FRAME, SUBFRAME_SIZE,
+    PITCH_MAX, PITCH_MIN, POSTFILTER_AGC_ALPHA, POSTFILTER_AGC_INIT_GAIN,
+    POSTFILTER_LTP_GAMMA_HIGH, POSTFILTER_LTP_GAMMA_LOW, POSTFILTER_LTP_PRED_GAIN_DB_MIN,
+    POSTFILTER_LTP_SEARCH_RADIUS, POSTFILTER_TILT_BASE, POSTFILTER_TILT_SMOOTH_ALPHA,
+    SAMPLE_RATE_HZ, SUBFRAMES_PER_FRAME, SUBFRAME_SIZE,
 };
 
 /// Total payload size for an ACELP (5.3 kbit/s) frame.
@@ -826,13 +826,31 @@ fn default_a() -> [f32; LPC_ORDER + 1] {
     a
 }
 
-/// Apply bandwidth expansion: `a_i <- a_i * gamma^i`.
-fn bandwidth_expand(a: &[f32; LPC_ORDER + 1], gamma: f32) -> [f32; LPC_ORDER + 1] {
+/// Formant-postfilter bandwidth expansion using the spec's *exact*
+/// Q15-quantised weighting tables instead of a recomputed floating-point
+/// `gamma^i`.
+///
+/// G.723.1 §3.8 (eq. 49.1–49.3) forms the ARMA formant postfilter
+/// `A(z/γ₁) / A(z/γ₂)` with γ₁ = 0.65 (zeros) and γ₂ = 0.75 (poles). The
+/// reference codec does **not** evaluate `γ^i` afresh at run time; it
+/// scales each LPC coefficient by a precomputed weight `PostFiltZeroTable`
+/// / `PostFiltPoleTable` (§2.18) carried in Q15. Those weights are the
+/// fixed-point powers `round(γ^(i+1) · 2¹⁵)` for `i = 0..9`. Threading the
+/// table through verbatim applies all ten weights from a single Q15
+/// constant instead of a repeatedly-multiplied float `gamma^i`, which
+/// accumulates rounding error tap-by-tap across the order-10 filter.
+///
+/// `weights_q15[k]` multiplies `a[k + 1]` (the order-`k+1` LPC tap); the
+/// `a[0] = 1` gain tap is left untouched. This is the spec-exact source of
+/// the formant postfilter coefficients, replacing the float `gamma^i`
+/// path so the weighting bit-matches the ITU table.
+fn postfilter_expand(
+    a: &[f32; LPC_ORDER + 1],
+    weights_q15: &[i16; LPC_ORDER],
+) -> [f32; LPC_ORDER + 1] {
     let mut out = *a;
-    let mut g = 1.0f32;
-    for i in 0..=LPC_ORDER {
-        out[i] = a[i] * g;
-        g *= gamma;
+    for k in 0..LPC_ORDER {
+        out[k + 1] = a[k + 1] * (weights_q15[k] as f32 / 32768.0);
     }
     out
 }
@@ -2488,8 +2506,12 @@ impl SynthesisState {
         // the formant bandwidth on the numerator and narrows it on the
         // denominator, emphasising the spectral peaks that carry speech
         // formants without shifting their centre frequency.
-        let a_num = bandwidth_expand(a_sub, POSTFILTER_GAMMA1);
-        let a_den = bandwidth_expand(a_sub, POSTFILTER_GAMMA2);
+        // Use the spec's exact Q15-quantised §2.18 PostFilt weighting
+        // tables (the fixed-point γ₁ = 0.65 / γ₂ = 0.75 powers) rather than
+        // recomputing γ^i in float, so the formant postfilter coefficients
+        // match the ITU reference weighting bit-for-bit.
+        let a_num = postfilter_expand(a_sub, &crate::spec_tables::POSTFILTER_ZERO_Q15);
+        let a_den = postfilter_expand(a_sub, &crate::spec_tables::POSTFILTER_POLE_Q15);
         let mut after_formant = [0.0f32; SUBFRAME_SIZE];
         for n in 0..SUBFRAME_SIZE {
             let x = after_pitch[n];
@@ -4428,6 +4450,60 @@ mod tests {
         let a = lsp_to_lpc(&lsp_out);
         for v in &a {
             assert!(v.is_finite(), "LPC coefficient must be finite");
+        }
+    }
+
+    /// `postfilter_expand` must scale `a[k+1]` by the spec's Q15
+    /// §2.18 PostFilt weighting tables exactly (`PostFilt[k] / 2¹⁵`),
+    /// leaving the `a[0] = 1` gain tap untouched.
+    #[test]
+    fn postfilter_expand_uses_q15_tables_verbatim() {
+        // Arbitrary non-trivial LPC vector (a[0] is the gain tap).
+        let mut a = [1.0f32; LPC_ORDER + 1];
+        for (k, v) in a.iter_mut().enumerate() {
+            *v = 1.0 - 0.05 * (k as f32);
+        }
+        let zero = crate::spec_tables::POSTFILTER_ZERO_Q15;
+        let pole = crate::spec_tables::POSTFILTER_POLE_Q15;
+
+        let num = postfilter_expand(&a, &zero);
+        let den = postfilter_expand(&a, &pole);
+
+        // Gain tap is left as-is in both.
+        assert_eq!(num[0], a[0]);
+        assert_eq!(den[0], a[0]);
+        for k in 0..LPC_ORDER {
+            let want_num = a[k + 1] * (zero[k] as f32 / 32768.0);
+            let want_den = a[k + 1] * (pole[k] as f32 / 32768.0);
+            assert!((num[k + 1] - want_num).abs() < 1e-9);
+            assert!((den[k + 1] - want_den).abs() < 1e-9);
+        }
+    }
+
+    /// The spec Q15 weighting tables are the fixed-point powers
+    /// `γ^(i+1)` of γ₁ = 0.65 (zeros) / γ₂ = 0.75 (poles): each entry equals
+    /// `round(γ^(i+1) · 2¹⁵)` (round half away from zero, as `f64::round`
+    /// does), and the sequence is strictly decreasing — the property a
+    /// bandwidth-expansion weighting must satisfy. Pinning the tables to
+    /// the closed-form powers guards against an accidental transcription
+    /// drift while documenting that `postfilter_expand` applies the exact
+    /// §2.18 weighting rather than a repeatedly-multiplied float `gamma^i`
+    /// (which accumulates rounding error across the 10 taps).
+    #[test]
+    fn postfilter_q15_tables_are_decreasing_gamma_powers() {
+        let zero = crate::spec_tables::POSTFILTER_ZERO_Q15;
+        let pole = crate::spec_tables::POSTFILTER_POLE_Q15;
+        for k in 1..LPC_ORDER {
+            assert!(zero[k] < zero[k - 1], "zero table must be decreasing");
+            assert!(pole[k] < pole[k - 1], "pole table must be decreasing");
+        }
+        for (k, &w) in zero.iter().enumerate() {
+            let want = (0.65f64.powi(k as i32 + 1) * 32768.0).round() as i16;
+            assert_eq!(w, want, "zero[{k}] must be round(0.65^(k+1)*2^15)");
+        }
+        for (k, &w) in pole.iter().enumerate() {
+            let want = (0.75f64.powi(k as i32 + 1) * 32768.0).round() as i16;
+            assert_eq!(w, want, "pole[{k}] must be round(0.75^(k+1)*2^15)");
         }
     }
 }

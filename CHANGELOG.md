@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- formant postfilter (§3.8 / §2.18) now scales each LPC tap by the spec's
+  exact Q15 `PostFiltZeroTable` / `PostFiltPoleTable` weights (the
+  fixed-point γ₁ = 0.65 / γ₂ = 0.75 powers from `spec_tables`) instead of
+  recomputing a repeatedly-multiplied float `gamma^i`, so the weighting
+  matches the ITU §2.18 table verbatim and avoids tap-by-tap rounding drift
 - §3.6 pitch postfilter forward LTP reach now spans the whole-frame
   synthesis signal (trace §8) instead of truncating the correlation
   window at the subframe boundary
