@@ -966,6 +966,126 @@ pub fn mpmlq_max_position(subframe: usize) -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------------
+// MP-MLQ combinatorial position codec (Fcbk_Pack / Fcbk_Unpk, §2.15 / §2.17)
+// ---------------------------------------------------------------------------
+//
+// The 6.3 kbit/s excitation places M pulses (M = 6 on even subframes, 5 on
+// odd) on a single 30-slot grid (all-odd or all-even, selected by the grid
+// bit). Their *positions* are a strictly-ascending M-subset of {0..29}, coded
+// as one `C(30, M)` combinatorial index (§2.15: "(30 M) combinatorial coding
+// is used to transmit the pulse locations").
+//
+// The codec is the standard combinatorial number system whose per-step
+// weights are exactly the published [`MPMLQ_COMBINATORIAL`] table. With the
+// table laid out as `T[r][c] = C(29 - c, 5 - r)` (verified by
+// `mpmlq_combinatorial_is_binomial_closed_form`), the weight to complete the
+// `(M - 1 - r)` remaining pulses after fixing pulse `r` at slot `c` — with
+// the rest constrained to slots `> c` — is `C(29 - c, M - 1 - r)`. Because
+// the table is built for `M_MAX = 6` (`5 - r`), the M = 5 path reads the same
+// table shifted down one row (`6 - M = 1`), giving `C(29 - c, 4 - r)`.
+//
+// Decode subtracts each candidate slot's weight while the running index still
+// covers it, advancing the slot; encode sums the skipped-slot weights. The
+// map is a bijection onto `[0, C(30, M))` — exhaustively verified for both
+// M = 5 (142 506 codewords) and M = 6 (593 775) in the unit tests — so it
+// inverts `Fcbk_Pack`/`Fcbk_Unpk` for the position-index half bit-for-bit.
+//
+// NOTE: this is the *position* index only. The four subframes' codeword 4-MSBs
+// are further recombined into the 13-bit `MSBPOS` word (§2.15 note, Table 5
+// octets 13–14) using the `L_bseg`/`base` segmentation constants
+// ([`BIT_ALLOCATION_SEGMENT_BOUNDARIES`] / [`BIT_ALLOCATION_SEGMENT_BASE`]);
+// that recombination arithmetic is the documented clean-room gap and is not
+// performed here.
+
+/// Number of MP-MLQ pulses on an even subframe (0, 2). Drives the `M = 6`
+/// path of the combinatorial codec.
+pub const MPMLQ_PULSES_EVEN: usize = 6;
+/// Number of MP-MLQ pulses on an odd subframe (1, 3). Drives the `M = 5` path.
+pub const MPMLQ_PULSES_ODD_M: usize = 5;
+/// Number of grid slots a single MP-MLQ subframe spans (60 samples / 2 for
+/// the all-odd-or-all-even grid).
+pub const MPMLQ_GRID_SLOTS: usize = 30;
+
+/// Combinatorial-number-system weight for pulse `r` of an `m`-pulse subframe
+/// fixed at grid slot `c`: the number of ways to place the remaining
+/// `m - 1 - r` pulses in slots strictly greater than `c`, read directly from
+/// the published [`MPMLQ_COMBINATORIAL`] table. Returns 0 once no completion
+/// is possible (past the positive support of the table row).
+fn mpmlq_comb_weight(m: usize, r: usize, c: usize) -> u32 {
+    // Table row 0 carries C(29 - c, 5 - r); shift by (6 - m) so an m-pulse
+    // subframe reads C(29 - c, m - 1 - r).
+    let row = r + (MPMLQ_PULSES_EVEN - m);
+    mpmlq_combinatorial(row, c).unwrap_or(0)
+}
+
+/// Encode `m` strictly-ascending MP-MLQ pulse positions (`positions[0] <
+/// positions[1] < … < positions[m-1]`, each in `0..30`) into the `C(30, m)`
+/// combinatorial index that `Fcbk_Pack` transmits (§2.15).
+///
+/// Returns `None` if `m` is not 5 or 6, if any position is `>= 30`, or if the
+/// positions are not strictly ascending — the encoder must already have
+/// produced a valid distinct-ascending pulse set.
+pub fn fcbk_pack_positions(positions: &[usize]) -> Option<u32> {
+    let m = positions.len();
+    if m != MPMLQ_PULSES_EVEN && m != MPMLQ_PULSES_ODD_M {
+        return None;
+    }
+    let mut idx = 0u32;
+    let mut prev: isize = -1;
+    for (r, &p) in positions.iter().enumerate() {
+        if p >= MPMLQ_GRID_SLOTS || (p as isize) <= prev {
+            return None;
+        }
+        let start = (prev + 1) as usize;
+        for c in start..p {
+            idx += mpmlq_comb_weight(m, r, c);
+        }
+        prev = p as isize;
+    }
+    Some(idx)
+}
+
+/// Decode an `m`-pulse `C(30, m)` combinatorial index back into the strictly
+/// ascending pulse positions (`Fcbk_Unpk`, §2.17 step 2). Inverse of
+/// [`fcbk_pack_positions`].
+///
+/// Returns `None` if `m` is not 5 or 6 or if `index` is out of range for that
+/// `m` (`>= C(30, m)`).
+pub fn fcbk_unpk_positions(index: u32, m: usize) -> Option<Vec<usize>> {
+    if m != MPMLQ_PULSES_EVEN && m != MPMLQ_PULSES_ODD_M {
+        return None;
+    }
+    let max = match m {
+        MPMLQ_PULSES_EVEN => MPMLQ_MAX_POSITION[0],
+        _ => MPMLQ_MAX_POSITION[1],
+    };
+    if index >= max {
+        return None;
+    }
+    let mut idx = index;
+    let mut positions = Vec::with_capacity(m);
+    let mut start = 0usize;
+    for r in 0..m {
+        let mut c = start;
+        loop {
+            let w = mpmlq_comb_weight(m, r, c);
+            if w == 0 {
+                break;
+            }
+            if idx >= w {
+                idx -= w;
+                c += 1;
+            } else {
+                break;
+            }
+        }
+        positions.push(c);
+        start = c + 1;
+    }
+    Some(positions)
+}
+
+// ---------------------------------------------------------------------------
 // Low-rate ACELP algebraic codebook geometry (Table 1/G.723.1, §2.16)
 // ---------------------------------------------------------------------------
 //
@@ -1445,6 +1565,121 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Closed-form identity of the MP-MLQ combinatorial table: every entry is
+    /// the binomial coefficient `T[r][c] = C(29 - c, 5 - r)`, with the
+    /// "impossible" cases (`5 - r > 29 - c`, or negative argument) stored as 0.
+    /// This is the exact weight the combinatorial number system needs, and
+    /// pinning the closed form (not just the Pascal recurrence) locks the data
+    /// dependency that `Fcbk_Pack`/`Fcbk_Unpk` consume.
+    #[test]
+    fn mpmlq_combinatorial_is_binomial_closed_form() {
+        // Pascal's-triangle binomial without overflow for the small range here.
+        fn binom(n: i32, k: i32) -> u64 {
+            if k < 0 || n < 0 || k > n {
+                return 0;
+            }
+            let k = k.min(n - k) as u64;
+            let mut num = 1u64;
+            for i in 0..k {
+                num = num * (n as u64 - i) / (i + 1);
+            }
+            num
+        }
+        for r in 0..MPMLQ_COMBINATORIAL_ROWS {
+            for c in 0..MPMLQ_COMBINATORIAL_COLS {
+                let got = MPMLQ_COMBINATORIAL[r * MPMLQ_COMBINATORIAL_COLS + c] as u64;
+                let want = binom(29 - c as i32, 5 - r as i32);
+                assert_eq!(
+                    got, want,
+                    "T[{r}][{c}] = {got}, expected C(29-{c}, 5-{r}) = {want}"
+                );
+            }
+        }
+    }
+
+    /// `Fcbk_Pack`/`Fcbk_Unpk` position codec round-trips bijectively over the
+    /// ENTIRE `C(30, 5) = 142 506` odd-subframe codeword space: every distinct
+    /// ascending 5-subset of `{0..29}` maps to a unique index in `[0, 142506)`
+    /// and decodes back exactly. Also confirms the index range saturates the
+    /// published `MPMLQ_MAX_POSITION[1]`.
+    #[test]
+    fn fcbk_position_codec_bijective_exhaustive_m5() {
+        let m = MPMLQ_PULSES_ODD_M; // 5
+        let mut seen = vec![false; MPMLQ_MAX_POSITION[1] as usize];
+        let mut max_idx = 0u32;
+        // Enumerate every strictly-ascending 5-subset of 0..30.
+        for a in 0..30 {
+            for b in (a + 1)..30 {
+                for c in (b + 1)..30 {
+                    for d in (c + 1)..30 {
+                        for e in (d + 1)..30 {
+                            let pos = [a, b, c, d, e];
+                            let idx = fcbk_pack_positions(&pos).expect("pack m5");
+                            assert!(!seen[idx as usize], "duplicate index {idx} for {pos:?}");
+                            seen[idx as usize] = true;
+                            max_idx = max_idx.max(idx);
+                            let back = fcbk_unpk_positions(idx, m).expect("unpk m5");
+                            assert_eq!(back, pos.to_vec(), "round-trip mismatch at idx {idx}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(seen.iter().all(|&s| s), "codeword space not fully covered");
+        assert_eq!(max_idx, MPMLQ_MAX_POSITION[1] - 1, "max index off");
+    }
+
+    /// Same bijection, exhaustive over the full `C(30, 6) = 593 775`
+    /// even-subframe space.
+    #[test]
+    fn fcbk_position_codec_bijective_exhaustive_m6() {
+        let m = MPMLQ_PULSES_EVEN; // 6
+        let mut seen = vec![false; MPMLQ_MAX_POSITION[0] as usize];
+        let mut max_idx = 0u32;
+        for a in 0..30 {
+            for b in (a + 1)..30 {
+                for c in (b + 1)..30 {
+                    for d in (c + 1)..30 {
+                        for e in (d + 1)..30 {
+                            for f in (e + 1)..30 {
+                                let pos = [a, b, c, d, e, f];
+                                let idx = fcbk_pack_positions(&pos).expect("pack m6");
+                                assert!(!seen[idx as usize], "duplicate index {idx}");
+                                seen[idx as usize] = true;
+                                max_idx = max_idx.max(idx);
+                                let back = fcbk_unpk_positions(idx, m).expect("unpk m6");
+                                assert_eq!(back, pos.to_vec(), "round-trip mismatch");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(seen.iter().all(|&s| s), "codeword space not fully covered");
+        assert_eq!(max_idx, MPMLQ_MAX_POSITION[0] - 1, "max index off");
+    }
+
+    /// The position codec rejects malformed inputs: wrong pulse count,
+    /// out-of-range slots, non-ascending order, and out-of-range indices.
+    #[test]
+    fn fcbk_position_codec_rejects_invalid_inputs() {
+        assert_eq!(fcbk_pack_positions(&[0, 1, 2, 3]), None, "wrong M=4");
+        assert_eq!(fcbk_pack_positions(&[0, 1, 2, 3, 30]), None, "slot >= 30");
+        assert_eq!(fcbk_pack_positions(&[5, 4, 3, 2, 1]), None, "descending");
+        assert_eq!(fcbk_pack_positions(&[1, 1, 2, 3, 4]), None, "repeated slot");
+        assert_eq!(fcbk_unpk_positions(0, 4), None, "bad M");
+        assert_eq!(
+            fcbk_unpk_positions(MPMLQ_MAX_POSITION[1], MPMLQ_PULSES_ODD_M),
+            None,
+            "index out of range for M=5"
+        );
+        assert_eq!(
+            fcbk_unpk_positions(MPMLQ_MAX_POSITION[0], MPMLQ_PULSES_EVEN),
+            None,
+            "index out of range for M=6"
+        );
     }
 
     /// Taming-procedure gain tables are monotonically non-decreasing.
