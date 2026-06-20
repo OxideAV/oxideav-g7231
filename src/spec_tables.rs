@@ -1682,6 +1682,66 @@ mod tests {
         );
     }
 
+    /// Every in-range combinatorial index decodes to a structurally valid
+    /// pulse set: exactly `M` slots, strictly ascending, all in `0..30`. This
+    /// is the structural contract `Fcbk_Unpk` must honour before §2.17 step 3
+    /// maps the slots onto the even/odd sample grid — exercised across the
+    /// entire `C(30,5)` index space and a stride sample of `C(30,6)`.
+    #[test]
+    fn fcbk_unpk_yields_valid_ascending_slots() {
+        for m in [MPMLQ_PULSES_ODD_M, MPMLQ_PULSES_EVEN] {
+            let max = if m == MPMLQ_PULSES_EVEN {
+                MPMLQ_MAX_POSITION[0]
+            } else {
+                MPMLQ_MAX_POSITION[1]
+            };
+            // Full sweep for M=5; stride-7 sweep for M=6 (still 80k+ probes).
+            let step = if m == MPMLQ_PULSES_EVEN { 7 } else { 1 };
+            let mut idx = 0u32;
+            while idx < max {
+                let pos = fcbk_unpk_positions(idx, m).expect("in-range index decodes");
+                assert_eq!(pos.len(), m, "M mismatch at idx {idx}");
+                for w in pos.windows(2) {
+                    assert!(w[0] < w[1], "not ascending at idx {idx}: {pos:?}");
+                }
+                assert!(
+                    pos[m - 1] < MPMLQ_GRID_SLOTS,
+                    "slot out of grid at idx {idx}"
+                );
+                idx += step;
+            }
+        }
+    }
+
+    /// The combinatorial number system is order-preserving: encoding the
+    /// pulse sets in lexicographic (ascending-position) order yields strictly
+    /// increasing indices `0, 1, 2, …`. Pinning this guarantees a future
+    /// spec-layout encoder can search positions and pack them with a single
+    /// monotone mapping. Verified over the full `C(30,5)` enumeration.
+    #[test]
+    fn fcbk_pack_is_lexicographically_monotone_m5() {
+        let mut expected = 0u32;
+        for a in 0..30 {
+            for b in (a + 1)..30 {
+                for c in (b + 1)..30 {
+                    for d in (c + 1)..30 {
+                        for e in (d + 1)..30 {
+                            let idx = fcbk_pack_positions(&[a, b, c, d, e]).unwrap();
+                            assert_eq!(
+                                idx,
+                                expected,
+                                "lexicographic rank {expected} ≠ packed index {idx} for {:?}",
+                                [a, b, c, d, e]
+                            );
+                            expected += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(expected, MPMLQ_MAX_POSITION[1], "enumeration count off");
+    }
+
     /// Taming-procedure gain tables are monotonically non-decreasing.
     #[test]
     fn taming_gain_tables_are_monotone_non_decreasing() {
