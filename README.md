@@ -128,12 +128,37 @@ selector, §2.17 taming gain, §2.18 postfilter tables, bit-allocation
 offsets). Each constant carries a doc-comment naming its source CSV
 under `docs/audio/g7231/tables/` and the data SHA-256 from its `.meta`
 sidecar. Typed accessor helpers (`LspBand`, `SpecRate`,
-`fixed_codebook_gain`, `mpmlq_combinatorial`, …) sit on top, with
+`fixed_codebook_gain`, `mpmlq_combinatorial`, `fcbk_pack_positions`,
+`fcbk_unpk_positions`, …) sit on top, with
 structural unit tests pinning lengths, symmetry, monotonicity, and the
 published bit-allocation constants. This data sits alongside (does not
 yet replace) the internally-consistent codebooks in
 [`tables`](src/tables.rs); threading it through the gain quantiser to
 produce a bit-exact spec-layout stream is future work.
+
+### MP-MLQ combinatorial position codec (`Fcbk_Pack` / `Fcbk_Unpk`)
+
+§2.15 / §2.17 transmit each subframe's six (even) or five (odd) MP-MLQ
+pulse positions as one `C(30, M)` combinatorial index. `spec_tables`
+implements the spec-faithful codec — `fcbk_pack_positions` /
+`fcbk_unpk_positions` — as the standard combinatorial number system
+whose per-step weights *are* the published `MPMLQ_COMBINATORIAL` table
+(`T[r][c] = C(29 − c, 5 − r)`, with the M = 5 path reading the table
+shifted one row). The mapping is exhaustively verified bijective over
+**both** complete codeword spaces — `C(30, 5) = 142 506` and
+`C(30, 6) = 593 775` — and proven order-preserving (lexicographic
+pulse-set order ↔ index order). This is the position-index half of
+`Fcbk_Pack` / `Fcbk_Unpk`, recovered from the published table without
+recomputing any binomials.
+
+The remaining step — recombining the four subframes' codeword 4-MSBs
+into the 13-bit `MSBPOS` word (§2.15 note, Table 5 octets 13–14, via
+the `L_bseg = {2048, 18432, 231233}` / `base = {0, 32, 96}`
+segmentation constants) — stays a documented clean-room gap: the
+mixed-radix digit ranges `(10, 9, 10, 9)` follow from the combinatorial
+ranges (and explain the "3 bits saved": 10·9·10·9 = 8100 < 2¹³), but
+the exact recombination arithmetic that consumes `L_bseg`/`base` is
+deferred to the clause-5 ANSI C and is not reproduced.
 
 ## Quick use
 

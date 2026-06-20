@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- spec-faithful MP-MLQ combinatorial position codec (§2.15 / §2.17
+  `Fcbk_Pack` / `Fcbk_Unpk` position-index half): `fcbk_pack_positions` /
+  `fcbk_unpk_positions` implement the `C(30, M)` combinatorial number system
+  whose per-step weights are the published `MPMLQ_COMBINATORIAL` table.
+  Exhaustively verified bijective over both complete codeword spaces
+  (`C(30, 5) = 142 506`, `C(30, 6) = 593 775`) and proven order-preserving;
+  the table's exact closed form `C(29 − c, 5 − r)` is now pinned. The 13-bit
+  `MSBPOS` 4-MSB recombination remains a documented clean-room gap.
 - formant postfilter (§3.8 / §2.18) now scales each LPC tap by the spec's
   exact Q15 `PostFiltZeroTable` / `PostFiltPoleTable` weights (the
   fixed-point γ₁ = 0.65 / γ₂ = 0.75 powers from `spec_tables`) instead of
