@@ -56,5 +56,4 @@ cargo +nightly fuzz run decode fuzz/seeds/decode -- -runs=0
 The harness, the targets, and the seed corpus are constructed solely
 from the ITU-T G.723.1 Recommendation frame-shape definitions (§3.7
 rate discriminator, §3.9 postfilter/AGC, §3.10 erasure concealment)
-and this crate's own public API. No external G.723.1 implementation
-or reference software package was consulted.
+and this crate's own public API.
