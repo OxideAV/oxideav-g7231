@@ -90,3 +90,21 @@ name = "bitstream"
 path = "fuzz_targets/bitstream.rs"
 test = false
 doc = false
+
+# Target 4 — `params`. Parameter-validation fuzzer for the codec
+# factories. The other three targets build their codec from a fixed,
+# spec-legal `CodecParameters`, so the validation branches in
+# `encoder::make_encoder` (wrong sample rate / non-mono / non-S16 /
+# out-of-band bit rate) and the bit-rate→mode acceptance-window edges
+# are never reached. This target drives `make_encoder` / `make_decoder`
+# across a wide parameter ladder (band edges 5000/5600/6000/6500 ±1,
+# rejected sample rates / formats / channel counts) and then drives a
+# successfully-built decoder through a sustained SID / untransmitted
+# erasure run interleaved with valid frames and `reset()`, walking the
+# §3.10.2 attenuation-and-mute concealment state machine through its
+# full decay→recovery→re-seed cycle.
+[[bin]]
+name = "params"
+path = "fuzz_targets/params.rs"
+test = false
+doc = false

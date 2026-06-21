@@ -31,17 +31,21 @@ field bodies, and frames truncated at field boundaries.
 
 ## Running
 
-`cargo-fuzz` needs a nightly toolchain. Pass the seed directory as an
-extra corpus so the run starts from the committed seeds:
+`cargo-fuzz` needs a nightly toolchain. libFuzzer writes newly
+discovered inputs into its **first** corpus directory, so name the
+git-ignored `corpus/<target>/` dir first (its growth stays untracked)
+and the committed `seeds/<target>/` dir second as read-only seed
+material — this keeps the seed corpus pristine:
 
 ```sh
-cargo +nightly fuzz run decode    fuzz/seeds/decode
-cargo +nightly fuzz run roundtrip fuzz/seeds/roundtrip
-cargo +nightly fuzz run bitstream fuzz/seeds/bitstream
-cargo +nightly fuzz run params    fuzz/seeds/params
+cargo +nightly fuzz run decode    corpus/decode    fuzz/seeds/decode
+cargo +nightly fuzz run roundtrip corpus/roundtrip fuzz/seeds/roundtrip
+cargo +nightly fuzz run bitstream corpus/bitstream fuzz/seeds/bitstream
+cargo +nightly fuzz run params    corpus/params    fuzz/seeds/params
 ```
 
-Replay just the seeds (no fuzzing) as a fast regression gate:
+Replay just the committed seeds (no fuzzing, no corpus growth) as a
+fast regression gate:
 
 ```sh
 cargo +nightly fuzz run decode fuzz/seeds/decode -- -runs=0

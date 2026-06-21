@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- fuzz harness hardening: untracked `fuzz/Cargo.lock` (cargo-fuzz
+  regenerates it; folded back under the library `Cargo.lock` ignore),
+  added a version-controlled seed corpus under `fuzz/seeds/<target>/`
+  (mixed-rate packet streams, sustained erasure runs, both encoder
+  rates, saturated/alternating field bodies, field-boundary
+  truncations) plus a `fuzz/README.md`, and added a fourth fuzz target
+  `params` covering the `make_encoder` / `make_decoder` parameter-
+  validation surface (rejected sample rates / channels / formats,
+  bit-rate→mode acceptance-window edges) and a focused sustained
+  SID / untransmitted erasure-concealment decay→recovery→reset drive
+  (§3.10.1 / §3.10.2). All four targets fuzz panic-free.
 - spec-faithful MP-MLQ combinatorial position codec (§2.15 / §2.17
   `Fcbk_Pack` / `Fcbk_Unpk` position-index half): `fcbk_pack_positions` /
   `fcbk_unpk_positions` implement the `C(30, M)` combinatorial number system
