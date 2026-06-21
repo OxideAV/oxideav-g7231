@@ -236,7 +236,7 @@ frame encoding, ~5 µs / frame decoding).
 
 ## Fuzzing
 
-Three `cargo-fuzz` targets live under `fuzz/fuzz_targets/`, each an
+Four `cargo-fuzz` targets live under `fuzz/fuzz_targets/`, each an
 ASan-instrumented panic-freedom fuzzer:
 
 - **`decode`** — attacker-supplied byte packets through
@@ -249,9 +249,16 @@ ASan-instrumented panic-freedom fuzzer:
 - **`bitstream`** — structured corruption of near-legal frames (one
   field surgically corrupted or the payload truncated at a field
   boundary) probing the `BitReader` out-of-bits guard.
+- **`params`** — the `make_encoder` / `make_decoder` parameter-
+  validation surface (rejected sample rates / channel counts / sample
+  formats, 5.3 / 6.3 kbit/s band edges) plus a sustained SID /
+  untransmitted erasure-concealment decay→recovery→reset drive.
+
+A version-controlled seed corpus shaped to each target's input layout
+lives under `fuzz/seeds/<target>/`; see `fuzz/README.md`.
 
 ```bash
-cargo fuzz run {decode,roundtrip,bitstream}   # nightly toolchain
+cargo fuzz run {decode,roundtrip,bitstream,params}   # nightly toolchain
 ```
 
 ## License
