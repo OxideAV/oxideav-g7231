@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-g7231/compare/v0.0.8...v0.0.9) - 2026-06-21
+
+### Other
+
+- tighten clean-room note wording in fuzz/README
+- document the params fuzz target + seed corpus
+- add params target — factory parameter validation + erasure decay
+- untrack fuzz/Cargo.lock + add version-controlled seed corpus + README
+- document MP-MLQ combinatorial position codec + MSBPOS gap boundary
+- pin MP-MLQ combinatorial codec structural + monotonicity invariants
+- spec-faithful MP-MLQ combinatorial position codec (Fcbk_Pack/Fcbk_Unpk)
+- formant postfilter uses spec Q15 PostFilt tables (§3.8 / §2.18)
+- §3.6 pitch postfilter forward LTP reach spans the whole frame
+- refresh to current status, drop per-round changelog cruft
+
 ### Other
 
 - fuzz harness hardening: untracked `fuzz/Cargo.lock` (cargo-fuzz
