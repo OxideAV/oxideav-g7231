@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- spec LSP codec (`spec_lsp`): §2.5 / §2.6 predictive split vector
+  quantiser on the published tables. Encode implements steps 2–5 of
+  §2.5 — DC removal (eq. 4.3), the fixed first-order MA predictor
+  `b = 12/32` on the previously *decoded* vector (eq. 3.3), the 3+3+4
+  split (eq. 4.1), and the 256-entry weighted-MSE codebook search per
+  band with the eq. 5 inverse-neighbour-gap diagonal weights. Decode is
+  the §2.6 inverse (`p̃ = p̄ + p_DC + ẽ`). All arithmetic runs in the
+  tables' native Q15 normalised-frequency domain (`ω = π·q/32768`),
+  established numerically: the band codebooks add directly onto the DC
+  scale (a 4× Q13→Q15 rescale would drive line 2 negative on early
+  rows). Conversions to/from the synthesis pipeline's cosine domain +
+  the 24-bit LPC-word split (band 0 in the low byte — documented crate
+  convention) included. 7 unit tests: index round trip, DC ordering,
+  cosine conversion, manual §2.6 reconstruction, near-DC decode of the
+  DC vector, 200-frame quantise→decode consistency with a 1024-unit
+  (250 Hz) worst-line bound, and an aggregate held-vector predictor
+  check.
 - clause-4 bitstream packing layer (`linepack`): spec-layout Table 5 /
   Table 6 octet maps for both rates as `SpecFrameParams` ⇄ 24- / 20-byte
   frames. The octet maps pin the layout to an LSB-first bit stream in
