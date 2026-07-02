@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- spec excitation-parameter codecs (`spec_exc`): the combined 12-bit
+  gain word decoded/encoded per eq. 36 / 39 / 40 — `PGIndex`/`MGIndex`
+  split with `GSize = 24`, the §2.14 codebook-selection rule (170-entry
+  shared codebook; 85-entry + impulse-train MSB only for the high rate
+  when the subframe pair's reference lag is < 58), and clamping of
+  non-conforming rows; the fifth-order adaptive-codebook contribution
+  `u[n]` per eq. 41.1–41.2 including both wrap-around seeds
+  `e′[0] = e[−L−2]`, `e′[1] = e[−L−1]` and the modular periodic
+  extension; MP-MLQ fixed-vector reconstruction (§2.15 / §2.17 —
+  combinatorial position decode, grid, ascending-order sign bits,
+  short-lag Dirac-train mode at the reference period); ACELP
+  fixed-vector reconstruction (§2.16 Table 1 direct position decode
+  with absent-slot handling) and the §2.16 pitch-synchronous 1-tap
+  enhancement `v[n] += β(PGIndex)·v[n−L−ε(PGIndex)]` applied
+  recursively in ascending n (β Q15; zero-β rows and the selector
+  sentinel disable it). Gain-row tap scale pinned to Q13 with the
+  remaining 15 row entries identified (and unit-tested) as the
+  precomputed −2·βᵢ² / −2·βᵢβⱼ closed-loop search energies. 8 unit
+  tests cover every layout branch and the eq. 41 geometry.
 - spec LSP codec (`spec_lsp`): §2.5 / §2.6 predictive split vector
   quantiser on the published tables. Encode implements steps 2–5 of
   §2.5 — DC removal (eq. 4.3), the fixed first-order MA predictor
