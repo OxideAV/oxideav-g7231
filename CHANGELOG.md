@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- clause-4 bitstream packing layer (`linepack`): spec-layout Table 5 /
+  Table 6 octet maps for both rates as `SpecFrameParams` ⇄ 24- / 20-byte
+  frames. The octet maps pin the layout to an LSB-first bit stream in
+  canonical Table 4 parameter order (RATEFLAG/VADFLAG flags, 24-bit LPC,
+  7/2/7/2 ACL, 4×12 GAIN, 4×1 GRID, then the rate-specific POS/PSIG
+  tail with the high-rate UB pad bit), verified octet-by-octet against
+  the published rows with golden tests. The 13-bit `MSBPOS` word is
+  implemented as the mixed-radix (10, 9, 10, 9) combine forced by the
+  `C(30,6)` / `C(30,5)` index ranges (10·9·10·9 = 8100 ≤ 2¹³ — exactly
+  the "3 additional bits are saved" of the Table 2 note), with the
+  subframe-major digit order documented as a derivation choice. Pack
+  validates every field range (combinatorial codes < 593775 / 142506);
+  unpack rejects SID/reserved flag combinations, short frames,
+  out-of-range MSBPOS words and position codes. 12 unit tests: golden
+  octets for the shared prefix (Table 5 octets 1–12), the MSBPOS
+  straddle (octets 13–15), the low-rate tail (Table 6 octets 13–20),
+  a 4000-frame random round-trip at both rates, full-digit-space
+  MSBPOS bijectivity, and the Table 2/3 bit budgets (189 / 158).
 - fuzz harness hardening: untracked `fuzz/Cargo.lock` (cargo-fuzz
   regenerates it; folded back under the library `Cargo.lock` ignore),
   added a version-controlled seed corpus under `fuzz/seeds/<target>/`
