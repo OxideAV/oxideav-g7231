@@ -292,12 +292,39 @@ struct AnalysisState {
     /// `decoder.syn_mem` is the synthesis filter memory used to compute
     /// the zero-input response.
     decoder: SynthesisState,
+    /// §2.3 input high-pass (DC removal) switch. §2.2: "Each block is
+    /// first high pass filtered to remove the DC component" — default
+    /// ON; the ITU encoder test configurations selectively disable it
+    /// (`CODEC63`/`OVERC63`/`INEQC53`/`PATHC53` run HP OFF).
+    highpass: bool,
+    /// One-sample x[n−1] memory of the §2.3 filter.
+    hp_x_prev: f32,
+    /// One-sample y[n−1] memory of the §2.3 filter.
+    hp_y_prev: f32,
 }
 
 impl AnalysisState {
     fn new() -> Self {
         Self {
             decoder: SynthesisState::new(),
+            highpass: true,
+            hp_x_prev: 0.0,
+            hp_y_prev: 0.0,
+        }
+    }
+
+    /// §2.3 high-pass filter over one frame, eq. 1:
+    /// `H(z) = (1 − z⁻¹) / (1 − (127/128)·z⁻¹)`, i.e.
+    /// `y[n] = x[n] − x[n−1] + (127/128)·y[n−1]`, with memories carried
+    /// across frames.
+    fn highpass_frame(&mut self, sig: &mut [f32; FRAME_SIZE_SAMPLES]) {
+        const POLE: f32 = 127.0 / 128.0;
+        for v in sig.iter_mut() {
+            let x = *v;
+            let y = x - self.hp_x_prev + POLE * self.hp_y_prev;
+            self.hp_x_prev = x;
+            self.hp_y_prev = y;
+            *v = y;
         }
     }
 }
@@ -331,6 +358,11 @@ impl AnalysisState {
         let mut sig = [0.0f32; FRAME_SIZE_SAMPLES];
         for (o, &s) in sig.iter_mut().zip(pcm.iter()) {
             *o = s as f32 * (1.0 / 32_768.0);
+        }
+        // §2.2/§2.3: remove the DC component up front (switchable for
+        // the ITU test configurations).
+        if self.highpass {
+            self.highpass_frame(&mut sig);
         }
 
         // ---- LPC → LSP → spec split VQ (§2.4–2.6). ----
@@ -2374,6 +2406,41 @@ pub fn decode_mpmlq_local(payload: &[u8]) -> Result<Vec<i16>> {
     Ok(st.decode_mpmlq(payload)?.to_vec())
 }
 
+/// Stateful frame-level encoder handle exposing the ITU device-under-test
+/// controls (rate + §2.3 high-pass switch) that the registry-level
+/// [`Encoder`] surface does not carry. The ITU conformance methodology
+/// requires running the encoder with the high-pass selectively disabled
+/// (the `..C53`/`..C63H` vector naming: trailing `H` = high-pass ON,
+/// absent = OFF).
+pub struct SpecEncoder {
+    analysis: AnalysisState,
+    rate: PackedRate,
+}
+
+impl SpecEncoder {
+    /// New encoder at the given rate with the §2.3 high-pass ON
+    /// (the Recommendation's default configuration).
+    pub fn new(rate: PackedRate) -> Self {
+        Self {
+            analysis: AnalysisState::new(),
+            rate,
+        }
+    }
+
+    /// Enable / disable the §2.3 input high-pass filter.
+    pub fn set_highpass(&mut self, enabled: bool) {
+        self.analysis.highpass = enabled;
+    }
+
+    /// Encode one 240-sample frame into its clause-4 octet sequence
+    /// (24 bytes at the high rate, 20 at the low rate).
+    pub fn encode_frame(&mut self, pcm: &[i16; FRAME_SIZE_SAMPLES]) -> Vec<u8> {
+        let params = self.analysis.analyse_spec(pcm, self.rate);
+        crate::linepack::pack_frame(&params)
+            .expect("analyse_spec emits in-range clause-4 parameters")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3206,6 +3273,77 @@ mod tests {
         let st3 = SynthesisState::new();
         let (voiced3, _) = st3.classify_erasure_voicing();
         assert!(!voiced3, "silent history must classify unvoiced");
+    }
+
+    /// §2.3 high-pass (eq. 1): a pure-DC frame must decay to (near)
+    /// zero output — the filter has a transmission zero at DC — while a
+    /// mid-band tone passes with roughly unit gain.
+    #[test]
+    fn highpass_removes_dc_and_passes_midband() {
+        let mut st = AnalysisState::new();
+        let mut dc = [0.25f32; FRAME_SIZE_SAMPLES];
+        st.highpass_frame(&mut dc);
+        // After the first-sample transient the DC response decays
+        // geometrically: (127/128)^239 ≈ 0.153, so the frame tail sits
+        // at ≈ 0.25 · 0.153 ≈ 0.038 and keeps shrinking.
+        assert!(dc[0] > 0.2, "first sample carries the step transient");
+        assert!(
+            dc[FRAME_SIZE_SAMPLES - 1].abs() < 0.05,
+            "DC must decay: tail = {}",
+            dc[FRAME_SIZE_SAMPLES - 1]
+        );
+        assert!(
+            dc[FRAME_SIZE_SAMPLES - 1].abs() < dc[60].abs(),
+            "decay must be monotone across the frame"
+        );
+
+        let mut st = AnalysisState::new();
+        let mut tone = [0.0f32; FRAME_SIZE_SAMPLES];
+        let two_pi = 2.0f32 * std::f32::consts::PI;
+        for (n, v) in tone.iter_mut().enumerate() {
+            *v = (two_pi * n as f32 / 8.0).sin() * 0.25; // 1 kHz at 8 kHz
+        }
+        let orig = tone;
+        st.highpass_frame(&mut tone);
+        // Steady-state gain at 1 kHz is close to unity — compare tail
+        // energies loosely.
+        let e_in: f32 = orig[120..].iter().map(|v| v * v).sum();
+        let e_out: f32 = tone[120..].iter().map(|v| v * v).sum();
+        let ratio = e_out / e_in;
+        assert!(
+            (0.7..1.3).contains(&ratio),
+            "mid-band gain should be ≈1, got {ratio}"
+        );
+    }
+
+    /// The public SpecEncoder handle emits clause-4 frames at both
+    /// rates that unpack cleanly, and its §2.3 switch changes the
+    /// emitted bits on a DC-offset input (the filter is really wired).
+    #[test]
+    fn spec_encoder_handle_emits_decodable_frames_and_hp_switch_acts() {
+        let mut pcm = [0i16; FRAME_SIZE_SAMPLES];
+        let two_pi = 2.0f32 * std::f32::consts::PI;
+        for (n, v) in pcm.iter_mut().enumerate() {
+            let t = n as f32;
+            *v = ((two_pi * t / 40.0).sin() * 6000.0 + 3000.0) as i16; // tone + DC
+        }
+        for rate in [PackedRate::High, PackedRate::Low] {
+            let mut enc_on = SpecEncoder::new(rate);
+            let mut enc_off = SpecEncoder::new(rate);
+            enc_off.set_highpass(false);
+            let f_on = enc_on.encode_frame(&pcm);
+            let f_off = enc_off.encode_frame(&pcm);
+            assert_eq!(f_on.len(), rate.frame_bytes());
+            assert_eq!(f_off.len(), rate.frame_bytes());
+            let p_on = crate::linepack::unpack_frame(&f_on).unwrap();
+            let p_off = crate::linepack::unpack_frame(&f_off).unwrap();
+            assert_eq!(p_on.rate, rate);
+            assert_eq!(p_off.rate, rate);
+            assert_ne!(
+                f_on, f_off,
+                "HP switch must change the coded frame on a DC-offset input"
+            );
+        }
     }
 
     /// Rate ↔ γ_ltp mapping must match the published §3.6 constants.
