@@ -759,6 +759,413 @@ struct MpMlqFrameFields {
     mp: [MpMlqPulses; SUBFRAMES_PER_FRAME],
 }
 
+// ---------- spec-layout encoder analysis ----------
+
+impl AnalysisState {
+    /// Analyse one 240-sample frame into a clause-4 spec-layout
+    /// parameter set — the §2 encoder pipeline running on the published
+    /// tables:
+    ///
+    /// - §2.4–2.5: LPC analysis + the predictive split-VQ LSP quantiser
+    ///   ([`crate::spec_lsp`]).
+    /// - §2.14 closed-loop pitch: lag candidates around the per-subframe
+    ///   open-loop estimate (±1 on subframes 0/2; the −1..+2 delta window
+    ///   on 1/3), jointly searched with the 85-/170-row gain-vector
+    ///   codebook by maximising `2·βᵀd − βᵀRβ` over the filtered eq. 41
+    ///   basis vectors.
+    /// - §2.15 / §2.16 fixed-codebook search at the quantised gain
+    ///   levels (see [`mpmlq_spec_search`] / [`acelp_spec_search`]).
+    ///
+    /// After parameter selection the shadow decoder is rolled back and
+    /// committed through the *exact* decode kernel
+    /// ([`SynthesisState::decode_spec_params`]), keeping encoder and
+    /// decoder state in provable lockstep frame after frame.
+    fn analyse_spec(
+        &mut self,
+        pcm: &[i16; FRAME_SIZE_SAMPLES],
+        rate: PackedRate,
+    ) -> SpecFrameParams {
+        let mut sig = [0.0f32; FRAME_SIZE_SAMPLES];
+        for (o, &s) in sig.iter_mut().zip(pcm.iter()) {
+            *o = s as f32 * (1.0 / 32_768.0);
+        }
+
+        // ---- LPC → LSP → spec split VQ (§2.4–2.6). ----
+        let a = lpc_analysis(&sig);
+        let lsp_cur_cos = lpc_to_lsp(&a);
+        let lsp_cur_freq = spec_lsp::lsp_cosines_to_freq(&lsp_cur_cos);
+        let (lsp_index, decoded_freq) =
+            spec_lsp::quantise_lsp_freq(&lsp_cur_freq, &self.decoder.prev_lsp_freq);
+        let cos_raw = spec_lsp::lsp_freq_to_cosines(&decoded_freq);
+        let (mut lsp_q, converged) = enforce_lsp_stability(&cos_raw, LSP_STABILITY_DELTA_MIN_HZ);
+        if !converged {
+            lsp_q = self.decoder.prev_lsp;
+        }
+
+        let exc_snapshot = self.decoder.exc_history;
+        let syn_snapshot = self.decoder.syn_mem;
+        let prev_lsp_snapshot = self.decoder.prev_lsp;
+
+        let mut params = SpecFrameParams::zeroed(rate);
+        params.lsp_index = lsp_index;
+        let mut lags = [0i32; SUBFRAMES_PER_FRAME];
+        for s in 0..SUBFRAMES_PER_FRAME {
+            let lsp_interp = interpolate_lsp(s, &prev_lsp_snapshot, &lsp_q);
+            let a_sub = lsp_to_lpc(&lsp_interp);
+            let start = s * SUBFRAME_SIZE;
+
+            let zir = zero_input_response(&a_sub, &self.decoder.syn_mem, SUBFRAME_SIZE);
+            let mut target = [0.0f32; SUBFRAME_SIZE];
+            for n in 0..SUBFRAME_SIZE {
+                target[n] = sig[start + n] - zir[n];
+            }
+            let h = impulse_response(&a_sub, SUBFRAME_SIZE);
+
+            // ---- Closed-loop pitch + gain-vector search (§2.14). ----
+            let ol = open_loop_acb_lag(&target, &self.decoder.exc_history, &h);
+            let lag_range = PITCH_MIN as i32..=PITCH_MAX as i32;
+            let candidates: Vec<i32> = if s % 2 == 0 {
+                (ol - 1..=ol + 1)
+                    .filter(|l| lag_range.contains(l))
+                    .collect()
+            } else {
+                (-1i32..=2)
+                    .map(|d| lags[s - 1] + d)
+                    .filter(|l| lag_range.contains(l))
+                    .collect()
+            };
+
+            let mut best_score = f32::NEG_INFINITY;
+            let mut best_lag = *candidates.first().unwrap_or(&(PITCH_MIN as i32));
+            let mut best_pg = 0usize;
+            for &cand in &candidates {
+                // §2.14: the 85-row rule keys off L0 / L2 — for the even
+                // subframes that is the candidate itself.
+                let lag_base = if s % 2 == 0 {
+                    cand
+                } else {
+                    lags[s - 1] // lags[0] for s = 1, lags[2] for s = 3
+                };
+                let rows = spec_exc::gain_vq_rows(rate, lag_base);
+                let basis = spec_exc::acb_basis(&self.decoder.exc_history, cand);
+                let mut y = [[0.0f32; SUBFRAME_SIZE]; spec_exc::ACB_TAPS];
+                for (yj, bj) in y.iter_mut().zip(basis.iter()) {
+                    *yj = conv_causal(bj, &h);
+                }
+                let mut d = [0.0f32; spec_exc::ACB_TAPS];
+                let mut rmat = [[0.0f32; spec_exc::ACB_TAPS]; spec_exc::ACB_TAPS];
+                for j in 0..spec_exc::ACB_TAPS {
+                    for n in 0..SUBFRAME_SIZE {
+                        d[j] += target[n] * y[j][n];
+                    }
+                    for k in j..spec_exc::ACB_TAPS {
+                        let mut acc = 0.0f32;
+                        for n in 0..SUBFRAME_SIZE {
+                            acc += y[j][n] * y[k][n];
+                        }
+                        rmat[j][k] = acc;
+                        rmat[k][j] = acc;
+                    }
+                }
+                for pg in 0..rows {
+                    let taps = spec_exc::acb_taps(rate, lag_base, pg);
+                    // Error reduction of this codeword:
+                    // 2·βᵀd − βᵀRβ (row 0 is all-zero taps ⇒ score 0, so
+                    // the best score is never negative).
+                    let mut score = 0.0f32;
+                    for j in 0..spec_exc::ACB_TAPS {
+                        score += 2.0 * taps[j] * d[j];
+                        for k in 0..spec_exc::ACB_TAPS {
+                            score -= taps[j] * taps[k] * rmat[j][k];
+                        }
+                    }
+                    if score > best_score {
+                        best_score = score;
+                        best_lag = cand;
+                        best_pg = pg;
+                    }
+                }
+            }
+            lags[s] = best_lag;
+            params.acl[s] = if s % 2 == 0 {
+                encode_abs_lag(best_lag)
+            } else {
+                encode_delta_lag(best_lag, lags[s - 1])
+            };
+            let lag_base = if s < 2 { lags[0] } else { lags[2] };
+
+            // Residual target for the fixed-codebook stage (eq. 20).
+            let taps = spec_exc::acb_taps(rate, lag_base, best_pg);
+            let u = spec_exc::acb_contribution(&self.decoder.exc_history, best_lag, &taps);
+            let u_filt = conv_causal(&u, &h);
+            let mut target2 = [0.0f32; SUBFRAME_SIZE];
+            for n in 0..SUBFRAME_SIZE {
+                target2[n] = target[n] - u_filt[n];
+            }
+
+            // ---- Fixed codebook (§2.15 / §2.16) + gain word. ----
+            match rate {
+                PackedRate::High => {
+                    let n_pulses = if s % 2 == 0 { 6 } else { 5 };
+                    let (pos, psig, grid, mg, train) =
+                        mpmlq_spec_search(&target2, &h, n_pulses, lag_base);
+                    params.pos[s] = pos;
+                    params.psig[s] = psig;
+                    params.grid[s] = grid;
+                    params.gain[s] = spec_exc::encode_gain_word(rate, lag_base, best_pg, mg, train);
+                }
+                PackedRate::Low => {
+                    let (pos, psig, grid, mg) = acelp_spec_search(&target2, &h, best_lag, best_pg);
+                    params.pos[s] = pos;
+                    params.psig[s] = psig;
+                    params.grid[s] = grid;
+                    params.gain[s] = spec_exc::encode_gain_word(rate, lag_base, best_pg, mg, false);
+                }
+            };
+
+            // ---- Advance the shadow state exactly as the decoder will. ----
+            let ginfo = spec_exc::decode_gain_word(rate, lag_base, params.gain[s]);
+            let u = spec_exc::acb_contribution(&self.decoder.exc_history, best_lag, &ginfo.taps);
+            let v = match rate {
+                PackedRate::High => {
+                    let n_pulses = if s % 2 == 0 { 6 } else { 5 };
+                    spec_exc::mpmlq_fixed_vector(
+                        params.pos[s],
+                        params.psig[s],
+                        params.grid[s],
+                        n_pulses,
+                        ginfo.fcb_gain,
+                        ginfo.train,
+                        lag_base,
+                    )
+                }
+                PackedRate::Low => {
+                    let mut v = spec_exc::acelp_fixed_vector(
+                        params.pos[s],
+                        params.psig[s],
+                        params.grid[s],
+                        ginfo.fcb_gain,
+                    );
+                    spec_exc::acelp_pitch_enhance(&mut v, best_lag, ginfo.pgindex);
+                    v
+                }
+            };
+            let mut exc = [0.0f32; SUBFRAME_SIZE];
+            for n in 0..SUBFRAME_SIZE {
+                exc[n] = u[n] + v[n];
+            }
+            self.decoder.exc_history.rotate_left(SUBFRAME_SIZE);
+            let tail = self.decoder.exc_history.len() - SUBFRAME_SIZE;
+            self.decoder.exc_history[tail..].copy_from_slice(&exc);
+            advance_syn_mem(&a_sub, &exc, &mut self.decoder.syn_mem);
+        }
+
+        // Roll back and commit through the canonical decode kernel so
+        // the shadow decoder state is bit-for-bit what a real decoder
+        // holds after this frame.
+        self.decoder.exc_history = exc_snapshot;
+        self.decoder.syn_mem = syn_snapshot;
+        let _ = self.decoder.decode_spec_params(&params);
+        params
+    }
+}
+
+/// §2.15 MP-MLQ fixed-codebook search at quantised gain levels.
+///
+/// Estimates `G_max` from the eq. 24 cross-correlation and the eq. 25
+/// normalisation, quantises it on the 24-step logarithmic table, then
+/// searches the gain neighbourhood `[Ĝ_max − 3.2 dB, Ĝ_max + 6.4 dB]`
+/// (one step down, two up) × both grids × (single pulses | Dirac trains
+/// when the reference lag is short), placing `M` pulses sequentially —
+/// each pulse takes the position/sign maximising the correlation of the
+/// running residual with the (train-extended) impulse response. The
+/// configuration with the least residual energy wins.
+///
+/// Returns `(pos_code, psig, grid, mgindex, train)` in the
+/// [`SpecFrameParams`] conventions.
+fn mpmlq_spec_search(
+    target: &[f32; SUBFRAME_SIZE],
+    h: &[f32],
+    n_pulses: usize,
+    lag_base: i32,
+) -> (u32, u32, u8, usize, bool) {
+    // eq. 24–25: estimated gain from the target/impulse cross-correlation.
+    let mut h_energy = 0.0f32;
+    for &hv in h.iter() {
+        h_energy += hv * hv;
+    }
+    let mut d_max = 0.0f32;
+    for j in 0..SUBFRAME_SIZE {
+        let mut dj = 0.0f32;
+        for n in j..SUBFRAME_SIZE {
+            dj += target[n] * h[n - j];
+        }
+        d_max = d_max.max(dj.abs());
+    }
+    let gmax = if h_energy > 0.0 {
+        d_max / h_energy
+    } else {
+        0.0
+    };
+    let j0 = spec_exc::nearest_fcb_gain(gmax);
+
+    // Dirac-train variant of the impulse response (§2.15): the response
+    // of a unit train at period `lag_base` through the synthesis filter.
+    let allow_train = lag_base < spec_exc::SHORT_LAG_LIMIT;
+    let mut h_train = h.to_vec();
+    if allow_train {
+        // Recursion h_train[n] = h[n] + h_train[n − p] expands to
+        // Σ_t h[n − t·p] — the filtered response of a unit Dirac train.
+        let p = lag_base.max(1) as usize;
+        for n in p..h_train.len() {
+            h_train[n] = h[n] + h_train[n - p];
+        }
+    }
+
+    let mut best_err = f32::INFINITY;
+    let mut best: (u32, u32, u8, usize, bool) = (0, 0, 0, j0, false);
+    let train_opts: &[bool] = if allow_train {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    for &train in train_opts {
+        let hh: &[f32] = if train { &h_train } else { h };
+        for grid in 0..2u8 {
+            for mg in j0.saturating_sub(1)..=(j0 + 2).min(23) {
+                let g = spec_exc::fcb_gain_value(mg);
+                let mut res = *target;
+                let mut used = [false; 30];
+                let mut chosen: Vec<(usize, bool)> = Vec::with_capacity(n_pulses);
+                for _ in 0..n_pulses {
+                    let mut best_slot = usize::MAX;
+                    let mut best_c = 0.0f32;
+                    for (slot, &u) in used.iter().enumerate() {
+                        if u {
+                            continue;
+                        }
+                        let m = 2 * slot + grid as usize;
+                        let mut c = 0.0f32;
+                        for n in m..SUBFRAME_SIZE {
+                            c += res[n] * hh[n - m];
+                        }
+                        if best_slot == usize::MAX || c.abs() > best_c.abs() {
+                            best_c = c;
+                            best_slot = slot;
+                        }
+                    }
+                    let amp = if best_c < 0.0 { -g } else { g };
+                    let m = 2 * best_slot + grid as usize;
+                    for n in m..SUBFRAME_SIZE {
+                        res[n] -= amp * hh[n - m];
+                    }
+                    used[best_slot] = true;
+                    chosen.push((best_slot, best_c < 0.0));
+                }
+                // §2.15: "the combination of the quantised parameters
+                // that yields the minimum mean square err[n] is
+                // selected" — with the pulse pattern fixed, re-optimise
+                // the gain index exactly over all 24 levels against the
+                // unit-pattern response.
+                let mut y_pat = [0.0f32; SUBFRAME_SIZE];
+                for &(slot, neg) in chosen.iter() {
+                    let m = 2 * slot + grid as usize;
+                    let sgn = if neg { -1.0f32 } else { 1.0 };
+                    for n in m..SUBFRAME_SIZE {
+                        y_pat[n] += sgn * hh[n - m];
+                    }
+                }
+                let (mut c_ty, mut e_yy, mut e_tt) = (0.0f32, 0.0f32, 0.0f32);
+                for n in 0..SUBFRAME_SIZE {
+                    c_ty += target[n] * y_pat[n];
+                    e_yy += y_pat[n] * y_pat[n];
+                    e_tt += target[n] * target[n];
+                }
+                let (best_mg, err) = best_gain_level(c_ty, e_yy, e_tt);
+                if err < best_err {
+                    chosen.sort_unstable_by_key(|&(slot, _)| slot);
+                    let slots: Vec<usize> = chosen.iter().map(|&(slot, _)| slot).collect();
+                    let mut psig = 0u32;
+                    for (k, &(_, neg)) in chosen.iter().enumerate() {
+                        if neg {
+                            psig |= 1 << k;
+                        }
+                    }
+                    if let Some(code) = crate::spec_tables::fcbk_pack_positions(&slots) {
+                        best_err = err;
+                        best = (code, psig, grid, best_mg, train);
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+/// §2.16 ACELP fixed-codebook search at quantised gain levels: run the
+/// Table 1 coordinate-descent pulse search against the §2.16-modified
+/// (pitch-enhanced) impulse response, derive the optimal codeword gain
+/// by least squares, and quantise it per the §2.16 last step
+/// (`|G − G̃_j|` minimisation; a negative optimum flips every pulse sign
+/// since the transmitted gain is unsigned).
+///
+/// Returns `(pos, psig, grid, mgindex)` in the [`SpecFrameParams`]
+/// conventions (track `t` slot in `pos` bits `3t..3t+2`, sign bit `t`).
+fn acelp_spec_search(
+    target: &[f32; SUBFRAME_SIZE],
+    h: &[f32],
+    lag: i32,
+    pgindex: usize,
+) -> (u32, u32, u8, usize) {
+    let h_enh = spec_exc::acelp_enhanced_impulse_response(h, lag, pgindex);
+    let (positions, mut signs, grid) = acelp_4pulse_search(target, &h_enh);
+
+    let mut v_unit = [0.0f32; SUBFRAME_SIZE];
+    place_pulses(&positions, signs, grid, &mut v_unit);
+    let y = conv_causal(&v_unit, &h_enh);
+    let (mut c_ty, mut e_yy, mut e_tt) = (0.0f32, 0.0f32, 0.0f32);
+    for n in 0..SUBFRAME_SIZE {
+        c_ty += target[n] * y[n];
+        e_yy += y[n] * y[n];
+        e_tt += target[n] * target[n];
+    }
+    if c_ty < 0.0 {
+        // The transmitted gain is unsigned; flip every pulse sign.
+        for sgn in signs.iter_mut() {
+            *sgn = -*sgn;
+        }
+        c_ty = -c_ty;
+    }
+    let (mg, _) = best_gain_level(c_ty, e_yy, e_tt);
+
+    let pos = positions[0] | positions[1] << 3 | positions[2] << 6 | positions[3] << 9;
+    let mut psig = 0u32;
+    for (t, &sgn) in signs.iter().enumerate() {
+        if sgn < 0 {
+            psig |= 1 << t;
+        }
+    }
+    (pos, psig, grid, mg)
+}
+
+/// Exact gain-index selection: given the target/pattern correlation
+/// `c_ty`, the pattern energy `e_yy`, and the target energy `e_tt`,
+/// return the 24-level gain index minimising
+/// `‖target − G̃_j·y‖² = e_tt − 2·G̃_j·c_ty + G̃_j²·e_yy` and that
+/// minimum (§2.15 / §2.16 gain quantisation as an MMSE pick over the
+/// published table).
+fn best_gain_level(c_ty: f32, e_yy: f32, e_tt: f32) -> (usize, f32) {
+    let mut best = (0usize, f32::INFINITY);
+    for j in 0..24usize {
+        let g = spec_exc::fcb_gain_value(j);
+        let err = e_tt - 2.0 * g * c_ty + g * g * e_yy;
+        if err < best.1 {
+            best = (j, err);
+        }
+    }
+    best
+}
+
 // ---------- LPC analysis ----------
 
 /// Autocorrelation + Levinson-Durbin on the full 240-sample frame. Output
@@ -4747,6 +5154,109 @@ mod tests {
         let cos = crate::spec_lsp::lsp_freq_to_cosines(&st.prev_lsp_freq);
         for i in 0..LPC_ORDER {
             assert!((cos[i] - st.prev_lsp[i]).abs() < 1.0e-5);
+        }
+    }
+
+    /// End-to-end spec-parameter round trip: analyse a voiced signal
+    /// into `SpecFrameParams`, pack/unpack through the clause-4 octet
+    /// maps, decode with a *fresh* decoder, and measure PSNR against
+    /// the input. Floors are set conservatively below the measured
+    /// debug-build figures.
+    fn spec_roundtrip_psnr(rate: PackedRate) -> f64 {
+        let frames = 20usize;
+        let pcm = voiced_signal(frames);
+        let mut analysis = AnalysisState::new();
+        let mut dec = SynthesisState::new();
+        let mut out = Vec::with_capacity(pcm.len());
+        for f in 0..frames {
+            let mut frame = [0i16; FRAME_SIZE_SAMPLES];
+            frame.copy_from_slice(&pcm[f * FRAME_SIZE_SAMPLES..(f + 1) * FRAME_SIZE_SAMPLES]);
+            let params = analysis.analyse_spec(&frame, rate);
+            let bytes = crate::linepack::pack_frame(&params).unwrap();
+            assert_eq!(
+                bytes.len(),
+                rate.frame_bytes(),
+                "packed frame must be the Table 5/6 size"
+            );
+            let unpacked = crate::linepack::unpack_frame(&bytes).unwrap();
+            assert_eq!(params, unpacked);
+            out.extend_from_slice(&dec.decode_spec_params(&unpacked));
+        }
+        // Skip the first two frames (cold-start transient) for PSNR.
+        let skip = 2 * FRAME_SIZE_SAMPLES;
+        let (mut err, mut sig_e) = (0.0f64, 0.0f64);
+        for (a, b) in pcm[skip..].iter().zip(out[skip..].iter()) {
+            let d = (*a as f64) - (*b as f64);
+            err += d * d;
+            sig_e += (*a as f64) * (*a as f64);
+        }
+        10.0 * (sig_e / err.max(1.0)).log10()
+    }
+
+    #[test]
+    fn spec_roundtrip_acelp_psnr_floor() {
+        let psnr = spec_roundtrip_psnr(PackedRate::Low);
+        println!("spec ACELP round-trip PSNR: {psnr:.2} dB");
+        assert!(
+            psnr > 10.0,
+            "spec-layout ACELP round-trip PSNR {psnr:.2} dB below floor"
+        );
+    }
+
+    #[test]
+    fn spec_roundtrip_mpmlq_psnr_floor() {
+        let psnr = spec_roundtrip_psnr(PackedRate::High);
+        println!("spec MP-MLQ round-trip PSNR: {psnr:.2} dB");
+        assert!(
+            psnr > 12.0,
+            "spec-layout MP-MLQ round-trip PSNR {psnr:.2} dB below floor"
+        );
+    }
+
+    #[test]
+    fn spec_encoder_shadow_decoder_stays_in_lockstep() {
+        // The analysis commits its shadow through decode_spec_params, so
+        // feeding the emitted parameters to an external decoder must
+        // leave both decoders with identical LSP predictor state.
+        let frames = 6usize;
+        let pcm = voiced_signal(frames);
+        let mut analysis = AnalysisState::new();
+        let mut dec = SynthesisState::new();
+        for f in 0..frames {
+            let mut frame = [0i16; FRAME_SIZE_SAMPLES];
+            frame.copy_from_slice(&pcm[f * FRAME_SIZE_SAMPLES..(f + 1) * FRAME_SIZE_SAMPLES]);
+            let params = analysis.analyse_spec(&frame, PackedRate::High);
+            let _ = dec.decode_spec_params(&params);
+            for i in 0..LPC_ORDER {
+                assert!(
+                    (analysis.decoder.prev_lsp_freq[i] - dec.prev_lsp_freq[i]).abs() < 1.0e-3,
+                    "frame {f} line {i}: shadow {} vs decoder {}",
+                    analysis.decoder.prev_lsp_freq[i],
+                    dec.prev_lsp_freq[i]
+                );
+            }
+            assert_eq!(
+                analysis.decoder.exc_history, dec.exc_history,
+                "frame {f}: excitation history diverged"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_analysis_emits_decodable_lags() {
+        let pcm = voiced_signal(3);
+        let mut analysis = AnalysisState::new();
+        for f in 0..3 {
+            let mut frame = [0i16; FRAME_SIZE_SAMPLES];
+            frame.copy_from_slice(&pcm[f * FRAME_SIZE_SAMPLES..(f + 1) * FRAME_SIZE_SAMPLES]);
+            let params = analysis.analyse_spec(&frame, PackedRate::Low);
+            let lag0 = decode_abs_lag(params.acl[0]);
+            let lag1 = decode_delta_lag(params.acl[1], lag0);
+            let lag2 = decode_abs_lag(params.acl[2]);
+            let lag3 = decode_delta_lag(params.acl[3], lag2);
+            for lag in [lag0, lag1, lag2, lag3] {
+                assert!((PITCH_MIN as i32..=PITCH_MAX as i32).contains(&lag));
+            }
         }
     }
 

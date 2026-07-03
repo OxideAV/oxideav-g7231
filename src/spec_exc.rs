@@ -162,19 +162,17 @@ pub(crate) fn encode_gain_word(
     }
 }
 
-/// Fifth-order adaptive-codebook (pitch predictor) contribution `u[n]`
-/// per eq. 41.1–41.2. `history` is the excitation buffer whose final
-/// element is the most recent past sample `e[-1]`.
-pub(crate) fn acb_contribution(
-    history: &[f32],
-    lag: i32,
-    taps: &[f32; ACB_TAPS],
-) -> [f32; SUBFRAME_SIZE] {
+/// The five per-tap basis vectors of the eq. 41 pitch predictor:
+/// `basis[j][n] = e′[n + j]` with `e′` per eq. 41.1 (`e′[0] = e[−L−2]`,
+/// `e′[1] = e[−L−1]`, `e′[n] = e[(n mod L) − L]` for `2 ≤ n ≤ 63`).
+/// `history` is the excitation buffer whose final element is the most
+/// recent past sample `e[-1]`. The contribution `u[n]` is the tap-
+/// weighted sum of these vectors; the encoder's closed-loop gain-VQ
+/// search correlates each basis vector separately.
+pub(crate) fn acb_basis(history: &[f32], lag: i32) -> [[f32; SUBFRAME_SIZE]; ACB_TAPS] {
     let l = lag.clamp(PITCH_MIN as i32, PITCH_MAX as i32) as usize;
     let hlen = history.len();
     debug_assert!(hlen >= l + 2);
-    // eq. 41.1: e'[0] = e[−L−2], e'[1] = e[−L−1],
-    // e'[n] = e[(n mod L) − L] for 2 ≤ n ≤ 63.
     let eprime = |n: usize| -> f32 {
         let off = match n {
             0 => l + 2,
@@ -183,15 +181,61 @@ pub(crate) fn acb_contribution(
         };
         history[hlen - off]
     };
-    let mut u = [0.0f32; SUBFRAME_SIZE];
-    for (n, out) in u.iter_mut().enumerate() {
-        let mut acc = 0.0f32;
-        for (j, &b) in taps.iter().enumerate() {
-            acc += b * eprime(n + j);
+    let mut basis = [[0.0f32; SUBFRAME_SIZE]; ACB_TAPS];
+    for (j, b) in basis.iter_mut().enumerate() {
+        for (n, out) in b.iter_mut().enumerate() {
+            *out = eprime(n + j);
         }
-        *out = acc;
+    }
+    basis
+}
+
+/// Fifth-order adaptive-codebook (pitch predictor) contribution `u[n]`
+/// per eq. 41.1–41.2. `history` is the excitation buffer whose final
+/// element is the most recent past sample `e[-1]`.
+pub(crate) fn acb_contribution(
+    history: &[f32],
+    lag: i32,
+    taps: &[f32; ACB_TAPS],
+) -> [f32; SUBFRAME_SIZE] {
+    let basis = acb_basis(history, lag);
+    let mut u = [0.0f32; SUBFRAME_SIZE];
+    for (j, &b) in taps.iter().enumerate() {
+        for (n, out) in u.iter_mut().enumerate() {
+            *out += b * basis[j][n];
+        }
     }
     u
+}
+
+/// Impulse response of the §2.16 pitch-synchronous enhancement filter
+/// applied to `h`: the recursive 1-tap LTP `h′[n] = h[n] + β·h′[n − D]`
+/// with `D = L + ε(PGIndex)` — the response a unit algebraic pulse sees
+/// after [`acelp_pitch_enhance`] and the synthesis filter (§2.16: "the
+/// impulse response should be modified" prior to the codebook search).
+/// Returns `h` unchanged when the enhancement is inactive (long lag,
+/// zero-β row, non-positive delay).
+pub(crate) fn acelp_enhanced_impulse_response(h: &[f32], lag: i32, pgindex: usize) -> Vec<f32> {
+    let mut out = h.to_vec();
+    if lag >= SUBFRAME_SIZE as i32 {
+        return out;
+    }
+    let Some(ltp) = pitch_1tap_ltp(pgindex) else {
+        return out;
+    };
+    if ltp.gain == 0 {
+        return out;
+    }
+    let beta = ltp.gain as f32 / 32_768.0;
+    let delay = lag + ltp.selector as i32;
+    if delay <= 0 {
+        return out;
+    }
+    for n in delay as usize..out.len() {
+        let prev = out[n - delay as usize];
+        out[n] += beta * prev;
+    }
+    out
 }
 
 /// Reconstruct a high-rate (MP-MLQ) fixed-codebook vector `v[n]`

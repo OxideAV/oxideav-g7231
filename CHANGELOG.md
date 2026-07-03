@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- spec-layout encoder analysis: `AnalysisState::analyse_spec` produces
+  a clause-4 `SpecFrameParams` set through the §2 pipeline on the
+  published tables. LSP: §2.5 predictive split VQ. Pitch (§2.14):
+  closed-loop lag candidates around the per-subframe open-loop estimate
+  (±1 on subframes 0/2, the −1..+2 delta window on 1/3) searched
+  *jointly* with the 85-/170-row gain-vector codebook by maximising the
+  error reduction `2·βᵀd − βᵀRβ` over the filtered eq. 41 basis
+  vectors (the all-zero row 0 guarantees a non-negative optimum).
+  MP-MLQ (§2.15): eq. 24/25 `G_max` estimate, the
+  `[Ĝ−3.2 dB, Ĝ+6.4 dB]` quantised-gain neighbourhood × both grids ×
+  Dirac-train mode on short reference lags, sequential per-pulse
+  placement against the (train-extended) impulse response, and an exact
+  24-level MMSE gain re-pick per pattern. ACELP (§2.16): the Table 1
+  coordinate-descent search against the pitch-enhanced impulse
+  response (`h′[n] = h[n] + β·h′[n−L−ε]`, the §2.16 pre-search
+  modification), least-squares gain with sign folding into the pulse
+  signs, exact 24-level MMSE quantisation. The shadow decoder commits
+  through `decode_spec_params` itself, keeping encoder and decoder in
+  bit-exact lockstep (pinned by a new test on `prev_lsp_freq` +
+  `exc_history`). New `spec_exc::acb_basis` /
+  `acelp_enhanced_impulse_response` helpers. Spec-format round-trip
+  PSNR on the 20-frame voiced signal (release): ACELP 13.8 dB,
+  MP-MLQ 15.7 dB — coarser than the legacy clean-room format's
+  17/21 dB because the published 24-step (3.2 dB) innovation-gain
+  table trades gain resolution for the richer 5-tap pitch VQ. 4 new
+  tests: PSNR floors at both rates through pack→unpack→decode,
+  encoder/decoder lockstep, decodable-lag emission.
 - spec-layout decoder kernel: `SynthesisState::decode_spec_params`
   runs the full §3.1 pipeline on a clause-4 `SpecFrameParams` set —
   spec LSP decode (§3.2 → 2.6) with §2.6-step-3 previous-vector
