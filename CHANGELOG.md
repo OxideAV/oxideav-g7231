@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- decoder robustness battery at the public API (integration tests):
+  1500 randomly-drawn *valid* clause-4 frames (both rates, extreme
+  combinatorial codes / gain words / degenerate LSP words) decode
+  through the registered decoder without error; §1.2 mid-stream rate
+  switching (interleaved real 24-/20-byte frames through one stateful
+  decoder) decodes cleanly; and 2000 free-form random bodies with legal
+  discriminators either decode or are rejected (`Err`) — both outcomes
+  asserted to occur, proving the MSBPOS/combinatorial validation path
+  and the decode path are both live. Complements the nightly-only ASan
+  fuzz targets on stable `cargo test`.
 - documentation sweep for the spec-layout flip: crate/encoder module
   docstrings now describe the clause-4 pipeline (and cite the in-repo
   03/96 edition), the README rewrites the implementation + interop

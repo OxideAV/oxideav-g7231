@@ -444,3 +444,122 @@ fn roundtrip_writes_sample_raw() {
         decoded.len()
     );
 }
+
+/// Decoder robustness battery over the clause-4 frame space: thousands
+/// of randomly-drawn *valid* spec-layout frames (every field inside its
+/// transmitted range, including extreme combinatorial codes, short-lag
+/// train bits, and degenerate LSP words) must decode through the
+/// registered decoder without a panic or an error, each producing a
+/// full 240-sample frame. This backfills, on stable in plain `cargo
+/// test`, the panic-freedom property the ASan fuzz targets check under
+/// nightly.
+#[test]
+fn spec_decoder_survives_random_valid_frames() {
+    use oxideav_g7231::linepack::{pack_frame, PackedRate, SpecFrameParams};
+
+    // Deterministic LCG.
+    let mut state = 0x0123_4567_89ab_cdefu64;
+    let mut next = move || -> u32 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as u32
+    };
+    const MPMLQ_MAX_POSITION: [u32; 4] = [593_775, 142_506, 593_775, 142_506];
+
+    let mut dec = make_decoder();
+    for i in 0..1500 {
+        let rate = if i % 2 == 0 {
+            PackedRate::High
+        } else {
+            PackedRate::Low
+        };
+        let mut p = SpecFrameParams::zeroed(rate);
+        p.lsp_index = next() & 0xFF_FF_FF;
+        for s in 0..4 {
+            p.acl[s] = next() % if s % 2 == 0 { 128 } else { 4 };
+            p.gain[s] = next() % 4096;
+            p.grid[s] = (next() % 2) as u8;
+            match rate {
+                PackedRate::High => {
+                    p.pos[s] = next() % MPMLQ_MAX_POSITION[s];
+                    p.psig[s] = next() % (1 << if s % 2 == 0 { 6 } else { 5 });
+                }
+                PackedRate::Low => {
+                    p.pos[s] = next() % (1 << 12);
+                    p.psig[s] = next() % (1 << 4);
+                }
+            }
+        }
+        let bytes = pack_frame(&p).expect("in-range params pack");
+        dec.send_packet(&packet(bytes))
+            .expect("valid frame decodes");
+        let Frame::Audio(af) = dec.receive_frame().expect("frame out") else {
+            panic!("expected audio frame");
+        };
+        assert_eq!(af.samples, FRAME_SAMPLES as u32);
+    }
+}
+
+/// The Recommendation allows switching rates at any 30 ms boundary
+/// (§1.2). Interleave real encoded high- and low-rate frames from two
+/// encoders through ONE stateful decoder and require clean decode with
+/// the right per-frame sizes.
+#[test]
+fn spec_decoder_switches_rates_mid_stream() {
+    let input = voiced(8);
+    let mut enc_hi = make_encoder(Some(6300));
+    let mut enc_lo = make_encoder(Some(5300));
+    enc_hi.send_frame(&audio_frame(&input)).unwrap();
+    enc_hi.flush().unwrap();
+    enc_lo.send_frame(&audio_frame(&input)).unwrap();
+    enc_lo.flush().unwrap();
+    let hi = collect_packets(&mut *enc_hi);
+    let lo = collect_packets(&mut *enc_lo);
+
+    let mut dec = make_decoder();
+    for i in 0..8 {
+        let pkt = if i % 2 == 0 { &hi[i] } else { &lo[i] };
+        assert_eq!(pkt.data.len(), if i % 2 == 0 { 24 } else { 20 });
+        dec.send_packet(pkt).unwrap();
+        let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+            panic!("expected audio frame");
+        };
+        assert_eq!(af.samples, FRAME_SAMPLES as u32);
+    }
+}
+
+/// Free-form bytes with a legal discriminator + length must never
+/// panic: they either decode (in-range fields) or are rejected with an
+/// `Err` (e.g. out-of-range MSBPOS words / combinatorial codes).
+#[test]
+fn spec_decoder_rejects_or_decodes_random_bytes_without_panic() {
+    let mut state = 0xdead_beef_1234_5678u64;
+    let mut next_byte = move || -> u8 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as u8
+    };
+    let mut dec = make_decoder();
+    let mut decoded = 0usize;
+    let mut rejected = 0usize;
+    for i in 0..2000 {
+        let (first_bits, len) = if i % 2 == 0 { (0b00, 24) } else { (0b01, 20) };
+        let mut data: Vec<u8> = (0..len).map(|_| next_byte()).collect();
+        data[0] = (data[0] & !0b11) | first_bits;
+        match dec.send_packet(&packet(data)) {
+            Ok(()) => {
+                decoded += 1;
+                let _ = dec.receive_frame().unwrap();
+            }
+            Err(_) => rejected += 1,
+        }
+    }
+    // Random high-rate bodies frequently trip the MSBPOS /
+    // combinatorial range checks; low-rate bodies always decode. Both
+    // outcomes must occur — that proves the validation path and the
+    // decode path are both being exercised.
+    assert!(decoded > 0, "no random frame decoded");
+    assert!(rejected > 0, "no random frame was rejected");
+}
