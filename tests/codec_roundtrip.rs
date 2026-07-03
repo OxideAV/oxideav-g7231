@@ -476,13 +476,13 @@ fn spec_decoder_survives_random_valid_frames() {
         };
         let mut p = SpecFrameParams::zeroed(rate);
         p.lsp_index = next() & 0xFF_FF_FF;
-        for s in 0..4 {
+        for (s, &pos_max) in MPMLQ_MAX_POSITION.iter().enumerate() {
             p.acl[s] = next() % if s % 2 == 0 { 128 } else { 4 };
             p.gain[s] = next() % 4096;
             p.grid[s] = (next() % 2) as u8;
             match rate {
                 PackedRate::High => {
-                    p.pos[s] = next() % MPMLQ_MAX_POSITION[s];
+                    p.pos[s] = next() % pos_max;
                     p.psig[s] = next() % (1 << if s % 2 == 0 { 6 } else { 5 });
                 }
                 PackedRate::Low => {
