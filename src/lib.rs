@@ -60,9 +60,7 @@
 //!
 //! Reference: ITU-T G.723.1 Recommendation (May 2006) and Annex B.
 
-// Scaffold-only — symbols will be used once the full decoder body lands.
 #![allow(
-    dead_code,
     clippy::needless_range_loop,
     clippy::unnecessary_cast,
     clippy::doc_lazy_continuation,
@@ -79,8 +77,7 @@ pub mod spec_tables;
 pub mod tables;
 
 use oxideav_core::{
-    AudioFrame, CodecCapabilities, CodecId, CodecParameters, CodecTag, Error, Frame, Packet,
-    Rational, Result, TimeBase,
+    AudioFrame, CodecCapabilities, CodecId, CodecParameters, CodecTag, Error, Frame, Packet, Result,
 };
 use oxideav_core::{CodecInfo, CodecRegistry, Decoder};
 
@@ -143,7 +140,6 @@ struct G7231Decoder {
     pending: std::collections::VecDeque<Frame>,
     drained: bool,
     next_pts: i64,
-    time_base: TimeBase,
 }
 
 impl G7231Decoder {
@@ -154,7 +150,6 @@ impl G7231Decoder {
             pending: std::collections::VecDeque::new(),
             drained: false,
             next_pts: 0,
-            time_base: TimeBase(Rational::new(1, SAMPLE_RATE_HZ as i64)),
         }
     }
 
@@ -254,6 +249,7 @@ impl Decoder for G7231Decoder {
 mod tests {
     use super::*;
     use oxideav_core::packet::PacketFlags;
+    use oxideav_core::{Rational, TimeBase};
 
     fn packet(data: Vec<u8>) -> Packet {
         Packet {

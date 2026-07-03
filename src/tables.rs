@@ -185,41 +185,6 @@ pub const ERASURE_ATTENUATION_DB_PER_FRAME: f32 = 2.5;
 /// interpolated frames"). Erasure runs longer than this emit silence.
 pub const ERASURE_MUTE_AFTER_FRAMES: u32 = 3;
 
-/// Bit-layout (high-rate, MP-MLQ) — field widths in bits, in packing order.
-///
-/// Derived from ITU-T G.723.1 Annex B Table B.1. The implementation below
-/// only uses these for consistency checks; per-field semantics live in the
-/// synthesis module once implemented.
-pub const HIGH_RATE_FIELD_WIDTHS: &[u32] = &[
-    2, // LPC0 (upper sub-codebook index)
-    8, // LPC1
-    8, // LPC2
-    8, // ACL0 (adaptive-codebook lag subframe 0)
-    5, // ACL1
-    5, // ACL2
-    5, // ACL3
-    2, // GAIN0 (combined gain index subframe 0, high rate)
-    12, 12, 12, 12, // combined GAINs
-    1, 1, 1, 1, // grid bits
-    1, // reserved
-    13, 16, 14, 14, // MP-MLQ pulse positions / signs subframes 0..3
-    6, 5, 5, 5, // pulse-position LSBs
-];
-
-/// Bit-layout (low-rate, ACELP) — field widths in bits, in packing order.
-pub const LOW_RATE_FIELD_WIDTHS: &[u32] = &[
-    2, // LPC0
-    8, // LPC1
-    8, // LPC2
-    7, // ACL0
-    2, // ACL1
-    7, // ACL2
-    2, // ACL3
-    12, 12, 12, 12, // combined GAINs
-    1, 1, 1, 1, // grid bits
-    12, 12, 12, 12, // ACELP fixed-codebook pulses (subframes 0..3)
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;

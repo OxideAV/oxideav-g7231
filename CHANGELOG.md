@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- removed the retired interim wire format (−1100 LOC): the clean-room
+  factorial-scalar LSP split VQ, the 4+7+1-bit joint gain codec, the
+  per-pulse MP-MLQ position/sign words, the internal field tables and
+  LSB bit writer, the legacy `analyse_acelp` / `analyse_mpmlq` /
+  `synthesise` paths and their tests. The crate-level `dead_code` allow
+  is gone; the `tables.rs` pseudo-"Annex B" field-width arrays (which
+  never matched the real Tables 5/6) are deleted in favour of
+  `linepack`. Retained shared DSP (LPC/LSP conversion, stability,
+  Table 1 ACELP search, postfilters, concealment) is unchanged.
 - **the wire format is now the ITU-T clause-4 spec layout** at both
   rates: `emit_frame` routes through `analyse_spec` + the Table 5/6
   packer, and `decode_acelp` / `decode_mpmlq` unpack clause-4 frames
