@@ -1,5 +1,7 @@
 # oxideav-g7231
 
+[![CI](https://github.com/OxideAV/oxideav-g7231/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-g7231/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-g7231.svg)](https://crates.io/crates/oxideav-g7231) [![docs.rs](https://docs.rs/oxideav-g7231/badge.svg)](https://docs.rs/oxideav-g7231) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **ITU-T G.723.1** dual-rate narrowband speech codec — encoder
 and full-synthesis decoder for both 6.3 kbit/s (MP-MLQ) and 5.3 kbit/s
 (ACELP). No C libraries, no FFI, no `*-sys` crates.
