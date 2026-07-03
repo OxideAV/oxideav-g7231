@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- spec-layout decoder kernel: `SynthesisState::decode_spec_params`
+  runs the full §3.1 pipeline on a clause-4 `SpecFrameParams` set —
+  spec LSP decode (§3.2 → 2.6) with §2.6-step-3 previous-vector
+  fallback, eq. 37/38 lag decode, the eq. 39/40 gain-word split per
+  subframe pair (`lag_base` = L0/L2 driving the 85-row rule), the
+  eq. 41 fifth-order adaptive-codebook contribution, rate-specific
+  fixed-codebook reconstruction (MP-MLQ combinatorial + Dirac-train /
+  ACELP Table 1 + 1-tap enhancement), per-subframe interpolated LPC
+  synthesis, and the existing §3.6/§3.8/§3.9 postfilter chain. New
+  `prev_lsp_freq` decoder state carries the §2.6 MA-predictor vector in
+  the tables' Q15 normalised-frequency domain, cold-started at `p_DC`
+  (§3.11) and kept in lockstep through the §3.10.1 erasure
+  extrapolation. Concealment bookkeeping gains a spec-path variant
+  (`record_last_frame_spec`) feeding the §3.10.2 classifier from
+  decoded taps/gains. 5 new tests: determinism + audible energy at both
+  rates, near-silent zero frames, linepack pack→unpack→decode
+  composition, LSP predictor-state advancement, and short-lag
+  train-mode energy extension.
 - spec excitation-parameter codecs (`spec_exc`): the combined 12-bit
   gain word decoded/encoded per eq. 36 / 39 / 40 — `PGIndex`/`MGIndex`
   split with `GSize = 24`, the §2.14 codebook-selection rule (170-entry

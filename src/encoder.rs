@@ -61,6 +61,9 @@ use oxideav_core::{
 };
 
 use crate::bitreader::BitReader;
+use crate::linepack::{PackedRate, SpecFrameParams};
+use crate::spec_exc;
+use crate::spec_lsp;
 use crate::tables::{
     ERASURE_ATTENUATION_DB_PER_FRAME, ERASURE_CLASSIFIER_HISTORY_LEN,
     ERASURE_CLASSIFIER_LAG_RADIUS, ERASURE_MUTE_AFTER_FRAMES, ERASURE_VOICED_THRESHOLD_DB,
@@ -2059,6 +2062,11 @@ fn pack_mpmlq_frame(f: &MpMlqFrameFields) -> Vec<u8> {
 /// signal path (what the encoder's analysis-by-synthesis loop needs to see).
 pub struct SynthesisState {
     prev_lsp: [f32; LPC_ORDER],
+    /// Previous decoded LSP vector in the spec tables' Q15
+    /// normalised-frequency domain (`ω = π·q/32768`) — the §2.6 / eq. 3.3
+    /// MA-predictor state for the spec-layout LSP codec. Kept in lockstep
+    /// with the cosine-domain `prev_lsp` (§3.11 cold start = `p_DC`).
+    prev_lsp_freq: [f32; LPC_ORDER],
     exc_history: [f32; PITCH_MAX + SUBFRAME_SIZE],
     syn_mem: [f32; LPC_ORDER],
     // Post-filter state ---------------------------------------------------
@@ -2127,6 +2135,7 @@ impl SynthesisState {
         let prev_lsp = crate::tables::lsp_dc_cosines();
         Self {
             prev_lsp,
+            prev_lsp_freq: crate::spec_lsp::lsp_dc_freq(),
             exc_history: [0.0; PITCH_MAX + SUBFRAME_SIZE],
             syn_mem: [0.0; LPC_ORDER],
             pf_syn_hist: [0.0; PITCH_MAX + SUBFRAME_SIZE],
@@ -2824,8 +2833,11 @@ impl SynthesisState {
         // after frame (§3.10.1: p̃_{n-1} is the previous *decoded* LSP, so
         // each concealed frame feeds the next), and so a good frame that
         // ends the run interpolates from the concealed envelope rather than
-        // the stale pre-erasure one.
+        // the stale pre-erasure one. The spec-layout LSP predictor state
+        // follows the same concealed vector (§3.10.1 feeds p̃_n back as
+        // p̃_{n-1} for both the erasure and the recovery frame).
         self.prev_lsp = lsp_q;
+        self.prev_lsp_freq = crate::spec_lsp::lsp_cosines_to_freq(&lsp_q);
 
         // Update classifier history with the concealed PCM so a
         // subsequent erasure in the same run sees a fresh tail.
@@ -3044,6 +3056,129 @@ impl SynthesisState {
         self.record_last_frame(&lags, &gain);
         self.record_pcm_history(&pcm_f);
         Ok(to_i16_frame(&pcm_f))
+    }
+
+    /// Decode one clause-4 spec-layout parameter set (either rate) into
+    /// 240 PCM samples, advancing every piece of decoder state.
+    ///
+    /// This is the §3.1 pipeline running on the published tables:
+    /// LSP decode (§3.2 → 2.6) through [`crate::spec_lsp`], pitch decode
+    /// (§3.4 → 2.18, eq. 37–41.2) and excitation decode (§3.5 → 2.17)
+    /// through [`crate::spec_exc`], then the existing pitch postfilter
+    /// (§3.6), LPC synthesis (§3.7), formant postfilter (§3.8) and gain
+    /// scaling (§3.9) chain.
+    pub(crate) fn decode_spec_params(&mut self, p: &SpecFrameParams) -> [i16; FRAME_SIZE_SAMPLES] {
+        // --- LSP decode (§3.2 → 2.6, eq. 3.3 / 4.4) ---
+        let lsp_freq = spec_lsp::decode_lsp_freq(p.lsp_index, &self.prev_lsp_freq);
+        let cos_raw = spec_lsp::lsp_freq_to_cosines(&lsp_freq);
+        let (mut lsp_q, converged) = enforce_lsp_stability(&cos_raw, LSP_STABILITY_DELTA_MIN_HZ);
+        if !converged {
+            // §2.6 step 3: "If after 10 iterations the condition of
+            // stability is not met, the previous LSP vector is used."
+            lsp_q = self.prev_lsp;
+        }
+
+        // --- Pitch lags (§3.4, eq. 37–38) ---
+        let lag0 = decode_abs_lag(p.acl[0]);
+        let lag1 = decode_delta_lag(p.acl[1], lag0);
+        let lag2 = decode_abs_lag(p.acl[2]);
+        let lag3 = decode_delta_lag(p.acl[3], lag2);
+        let lags = [lag0, lag1, lag2, lag3];
+
+        let prev_lsp_snapshot = self.prev_lsp;
+        let mut pcm_f = [0.0f32; FRAME_SIZE_SAMPLES];
+        let mut fcb_gains = [0.0f32; SUBFRAMES_PER_FRAME];
+        let mut last_taps_sum = 0.0f32;
+        for s in 0..SUBFRAMES_PER_FRAME {
+            let lsp_interp = interpolate_lsp(s, &self.prev_lsp, &lsp_q);
+            let a_sub = lsp_to_lpc(&lsp_interp);
+
+            // §2.14: the 85-entry short-lag gain codebook rule keys off
+            // the subframe pair's reference lag L0 / L2.
+            let lag_base = if s < 2 { lags[0] } else { lags[2] };
+            let gain = spec_exc::decode_gain_word(p.rate, lag_base, p.gain[s]);
+            fcb_gains[s] = gain.fcb_gain;
+            last_taps_sum = gain.taps.iter().sum();
+
+            // §3.4 → 2.18: fifth-order adaptive-codebook contribution.
+            let u = spec_exc::acb_contribution(&self.exc_history, lags[s], &gain.taps);
+
+            // §3.5 → 2.17: rate-specific fixed-codebook contribution.
+            let v = match p.rate {
+                PackedRate::High => {
+                    let n_pulses = if s % 2 == 0 { 6 } else { 5 };
+                    spec_exc::mpmlq_fixed_vector(
+                        p.pos[s],
+                        p.psig[s],
+                        p.grid[s],
+                        n_pulses,
+                        gain.fcb_gain,
+                        gain.train,
+                        lag_base,
+                    )
+                }
+                PackedRate::Low => {
+                    let mut v =
+                        spec_exc::acelp_fixed_vector(p.pos[s], p.psig[s], p.grid[s], gain.fcb_gain);
+                    spec_exc::acelp_pitch_enhance(&mut v, lags[s], gain.pgindex);
+                    v
+                }
+            };
+
+            // §2.17 step 7: e[n] = u[n] + v[n]; then §3.7 LPC synthesis.
+            let mut exc = [0.0f32; SUBFRAME_SIZE];
+            for n in 0..SUBFRAME_SIZE {
+                exc[n] = u[n] + v[n];
+            }
+            for i in 0..SUBFRAME_SIZE {
+                let mut y = exc[i];
+                for k in 0..LPC_ORDER {
+                    y -= a_sub[k + 1] * self.syn_mem[k];
+                }
+                for k in (1..LPC_ORDER).rev() {
+                    self.syn_mem[k] = self.syn_mem[k - 1];
+                }
+                self.syn_mem[0] = y;
+                pcm_f[s * SUBFRAME_SIZE + i] = y;
+            }
+            self.exc_history.rotate_left(SUBFRAME_SIZE);
+            let tail = self.exc_history.len() - SUBFRAME_SIZE;
+            self.exc_history[tail..].copy_from_slice(&exc);
+        }
+
+        // Persist the decoded LSP for the next frame's interpolation and
+        // MA predictor (§2.6 / eq. 3.3).
+        self.prev_lsp = lsp_q;
+        self.prev_lsp_freq = spec_lsp::lsp_cosines_to_freq(&lsp_q);
+
+        // Post-filter chain + concealment bookkeeping.
+        let rate = match p.rate {
+            PackedRate::High => Rate::High,
+            PackedRate::Low => Rate::Low,
+        };
+        self.apply_post_filter(&prev_lsp_snapshot, &lsp_q, &lags, rate, &mut pcm_f);
+        self.record_last_frame_spec(&lags, last_taps_sum, &fcb_gains);
+        self.record_pcm_history(&pcm_f);
+        to_i16_frame(&pcm_f)
+    }
+
+    /// Spec-path variant of [`SynthesisState::record_last_frame`]: saves
+    /// the §3.10.2 classifier inputs from decoded spec parameters. The
+    /// scalar "adaptive gain" driving the voiced concealment branch is
+    /// the DC gain of the last subframe's fifth-order predictor (the tap
+    /// sum), clamped to a stable replay range.
+    fn record_last_frame_spec(
+        &mut self,
+        lags: &[i32; SUBFRAMES_PER_FRAME],
+        last_taps_sum: f32,
+        fcb_gains: &[f32; SUBFRAMES_PER_FRAME],
+    ) {
+        self.pf_last_lag = lags[SUBFRAMES_PER_FRAME - 1];
+        self.pf_last_gain_adapt = last_taps_sum.clamp(0.0, 1.0);
+        self.pf_last_gain_fixed = fcb_gains[SUBFRAMES_PER_FRAME - 1];
+        self.pf_last_lag2 = lags[2];
+        self.pf_last_gain_unvoiced = 0.5 * (fcb_gains[2] + fcb_gains[3]);
+        self.pf_erased_run = 0;
     }
 }
 
@@ -4505,5 +4640,140 @@ mod tests {
             let want = (0.75f64.powi(k as i32 + 1) * 32768.0).round() as i16;
             assert_eq!(w, want, "pole[{k}] must be round(0.75^(k+1)*2^15)");
         }
+    }
+
+    // ---------- spec-layout decode kernel ----------
+
+    use crate::linepack::{pack_frame, unpack_frame, PackedRate, SpecFrameParams};
+
+    /// A voiced-ish hand-built spec parameter set at the given rate.
+    fn voiced_spec_params(rate: PackedRate) -> SpecFrameParams {
+        let mut p = SpecFrameParams::zeroed(rate);
+        p.lsp_index = crate::spec_lsp::combine_lsp_index([120, 40, 200]);
+        // Absolute lags 80 (index 62); differentials 0 (index 1).
+        p.acl = [62, 1, 62, 1];
+        for s in 0..SUBFRAMES_PER_FRAME {
+            // PGIndex 1 (long-lag 170-row layout; a modest tap set so a
+            // repeated frame does not saturate), MGIndex 18 — an audible
+            // fixed-codebook gain level.
+            p.gain[s] = crate::spec_exc::encode_gain_word(rate, 80, 1, 18, false);
+            p.grid[s] = (s % 2) as u8;
+        }
+        match rate {
+            PackedRate::High => {
+                for s in 0..SUBFRAMES_PER_FRAME {
+                    let slots: &[usize] = if s % 2 == 0 {
+                        &[0, 5, 11, 17, 23, 29]
+                    } else {
+                        &[2, 8, 14, 20, 26]
+                    };
+                    p.pos[s] = crate::spec_tables::fcbk_pack_positions(slots).unwrap();
+                    p.psig[s] = 0b010101 & ((1 << slots.len()) - 1);
+                }
+            }
+            PackedRate::Low => {
+                for s in 0..SUBFRAMES_PER_FRAME {
+                    p.pos[s] = 1 | (3 << 3) | (5 << 6) | (6 << 9);
+                    p.psig[s] = 0b0101;
+                }
+            }
+        }
+        p
+    }
+
+    #[test]
+    fn decode_spec_params_produces_energy_and_is_deterministic() {
+        for rate in [PackedRate::High, PackedRate::Low] {
+            let p = voiced_spec_params(rate);
+            let mut st_a = SynthesisState::new();
+            let mut st_b = SynthesisState::new();
+            let mut energy = 0.0f64;
+            for _ in 0..4 {
+                let out_a = st_a.decode_spec_params(&p);
+                let out_b = st_b.decode_spec_params(&p);
+                assert_eq!(out_a[..], out_b[..], "spec decode must be deterministic");
+                let peak = out_a.iter().map(|&s| (s as i32).abs()).max().unwrap();
+                assert!(peak < 32_768, "output must stay in i16 range");
+                for &s in out_a.iter() {
+                    energy += (s as f64) * (s as f64);
+                }
+            }
+            assert!(
+                energy > 1.0e4,
+                "voiced spec frame at {rate:?} must synthesise audible energy (got {energy})"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_spec_params_zero_frame_is_near_silent() {
+        for rate in [PackedRate::High, PackedRate::Low] {
+            let mut st = SynthesisState::new();
+            let out = st.decode_spec_params(&SpecFrameParams::zeroed(rate));
+            let peak = out.iter().map(|&s| (s as i32).abs()).max().unwrap();
+            // All-zero indices decode to the minimum gain level driving
+            // a couple of pulses — near-silence, far below speech level.
+            assert!(peak < 512, "zero frame peaked at {peak} ({rate:?})");
+        }
+    }
+
+    #[test]
+    fn spec_decode_composes_with_linepack_round_trip() {
+        for rate in [PackedRate::High, PackedRate::Low] {
+            let p = voiced_spec_params(rate);
+            let bytes = pack_frame(&p).unwrap();
+            let q = unpack_frame(&bytes).unwrap();
+            assert_eq!(p, q);
+            let mut st_direct = SynthesisState::new();
+            let mut st_packed = SynthesisState::new();
+            let direct = st_direct.decode_spec_params(&p);
+            let packed = st_packed.decode_spec_params(&q);
+            assert_eq!(direct[..], packed[..]);
+        }
+    }
+
+    #[test]
+    fn spec_decode_updates_lsp_predictor_state() {
+        let p = voiced_spec_params(PackedRate::High);
+        let mut st = SynthesisState::new();
+        let dc = crate::spec_lsp::lsp_dc_freq();
+        assert_eq!(st.prev_lsp_freq, dc, "§3.11 cold start at p_DC");
+        st.decode_spec_params(&p);
+        assert_ne!(
+            st.prev_lsp_freq, dc,
+            "decoding a non-trivial LSP index must advance the predictor state"
+        );
+        // The frequency-domain state mirrors the cosine-domain vector.
+        let cos = crate::spec_lsp::lsp_freq_to_cosines(&st.prev_lsp_freq);
+        for i in 0..LPC_ORDER {
+            assert!((cos[i] - st.prev_lsp[i]).abs() < 1.0e-5);
+        }
+    }
+
+    #[test]
+    fn spec_decode_short_lag_train_mode_extends_pulses() {
+        // Same frame twice, once with the train bit set on a short lag
+        // (L0 = 20 < 58): the train must add excitation energy.
+        let mut base = voiced_spec_params(PackedRate::High);
+        base.acl = [2, 1, 2, 1]; // absolute lag 20
+        for s in 0..SUBFRAMES_PER_FRAME {
+            base.gain[s] = crate::spec_exc::encode_gain_word(PackedRate::High, 20, 40, 18, false);
+        }
+        let mut with_train = base;
+        for s in 0..SUBFRAMES_PER_FRAME {
+            with_train.gain[s] =
+                crate::spec_exc::encode_gain_word(PackedRate::High, 20, 40, 18, true);
+        }
+        let mut st_a = SynthesisState::new();
+        let mut st_b = SynthesisState::new();
+        let out_a = st_a.decode_spec_params(&base);
+        let out_b = st_b.decode_spec_params(&with_train);
+        let e = |pcm: &[i16]| -> f64 { pcm.iter().map(|&s| (s as f64) * (s as f64)).sum() };
+        assert!(
+            e(&out_b) > e(&out_a),
+            "train mode must add excitation energy: {} vs {}",
+            e(&out_b),
+            e(&out_a)
+        );
     }
 }
