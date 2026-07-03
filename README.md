@@ -34,10 +34,13 @@ maps carrying the published quantiser indices.
 
 ### Encoder (both rates)
 
-Full LPC → LSP → open-loop pitch → closed-loop adaptive-codebook →
-rate-specific fixed-codebook → gain-word pipeline on the published
-tables, packed into the clause-4 octet layout. Default rate (no
-`bit_rate` hint) is 6.3 kbit/s MP-MLQ; request `Some(5300)` for ACELP.
+Full §2.3 high-pass → LPC → LSP → open-loop pitch → closed-loop
+adaptive-codebook → rate-specific fixed-codebook → gain-word pipeline
+on the published tables, packed into the clause-4 octet layout.
+Default rate (no `bit_rate` hint) is 6.3 kbit/s MP-MLQ; request
+`Some(5300)` for ACELP. The §2.3 DC-removal filter (eq. 1) defaults ON
+per §2.2; `encoder::SpecEncoder` exposes the rate + high-pass switches
+the ITU encoder-test configurations require.
 
 - **Analysis by synthesis**: the encoder carries a shadow
   `SynthesisState` committed through the *exact* decode kernel, so
@@ -77,11 +80,17 @@ tables:
   lag), the eq. 41.1–41.2 **fifth-order adaptive codebook**, and the
   rate-specific fixed-codebook reconstruction (MP-MLQ combinatorial +
   Dirac trains; ACELP Table 1 + the §2.16 1-tap pitch enhancement).
-- **Post-filter chain**: §3.6 pitch (long-term) post-filter with
-  per-side prediction-gain weighting and rate-specific γ_ltp; §3.8
-  formant filter `A(z/γ₁)/A(z/γ₂)` on the per-subframe interpolated
-  synthesis LPC with the exact Q15 §2.18 tap tables; signal-adaptive
-  tilt compensation; §3.9 leaky-integrator adaptive gain scaling.
+- **Post-filter chain in the §3.1 order**: the §3.6 pitch (long-term)
+  post-filter runs on the **whole-frame decoded excitation**
+  (eq. 42–47: forward/backward search in `[L±3]`, the forward-reach
+  availability rule, the 1.25 dB prediction-gain gate, `g = C/D`
+  weighted by the rate-specific γ_ltp, the attenuate-only eq. 47
+  `g_p`), its output feeds the §3.7 synthesis filter, and §3.8/§3.9
+  run on the synthesis output: formant filter `A(z/γ₁)/A(z/γ₂)` on the
+  per-subframe interpolated LPC with the exact Q15 §2.18 tap tables,
+  signal-adaptive tilt compensation, leaky-integrator adaptive gain
+  scaling. `SynthesisState::set_postfilter(false)` disables the chain
+  (the ITU decoder-test configurations require the switch).
 - **Frame-erasure concealment** (§3.10): voiced/unvoiced classifier,
   periodic or pseudo-random regeneration, 2.5 dB/frame attenuation,
   mute after 3 frames; §3.10.1 LSP extrapolation toward `p_DC` with
@@ -113,30 +122,43 @@ aplay -f S16_LE -c 1 -r 8000 /tmp/g7231-sample.raw
 ## Bitstream interoperability
 
 Frames follow the Recommendation's clause-4 octet maps (Tables 5/6)
-over the published quantiser tables, so the layout, field order, and
-index semantics are the spec's own. Three caveats stand between this
-and a *proven* bit-exact interop claim:
+over the published quantiser tables — and as of r388 the wire format
+is **verified against the official ITU conformance vectors**
+(`docs/audio/g7231/conformance/` in the OxideAV umbrella): all 2 816
+frames of the 13 main-body reference bitstreams unpack and repack
+byte-identically through [`linepack`](src/linepack.rs), so the
+crate's MSBPOS mixed-radix combine (subframe-major, most significant
+first), `C(30,M)` combinatorial position codec and field layout are
+the reference's own. The three deliberate transmission-error frames
+in `PATHD63P.TCO` correctly fail field validation and are concealed
+as erasures. Decoded pulse positions were additionally verified
+against Â(z)-deconvolved reference decoder output.
 
-1. **MSBPOS digit order** — the mixed-radix (10, 9, 10, 9) combine of
-   the four combinatorial codes' top-4-bit digits is forced by the
-   `C(30,6)`/`C(30,5)` ranges (10·9·10·9 = 8100 ≤ 2¹³, exactly the
-   Table 2 note's 3-bit saving), but the digit *order* inside the
-   13-bit word is not pinned by the Recommendation's tables. This
-   crate packs subframe-major, most significant first (documented in
-   [`linepack`](src/linepack.rs)).
-2. **Intra-word pulse/sign conventions** — the assignment of pulses to
-   bit positions inside the low-rate `POS`/`PSIG` words and the
-   high-rate sign-bit order are documented crate conventions (Table 4
-   treats each parameter as one opaque integer).
-3. **Float vs fixed-point** — this is a floating-point implementation
-   of the clause 2/3 mathematical description; the Recommendation
-   makes the fixed-point code of clause 5 normative on discrepancies,
-   and no conformance test vectors are staged under
-   `docs/audio/g7231/`, so bit-exactness against them is unverified.
+The intra-word sign conventions are pinned by the vectors: high-rate
+`PSIG` stores signs MSB-first over ascending pulse order with a set
+bit meaning **negative**; low-rate `PSIG` bit `t` is the track-`t`
+sign with a set bit meaning **positive** (flipping it takes the
+whole-file `OVERD53` waveform correlation from −0.97 to +0.97).
+
+What remains between this and a *bit-exact* conformance claim is
+fixed-point arithmetic: this is a floating-point implementation of
+the clause 2/3 mathematical description, while the Recommendation
+makes the clause-5 fixed-point behaviour normative. Measured decoder
+tracking against the reference `.ROU` outputs (r388): `OVERD53`
+whole-file correlation 0.973 / mean per-frame 0.985 / SNR 7.3 dB
+(post-filter OFF per the test config); `OVERD63P` cold-start frames
+0–3 correlation 0.61/0.89/0.83/0.74 (post-filter ON). The `OVER..` /
+`TAME..` classes deliberately drive sustained Word16-saturation
+chains that only a bit-exact fixed-point pipeline tracks long-range —
+that rebuild (Q15 saturating basic ops through analysis + synthesis)
+is the remaining conformance work. See
+[`tests/itu_conformance.rs`](tests/itu_conformance.rs) for the pinned
+floors.
 
 Bitstreams produced by this encoder decode with this crate's own
-decoder at the PSNR figures above and carry spec-semantic indices
-throughout.
+decoder at the PSNR figures above, carry spec-semantic indices
+throughout, and every encoder-emitted frame on the ITU test inputs is
+a legal clause-4 stream.
 
 ### Spec-table data in tree
 

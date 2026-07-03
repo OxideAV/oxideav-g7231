@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **ITU conformance vectors (r388)** — first round against the newly
+  staged official G.723.1 digital test sequences
+  (`docs/audio/g7231/conformance/`, black-box I/O pairs; the clause-5
+  reference C stays outside the clean-room wall):
+  - clause-4 wire format **confirmed against the reference bitstreams**:
+    all 2 816 frames of the 13 main-body `.RCO`/`.TCO` streams unpack +
+    repack byte-identically (the crate's MSBPOS mixed-radix combine,
+    `C(30,M)` combinatorial codec and Table 5/6 layout are the
+    reference's own), except the three deliberate transmission-error
+    frames of `PATHD63P.TCO`, which correctly fail field validation.
+    Decoded pulse positions verified against Â(z)-deconvolved reference
+    excitation (positions, Dirac trains and the 13-bit MSBPOS split all
+    land where the reference decoder puts them).
+  - **PSIG conventions arbitrated by the vectors**: high rate =
+    MSB-first over ascending pulse order with set bit = negative
+    (pinned by cold-start `OVERD63P`/`PATHD63P` frames); low rate =
+    bit `t` per track with set bit = positive (flips whole-file
+    `OVERD53` correlation from −0.97 to **+0.97**). Encoder writers
+    updated symmetrically; low-rate track *order* remains
+    vector-underdetermined at float fidelity (identity vs reversed
+    differ by <0.001 corr on OVERD53).
+  - **§3.1 decoder chain restructure**: the §3.6 pitch post-filter now
+    runs in the **excitation domain** (eq. 42–47 with the forward-reach
+    availability rule, the 1.25 dB prediction-gain gate and the
+    attenuate-only eq. 47 `g_p`) and feeds the §3.7 synthesis filter,
+    with §3.8/§3.9 formant + tilt + AGC on the synthesis output — per
+    the §3.1 block diagram. The old synthesis-domain LTP stage is gone.
+  - **Device-under-test switches**: `SynthesisState::set_postfilter()`
+    (the `..D53` vectors run post-filter OFF, `..D63P` ON) and the new
+    §2.3 input high-pass filter (eq. 1, default ON per §2.2) with
+    `encoder::SpecEncoder` exposing rate + HP controls.
+  - content-invalid but size-valid frames now conceal like erasures
+    (§3.10) instead of erroring the stream — the behaviour the
+    PATHD63P transmission-error frames demand.
+  - committed harness `tests/itu_conformance.rs` (skips vacuously
+    without the corpus): wire-format identity, decoder floors
+    (OVERD53 corr ≥ 0.95 / mean-frame ≥ 0.97 / SNR ≥ 5 dB, measured
+    0.973 / 0.985 / 7.3 dB; OVERD63P cold-start frames 0–3 corr
+    0.605/0.887/0.833/0.738), CRC-driven full decodes with exact
+    sample budgets, encoder self-validity on the ITU inputs.
+  - known gap: the `OVER..`/`TAME..` classes drive sustained Word16
+    saturation chains that only a bit-exact fixed-point pipeline
+    reproduces — long-range bit-exactness needs a Q15 basic-ops
+    rebuild of the analysis/synthesis kernels (float tracking was
+    measurably *hurt* by emulating per-sample saturation).
+
+### Earlier unreleased work
+
 - decoder robustness battery at the public API (integration tests):
   1500 randomly-drawn *valid* clause-4 frames (both rates, extreme
   combinatorial codes / gain words / degenerate LSP words) decode
