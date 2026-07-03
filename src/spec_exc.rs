@@ -244,8 +244,13 @@ pub(crate) fn acelp_enhanced_impulse_response(h: &[f32], lag: i32, pgindex: usiz
 /// set on a short-lag subframe pair — a train of Dirac functions at
 /// the reference pitch period instead of a single pulse.
 ///
-/// `psig` bit `k` (LSB) is the sign of the `k`-th pulse in ascending
-/// position order, `0` = positive (crate convention).
+/// Sign convention (ITU-conformance-vector arbitrated, r388): the PSIG
+/// word stores pulse signs **most-significant bit first** in ascending
+/// position order — bit `n_pulses − 1 − k` carries the sign of the
+/// `k`-th pulse — and a **set bit means negative**. Pinned against the
+/// cold-start frames of `OVERD63P`/`PATHD63P`
+/// (docs/audio/g7231/conformance/), where this order/polarity maximises
+/// waveform correlation with the reference decoder output.
 pub(crate) fn mpmlq_fixed_vector(
     pos_code: u32,
     psig: u32,
@@ -261,7 +266,8 @@ pub(crate) fn mpmlq_fixed_vector(
     };
     let period = lag_base.max(1) as usize;
     for (k, &slot) in slots.iter().enumerate() {
-        let sign = if (psig >> k) & 1 == 1 { -1.0f32 } else { 1.0 };
+        let bit = n_pulses - 1 - k;
+        let sign = if (psig >> bit) & 1 == 1 { -1.0f32 } else { 1.0 };
         let amp = sign * gain;
         let base = 2 * slot + grid as usize;
         if train {
@@ -282,7 +288,11 @@ pub(crate) fn mpmlq_fixed_vector(
 /// Reconstruct a low-rate (ACELP) fixed-codebook vector `v[n]` (§2.16 /
 /// §2.17 step 2 "direct decoding of the position indices"): four 3-bit
 /// track slots (track 0 in the low bits of `pos`), the shared grid bit,
-/// per-track signs (`psig` bit `t`, `0` = positive), and the gain.
+/// per-track signs, and the gain. Sign convention (ITU-vector
+/// arbitrated, r388): `psig` bit `t` is the sign of the track-`t`
+/// pulse, **set = positive** — flipping the pre-conformance polarity
+/// turned the whole-file OVERD53 waveform correlation from −0.97 to
+/// +0.97.
 /// Track slots that map past the subframe boundary (Table 1's "(60)" /
 /// "(62)") mean the pulse is absent.
 pub(crate) fn acelp_fixed_vector(pos: u32, psig: u32, grid: u8, gain: f32) -> [f32; SUBFRAME_SIZE] {
@@ -297,9 +307,9 @@ pub(crate) fn acelp_fixed_vector(pos: u32, psig: u32, grid: u8, gain: f32) -> [f
             continue;
         };
         let sign = if (psig >> track) & 1 == 1 {
-            -1.0f32
+            1.0f32
         } else {
-            1.0
+            -1.0
         };
         v[sample] += sign * gain;
     }
@@ -419,10 +429,12 @@ mod tests {
     #[test]
     fn mpmlq_fixed_vector_places_signed_pulses_and_trains() {
         // Pack the 6-pulse slot set {0, 3, 7, 12, 20, 29} and decode on
-        // the odd grid with alternating signs.
+        // the odd grid with alternating signs. PSIG is MSB-first over
+        // ascending pulse order with a set bit = negative, so bit
+        // 5 − k carries pulse k: pulses 1, 3, 5 negative ⇒ bits 4, 2, 0.
         let slots = [0usize, 3, 7, 12, 20, 29];
         let code = crate::spec_tables::fcbk_pack_positions(&slots).unwrap();
-        let psig = 0b101010; // pulses 1, 3, 5 negative
+        let psig = 0b010101; // pulses 1, 3, 5 negative (bits 4, 2, 0)
         let v = mpmlq_fixed_vector(code, psig, 1, 6, 0.25, false, 100);
         for (k, &slot) in slots.iter().enumerate() {
             let sample = 2 * slot + 1;
@@ -450,16 +462,17 @@ mod tests {
     fn acelp_fixed_vector_follows_table1_tracks() {
         // Slots (1, 2, 7, 7): track 0 → 8, track 1 → 18, tracks 2/3 at
         // slot 7 on the even grid are the absent "(60)" / "(62)".
+        // PSIG bit t set = the track-t pulse is POSITIVE.
         let pos = 1 | (2 << 3) | (7 << 6) | (7 << 9);
-        let v = acelp_fixed_vector(pos, 0b0010, 0, 0.5);
-        assert_eq!(v[8], 0.5);
-        assert_eq!(v[18], -0.5); // track 1 sign bit set
+        let v = acelp_fixed_vector(pos, 0b0001, 0, 0.5);
+        assert_eq!(v[8], 0.5); // track 0 sign bit set → positive
+        assert_eq!(v[18], -0.5); // track 1 sign bit clear → negative
         assert_eq!(v.iter().filter(|&&s| s != 0.0).count(), 2);
 
         // Odd grid shifts every present pulse by +1 and makes slot 7 of
         // tracks 2/3 real samples (61/63 → wait: 60/62 + 1 = 61/63 are
         // beyond 59 — still absent).
-        let v = acelp_fixed_vector(pos, 0, 1, 0.5);
+        let v = acelp_fixed_vector(pos, 0b1111, 1, 0.5);
         assert_eq!(v[9], 0.5);
         assert_eq!(v[19], 0.5);
         assert_eq!(v.iter().filter(|&&s| s != 0.0).count(), 2);

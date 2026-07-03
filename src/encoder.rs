@@ -628,10 +628,14 @@ fn mpmlq_spec_search(
                 if err < best_err {
                     chosen.sort_unstable_by_key(|&(slot, _)| slot);
                     let slots: Vec<usize> = chosen.iter().map(|&(slot, _)| slot).collect();
+                    // PSIG convention (vector-arbitrated, r388): signs
+                    // MSB-first in ascending position order, set bit =
+                    // negative — see spec_exc::mpmlq_fixed_vector.
                     let mut psig = 0u32;
+                    let n_pulses = chosen.len();
                     for (k, &(_, neg)) in chosen.iter().enumerate() {
                         if neg {
-                            psig |= 1 << k;
+                            psig |= 1 << (n_pulses - 1 - k);
                         }
                     }
                     if let Some(code) = crate::spec_tables::fcbk_pack_positions(&slots) {
@@ -682,9 +686,11 @@ fn acelp_spec_search(
     let (mg, _) = best_gain_level(c_ty, e_yy, e_tt);
 
     let pos = positions[0] | positions[1] << 3 | positions[2] << 6 | positions[3] << 9;
+    // PSIG convention (vector-arbitrated, r388): bit t set = the track-t
+    // pulse is POSITIVE — see spec_exc::acelp_fixed_vector.
     let mut psig = 0u32;
     for (t, &sgn) in signs.iter().enumerate() {
-        if sgn < 0 {
+        if sgn > 0 {
             psig |= 1 << t;
         }
     }
@@ -1479,6 +1485,11 @@ fn open_loop_acb_lag(target: &[f32; SUBFRAME_SIZE], history: &[f32], h: &[f32]) 
 /// points and left untouched by the bare [`SynthesisState::synthesise`]
 /// kernel, so the encoder's shadow-decoder pass stays on the pre-post-filter
 /// signal path (what the encoder's analysis-by-synthesis loop needs to see).
+/// Word16 positive saturation bound in the crate's normalised float
+/// domain (32767 / 32768 — the fixed-point description of §1.5 clamps
+/// every stored sample to the i16 range).
+const I16_MAX_NORM: f32 = 32_767.0 / 32_768.0;
+
 pub struct SynthesisState {
     prev_lsp: [f32; LPC_ORDER],
     /// Previous decoded LSP vector in the spec tables' Q15
@@ -1489,10 +1500,6 @@ pub struct SynthesisState {
     exc_history: [f32; PITCH_MAX + SUBFRAME_SIZE],
     syn_mem: [f32; LPC_ORDER],
     // Post-filter state ---------------------------------------------------
-    /// Pre-post-filter synthesis history. Feeds the pitch post-filter's
-    /// long-term predictor when the current subframe's lag reaches back
-    /// beyond the subframe boundary.
-    pf_syn_hist: [f32; PITCH_MAX + SUBFRAME_SIZE],
     /// Numerator memory for A(z/γ₁) of the formant post-filter.
     pf_num_mem: [f32; LPC_ORDER],
     /// Denominator memory for 1/A(z/γ₂).
@@ -1531,18 +1538,13 @@ pub struct SynthesisState {
     /// to decide voiced vs unvoiced and to refine the pitch period used
     /// for the voiced-path periodic regenerator.
     pf_pcm_hist: [f32; ERASURE_CLASSIFIER_HISTORY_LEN],
-}
-
-/// Whole-frame forward context for the §3.6 pitch postfilter (trace §8):
-/// the forward cross-correlation `x[n + M_f]` reaches into the next
-/// subframe, so the postfilter needs the raw (pre-postfilter) synthesis
-/// samples of the whole frame plus the current subframe's start offset.
-#[derive(Copy, Clone)]
-struct ForwardCtx<'a> {
-    /// Raw (pre-postfilter) synthesis samples of the whole 240-sample frame.
-    raw_frame: &'a [f32; FRAME_SIZE_SAMPLES],
-    /// Frame-relative start index of the subframe being post-filtered.
-    sf_start: usize,
+    /// Whether the §3.6–§3.9 post-filter chain (pitch post-filter,
+    /// formant post-filter, tilt compensation, AGC) runs on decoded
+    /// frames. Defaults to `true`. The ITU conformance methodology
+    /// exercises the decoder with the post-filter selectively disabled
+    /// (the `..D53`/`..D63P` vector naming: trailing `P` = post-filter
+    /// ON, absent = OFF), so a device under test must expose the switch.
+    postfilter_enabled: bool,
 }
 
 impl SynthesisState {
@@ -1557,7 +1559,6 @@ impl SynthesisState {
             prev_lsp_freq: crate::spec_lsp::lsp_dc_freq(),
             exc_history: [0.0; PITCH_MAX + SUBFRAME_SIZE],
             syn_mem: [0.0; LPC_ORDER],
-            pf_syn_hist: [0.0; PITCH_MAX + SUBFRAME_SIZE],
             pf_num_mem: [0.0; LPC_ORDER],
             pf_den_mem: [0.0; LPC_ORDER],
             pf_tilt_prev: 0.0,
@@ -1570,12 +1571,30 @@ impl SynthesisState {
             pf_last_lag2: 60,
             pf_last_gain_unvoiced: 0.0,
             pf_pcm_hist: [0.0; ERASURE_CLASSIFIER_HISTORY_LEN],
+            postfilter_enabled: true,
         }
     }
 
-    /// Reset to the silent-LSP boot state.
+    /// Reset to the silent-LSP boot state. The post-filter switch is a
+    /// configuration bit, not decoder state — it survives the reset.
     pub fn reset(&mut self) {
+        let postfilter = self.postfilter_enabled;
         *self = Self::new();
+        self.postfilter_enabled = postfilter;
+    }
+
+    /// Enable / disable the §3.6–§3.9 decoder post-filter chain
+    /// (default: enabled). The ITU test-vector methodology requires the
+    /// switch: the `PATHD53` / `OVERD53` / `INEQD53` decoder vectors are
+    /// defined with the post-filter OFF, `PATHD63P` / `OVERD63P` /
+    /// `TAMED63P` with it ON.
+    pub fn set_postfilter(&mut self, enabled: bool) {
+        self.postfilter_enabled = enabled;
+    }
+
+    /// Current state of the decoder post-filter switch.
+    pub fn postfilter(&self) -> bool {
+        self.postfilter_enabled
     }
 
     /// Update the trailing-PCM classifier history with the last
@@ -1589,270 +1608,174 @@ impl SynthesisState {
             .copy_from_slice(&pcm_f[tail..tail + ERASURE_CLASSIFIER_HISTORY_LEN]);
     }
 
-    /// Long-term (pitch) post-filter per G.723.1 §3.6 (eq. 42–47):
-    /// search forward `M_f` ∈ `[lag − 3, lag + 3]` and backward
-    /// `M_b` ∈ `[lag − 3, lag + 3]` for the maximum positive
-    /// cross-correlation against the synthesis-domain signal, pick
-    /// `(w_f, w_b) ∈ {(0, 0), (0, 1), (1, 0)}` based on which side has
-    /// the larger prediction gain, and apply the energy-normalised LTP
-    /// post-filter with rate-specific weighting `γ_ltp`. Subframes whose
-    /// best pitch prediction gain is below 1.25 dB pass through
-    /// unchanged (eq. 45–46 gate).
-    fn ltp_post_filter_subframe(
-        &self,
-        syn: &[f32; SUBFRAME_SIZE],
-        fwd: ForwardCtx<'_>,
-        lag: i32,
+    /// §3.6 pitch post-filter, **excitation domain** (eq. 42–47).
+    ///
+    /// Per the §3.1 block diagram the decoded excitation `e[n]` is input
+    /// to the pitch post-filter, whose output `ppf[n]` feeds the §3.7
+    /// synthesis filter — the post-filter does *not* run on the
+    /// synthesis output. §3.6: "to implement it, it is required that the
+    /// whole frame excitation signal {e[n]}n=0..239 is generated and
+    /// saved", so the forward reach `e[n + M_f]` reads the current
+    /// frame's excitation and is dropped (weight 0) when any sample
+    /// would fall past the frame end; the backward reach `e[n − M_b]`
+    /// extends into the pre-frame excitation history.
+    ///
+    /// `hist` is the excitation history as it stood *before* the current
+    /// frame (most recent sample last), `frame` the current frame's
+    /// decoded excitation, `start` the subframe offset (0/60/120/180)
+    /// and `ref_lag` the §3.6 reference lag (`L_0` for subframes 0–1,
+    /// `L_2` for 2–3).
+    fn pitch_postfilter_exc(
+        hist: &[f32],
+        frame: &[f32; FRAME_SIZE_SAMPLES],
+        start: usize,
+        ref_lag: i32,
         rate: Rate,
     ) -> [f32; SUBFRAME_SIZE] {
-        // Centre the search at the decoded lag, clamped to the legal
-        // PITCH_MIN..=PITCH_MAX range so we never read past the end of
-        // the synthesis-domain history buffer.
-        let lag_c = lag.clamp(PITCH_MIN as i32, PITCH_MAX as i32);
-        let m_lo = (lag_c - POSTFILTER_LTP_SEARCH_RADIUS).max(PITCH_MIN as i32);
-        let m_hi = (lag_c + POSTFILTER_LTP_SEARCH_RADIUS).min(PITCH_MAX as i32);
+        let mut sf = [0.0f32; SUBFRAME_SIZE];
+        sf.copy_from_slice(&frame[start..start + SUBFRAME_SIZE]);
 
-        // Subframe energy `T_en` (eq. 45 denominator term).
+        let lag_c = ref_lag.clamp(PITCH_MIN as i32, PITCH_MAX as i32);
+        let m_lo = (lag_c - POSTFILTER_LTP_SEARCH_RADIUS).max(1);
+        let m_hi = lag_c + POSTFILTER_LTP_SEARCH_RADIUS;
+
+        // Subframe energy T_en (eq. 44.3).
         let mut t_en = 0.0f32;
-        for &v in syn.iter() {
+        for &v in sf.iter() {
             t_en += v * v;
         }
-        // If the subframe is essentially silent, the postfilter has
-        // nothing to enhance and the prediction gain is meaningless.
         if t_en < 1e-12 {
-            return *syn;
+            return sf;
         }
 
-        let mut out = *syn;
+        // Forward search (eq. 43.1): C_f = Σ e[n]·e[n + M_f]. §3.6: "if
+        // for some n ∈ [0..59] there is no sample value e[n + M_f]
+        // available, then the corresponding weight and delay are set
+        // to 0" — availability means within the saved 240-sample frame.
+        let mut best_f: Option<(usize, f32, f32)> = None; // (M_f, C_f, D_f)
+        for m in m_lo..=m_hi {
+            let mu = m as usize;
+            if start + SUBFRAME_SIZE - 1 + mu >= FRAME_SIZE_SAMPLES {
+                continue;
+            }
+            let mut c = 0.0f32;
+            let mut d = 0.0f32;
+            for n in 0..SUBFRAME_SIZE {
+                let x = frame[start + n + mu];
+                c += sf[n] * x;
+                d += x * x;
+            }
+            let metric = if c > 0.0 && d > 1e-12 {
+                c * c / d
+            } else {
+                -1.0
+            };
+            if metric >= 0.0 && best_f.map_or(true, |(_, bc, bd)| metric > bc * bc / bd.max(1e-12))
+            {
+                best_f = Some((mu, c, d));
+            }
+        }
 
-        // Forward lookup `x[n + M_f]`: per G.723.1 §3.6 / trace §8 the
-        // pitch postfilter is defined over the whole-frame synthesis
-        // signal, so when `n + M_f >= 60` the read continues into the next
-        // subframe of the raw (pre-postfilter) frame `raw_frame` rather
-        // than being truncated. Only when the forward reach exceeds the
-        // frame end (sample 239) does the contribution drop to zero.
-        let (mf_best, cf, df) = self.ltp_search_forward(syn, fwd, m_lo, m_hi);
-
-        // Backward lookup `x[n − M_b]`: when `n − M_b < 0` the read
-        // falls into the saved `pf_syn_hist` (the most recent
-        // PITCH_MAX + SUBFRAME_SIZE pre-postfilter samples).
-        let (mb_best, cb, db) = self.ltp_search_backward(syn, m_lo, m_hi);
-
-        // Per-side prediction gains in linear domain:
-        //   G_side = C² / (D · T_en)   (eq. 45 / eq. 46 ratio)
-        // converted to dB as `−10·log10(1 − G_side)`. We keep things
-        // in the linear ratio domain for the gate (and just compare
-        // gains numerically); a side with C ≤ 0 contributes 0.
-        let gain_f = if cf > 0.0 && df > 0.0 {
-            cf * cf / (df * t_en)
-        } else {
-            0.0
+        // Backward search (eq. 43.2): C_b = Σ e[n]·e[n − M_b], reaching
+        // into the pre-frame history.
+        let hlen = hist.len();
+        let past = |gidx: isize| -> f32 {
+            if gidx >= 0 {
+                frame[gidx as usize]
+            } else {
+                let k = (-gidx) as usize;
+                if k <= hlen {
+                    hist[hlen - k]
+                } else {
+                    0.0
+                }
+            }
         };
-        let gain_b = if cb > 0.0 && db > 0.0 {
-            cb * cb / (db * t_en)
-        } else {
-            0.0
-        };
+        let mut best_b: Option<(usize, f32, f32)> = None;
+        for m in m_lo..=m_hi {
+            let mu = m as usize;
+            let mut c = 0.0f32;
+            let mut d = 0.0f32;
+            for n in 0..SUBFRAME_SIZE {
+                let x = past((start + n) as isize - mu as isize);
+                c += sf[n] * x;
+                d += x * x;
+            }
+            let metric = if c > 0.0 && d > 1e-12 {
+                c * c / d
+            } else {
+                -1.0
+            };
+            if metric >= 0.0 && best_b.map_or(true, |(_, bc, bd)| metric > bc * bc / bd.max(1e-12))
+            {
+                best_b = Some((mu, c, d));
+            }
+        }
 
-        // Best per-subframe prediction gain. The gate is in dB:
-        //   −10·log10(1 − G) ≥ POSTFILTER_LTP_PRED_GAIN_DB_MIN
-        //   ⇔ G ≥ 1 − 10^(−POSTFILTER_LTP_PRED_GAIN_DB_MIN / 10)
+        // Case selection: pick the positive-maximum side with the larger
+        // C²/D contribution (eq. 45.1/45.2 minimisation).
+        let gain_f = best_f.map_or(0.0, |(_, c, d)| c * c / (d.max(1e-12) * t_en));
+        let gain_b = best_b.map_or(0.0, |(_, c, d)| c * c / (d.max(1e-12) * t_en));
         let gain_best = gain_f.max(gain_b);
+        // Prediction-gain gate: −10·log10(1 − C²/(D·T_en)) < 1.25 dB ⇒
+        // "the contribution is judged to be negligible and no pitch
+        // postfilter is used".
         let gate_linear = 1.0 - 10.0_f32.powf(-POSTFILTER_LTP_PRED_GAIN_DB_MIN / 10.0);
         if gain_best < gate_linear {
-            return out; // postfilter bypassed for this subframe.
+            return sf;
         }
-
-        // Pick the (w_f, w_b) winner: whichever side has the larger
-        // prediction gain, weight = 1 on that side and 0 on the other
-        // (the spec's `{(0,0), (0,1), (1,0)}` constraint).
-        let pick_forward = gain_f >= gain_b;
-        let (c_chosen, d_chosen);
-        let mut contrib = [0.0f32; SUBFRAME_SIZE];
-        if pick_forward {
-            c_chosen = cf;
-            d_chosen = df;
-            let m = mf_best as usize;
-            for n in 0..SUBFRAME_SIZE {
-                let g = fwd.sf_start + n + m; // global frame index of x[n + M_f]
-                if g < FRAME_SIZE_SAMPLES {
-                    contrib[n] = fwd.raw_frame[g];
-                }
-                // Forward reach past the frame end (sample 239) → 0;
-                // matches the correlation that produced cf/df.
-            }
+        let (m_best, c_chosen, d_chosen, forward) = if gain_f >= gain_b {
+            let (m, c, d) = best_f.unwrap();
+            (m, c, d, true)
         } else {
-            c_chosen = cb;
-            d_chosen = db;
-            let m = mb_best as usize;
-            let hist = &self.pf_syn_hist;
-            let hlen = hist.len();
-            for n in 0..SUBFRAME_SIZE {
-                let val = if n >= m {
-                    syn[n - m]
-                } else {
-                    let k = m - n;
-                    if k <= hlen {
-                        hist[hlen - k]
-                    } else {
-                        0.0
-                    }
-                };
-                contrib[n] = val;
-            }
-        }
+            let (m, c, d) = best_b.unwrap();
+            (m, c, d, false)
+        };
 
-        // Per-side LTP gain `g_side = C / D`, clamped to [0, 1] per spec.
+        // eq. 46: g = C / D, weighted by the rate-specific γ_ltp.
         let g_side = (c_chosen / d_chosen.max(1e-12)).clamp(0.0, 1.0);
         let gamma_ltp = rate.ltp_gamma();
 
-        // Output energy normalisation `g_p` (eq. 47): preserves the
-        // subframe energy through the LTP comb-filter. With a single
-        // active side the denominator simplifies to
-        //   T_en + 2·γ_ltp·g_side·C + γ_ltp²·g_side²·D.
-        let num_energy = t_en;
-        let mut den_energy = t_en
-            + 2.0 * gamma_ltp * g_side * c_chosen
-            + gamma_ltp * gamma_ltp * g_side * g_side * d_chosen;
-        if den_energy < 1e-12 {
-            den_energy = 1e-12;
-        }
-        let g_p = (num_energy / den_energy).sqrt().min(1.0);
-
+        // ppf′[n] = e[n] + γ_ltp·g·e[n ± M] (eq. 42 inner term).
+        let mut ppf = [0.0f32; SUBFRAME_SIZE];
+        let mut den_energy = 0.0f32;
         for n in 0..SUBFRAME_SIZE {
-            out[n] = g_p * (syn[n] + gamma_ltp * g_side * contrib[n]);
+            let x = if forward {
+                frame[start + n + m_best]
+            } else {
+                past((start + n) as isize - m_best as isize)
+            };
+            let v = sf[n] + gamma_ltp * g_side * x;
+            ppf[n] = v;
+            den_energy += v * v;
         }
-        out
+        // eq. 47: gp = √(Σe²/Σppf′²), set to 1 when the denominator is
+        // smaller than the numerator (attenuate-only).
+        let g_p = if den_energy < t_en {
+            1.0
+        } else {
+            (t_en / den_energy.max(1e-12)).sqrt()
+        };
+        for v in ppf.iter_mut() {
+            *v *= g_p;
+        }
+        ppf
     }
 
-    /// Maximise the forward cross-correlation `C_f = Σ_n syn[n]·syn[n + M_f]`
-    /// over `M_f ∈ [m_lo, m_hi]`, returning `(M_f*, C_f*, D_f*)` where
-    /// `D_f* = Σ_n syn[n + M_f*]²` is the matched energy for the
-    /// winning lag. Out-of-range reads (`n + M_f ≥ SUBFRAME_SIZE`)
-    /// contribute zero — they would otherwise need the next subframe's
-    /// synthesis (not available at this point in the pipeline).
-    fn ltp_search_forward(
-        &self,
-        syn: &[f32; SUBFRAME_SIZE],
-        fwd: ForwardCtx<'_>,
-        m_lo: i32,
-        m_hi: i32,
-    ) -> (i32, f32, f32) {
-        let mut best_metric = -f32::INFINITY;
-        let mut best = (m_lo, 0.0f32, 0.0f32);
-        for m in m_lo..=m_hi {
-            let mu = m as usize;
-            let mut c = 0.0f32;
-            let mut d = 0.0f32;
-            for n in 0..SUBFRAME_SIZE {
-                // x[n + M_f] over the whole-frame synthesis signal
-                // (§3.6 / trace §8): reads into the next subframe of the
-                // raw pre-postfilter frame; past the frame end → 0.
-                let g = fwd.sf_start + n + mu;
-                let p = if g < FRAME_SIZE_SAMPLES {
-                    fwd.raw_frame[g]
-                } else {
-                    0.0
-                };
-                c += syn[n] * p;
-                d += p * p;
-            }
-            let metric = if c > 0.0 && d > 1e-12 { c * c / d } else { 0.0 };
-            if metric > best_metric {
-                best_metric = metric;
-                best = (m, c, d);
-            }
-        }
-        best
-    }
-
-    /// Maximise the backward cross-correlation `C_b = Σ_n syn[n]·syn[n − M_b]`
-    /// over `M_b ∈ [m_lo, m_hi]`, returning `(M_b*, C_b*, D_b*)`. The
-    /// backward reach extends into `pf_syn_hist`, which carries the
-    /// most recent PITCH_MAX + SUBFRAME_SIZE pre-postfilter synthesis
-    /// samples.
-    fn ltp_search_backward(
-        &self,
-        syn: &[f32; SUBFRAME_SIZE],
-        m_lo: i32,
-        m_hi: i32,
-    ) -> (i32, f32, f32) {
-        let hist = &self.pf_syn_hist;
-        let hlen = hist.len();
-        let mut best_metric = -f32::INFINITY;
-        let mut best = (m_lo, 0.0f32, 0.0f32);
-        for m in m_lo..=m_hi {
-            let mu = m as usize;
-            let mut c = 0.0f32;
-            let mut d = 0.0f32;
-            for n in 0..SUBFRAME_SIZE {
-                let past = if n >= mu {
-                    syn[n - mu]
-                } else {
-                    let k = mu - n;
-                    if k <= hlen {
-                        hist[hlen - k]
-                    } else {
-                        0.0
-                    }
-                };
-                c += syn[n] * past;
-                d += past * past;
-            }
-            let metric = if c > 0.0 && d > 1e-12 { c * c / d } else { 0.0 };
-            if metric > best_metric {
-                best_metric = metric;
-                best = (m, c, d);
-            }
-        }
-        best
-    }
-
-    /// Apply the G.723.1 post-filter chain to one subframe:
-    /// pitch-enhancement (§3.6) → formant A(z/γ₁)/A(z/γ₂) (§3.8) →
-    /// first-order tilt compensation → smoothed automatic-gain-control,
-    /// updating the post-filter memories in place. `syn` is the 60-sample
-    /// synthesis output of the current subframe; `lag` is the decoded
-    /// pitch lag used as the centre of the LTP search; `rate` picks the
-    /// rate-specific γ_ltp weighting in §3.6; `a_sub` are the
-    /// unquantised-polynomial LPC coefficients for the subframe.
-    ///
-    /// The post-filter runs only on the decoder path; it is deliberately
-    /// separate from [`SynthesisState::synthesise`] so the encoder's shadow
-    /// synth (which needs the raw excitation-domain signal for closed-loop
-    /// analysis) never sees a post-filtered intermediate.
-    fn post_filter_subframe(
+    /// Apply the §3.8/§3.9 back half of the post-filter chain to one
+    /// subframe: formant A(z/γ₁)/A(z/γ₂) → first-order tilt
+    /// compensation → smoothed automatic-gain-control, updating the
+    /// post-filter memories in place. `syn` is the 60-sample §3.7
+    /// synthesis output of the current subframe (the §3.6 pitch
+    /// post-filter has already run upstream, in the excitation domain);
+    /// `a_sub` are the interpolated LPC coefficients for the subframe.
+    fn formant_postfilter_subframe(
         &mut self,
         a_sub: &[f32; LPC_ORDER + 1],
         syn: &[f32; SUBFRAME_SIZE],
-        fwd: ForwardCtx<'_>,
-        lag: i32,
-        rate: Rate,
         out: &mut [f32; SUBFRAME_SIZE],
     ) {
-        // ---- 1. Long-term (pitch) post-filter per G.723.1 §3.6, eq. 42:
-        //
-        //   ppf[n] = g_p · { x[n] + γ_ltp · ( w_f · g_f · x[n + M_f]
-        //                                   + w_b · g_b · x[n − M_b] ) }
-        //
-        // with `(w_f, w_b)` constrained to one of `{(0,0), (0,1), (1,0)}`,
-        // `M_f` / `M_b` searched in `[L − 3, L + 3]` for the max forward /
-        // backward cross-correlation (eq. 43.1–43.2), and the postfilter
-        // bypassed for this subframe if the pitch-prediction gain falls
-        // below 1.25 dB (eq. 45–46 gate).  γ_ltp differs by rate per §3.6.
-        //
-        // We run this on the synthesis-domain signal (the same signal the
-        // surrounding ARMA formant postfilter sees), using the dedicated
-        // pre-postfilter history `pf_syn_hist` so the back reference is
-        // spectrally consistent.  The spec equation talks about the
-        // excitation `e[n]`; on a quasi-stationary subframe the LTP
-        // structure carries over to the synthesis signal because the LPC
-        // synthesis filter does not change the periodicity.  The 1.25 dB
-        // prediction-gain gate then naturally suppresses subframes where
-        // the synthesis-domain LTP shape diverges from the excitation's.
-        let after_pitch = self.ltp_post_filter_subframe(syn, fwd, lag, rate);
-
-        // ---- 2. Formant post-filter A(z/γ₁) / A(z/γ₂). γ₁ < γ₂ widens
+        // ---- 1. Formant post-filter A(z/γ₁) / A(z/γ₂). γ₁ < γ₂ widens
         // the formant bandwidth on the numerator and narrows it on the
         // denominator, emphasising the spectral peaks that carry speech
         // formants without shifting their centre frequency.
@@ -1864,7 +1787,7 @@ impl SynthesisState {
         let a_den = postfilter_expand(a_sub, &crate::spec_tables::POSTFILTER_POLE_Q15);
         let mut after_formant = [0.0f32; SUBFRAME_SIZE];
         for n in 0..SUBFRAME_SIZE {
-            let x = after_pitch[n];
+            let x = syn[n];
             // y[n] = x[n] + Σ a_num[k] · x_hist[k] - Σ a_den[k] · y_hist[k]
             let mut y = x;
             for k in 0..LPC_ORDER {
@@ -1882,7 +1805,7 @@ impl SynthesisState {
             after_formant[n] = y;
         }
 
-        // ---- 3. First-order tilt compensation per G.723.1 §3.8, eq. 49.2:
+        // ---- 2. First-order tilt compensation per G.723.1 §3.8, eq. 49.2:
         //
         //   y[n] = x[n] − μ · x[n − 1],   μ = POSTFILTER_TILT_BASE · k1
         //
@@ -1920,7 +1843,7 @@ impl SynthesisState {
         }
         self.pf_tilt_prev = prev;
 
-        // ---- 4. Adaptive gain scaling per G.723.1 §3.9, eq. 50–52:
+        // ---- 3. Adaptive gain scaling per G.723.1 §3.9, eq. 50–52:
         //
         //   g_s = sqrt( Σ sy²[n] / Σ pf²[n] ),    g_s = 1 if denominator is 0
         //   g[n] = (1 − α) · g[n − 1] + α · g_s,   α = 1/16
@@ -1950,12 +1873,6 @@ impl SynthesisState {
             self.pf_agc_gain = (1.0 - alpha) * self.pf_agc_gain + alpha * g_s;
             out[n] = after_tilt[n] * self.pf_agc_gain * scale;
         }
-
-        // Advance the post-filter synthesis-domain history with this
-        // subframe's *pre*-post-filter samples.
-        self.pf_syn_hist.rotate_left(SUBFRAME_SIZE);
-        let tail = self.pf_syn_hist.len() - SUBFRAME_SIZE;
-        self.pf_syn_hist[tail..].copy_from_slice(syn);
     }
 
     /// Run the post-filter across a full frame. `pcm` is the synthesis-
@@ -1970,49 +1887,32 @@ impl SynthesisState {
     /// absolute lag of subframe 0) for subframes 0,1 and `L_2` (subframe
     /// 2's absolute lag) for subframes 2,3 — not the per-subframe
     /// delta-decoded lags. We respect that here.
-    fn apply_post_filter(
+    /// §3.8/§3.9 formant + tilt + AGC stage over a whole frame of §3.7
+    /// synthesis output. The formant postfilter A(z/γ₁)/A(z/γ₂)
+    /// operates on the same per-subframe interpolated synthesis filter
+    /// Ã_i(z) the LPC synthesis stage used (§3.3 / §2.7 eq. 8 weights
+    /// (0.75/0.25), (0.5/0.5), (0.25/0.75), (0/1)); the caller passes
+    /// the captured pre-decode previous LSP so the interpolation curve
+    /// matches subframe-for-subframe. No-op when the post-filter switch
+    /// is off.
+    fn apply_formant_postfilter(
         &mut self,
         prev_lsp: &[f32; LPC_ORDER],
         lsp_q: &[f32; LPC_ORDER],
-        lags: &[i32; SUBFRAMES_PER_FRAME],
-        rate: Rate,
         pcm: &mut [f32; FRAME_SIZE_SAMPLES],
     ) {
-        // The formant postfilter A(z/γ₁)/A(z/γ₂) (§3.8) operates on the
-        // same per-subframe quantised synthesis filter Ã_i(z) the LPC
-        // synthesis stage used.  Those coefficients come from the §3.3 /
-        // §2.7 (eq. 8) per-subframe LSP interpolation between the previous
-        // frame's decoded LSP and the current frame's, with weights
-        // (0.75/0.25), (0.5/0.5), (0.25/0.75), (0/1) for subframes 0..3 —
-        // *not* a frame-constant LSP.  `synthesise()` already advanced
-        // `self.prev_lsp` to `lsp_q`, so the caller passes the captured
-        // pre-synthesis previous LSP here and we reproduce the identical
-        // interpolation curve, keeping the postfilter's formant filter
-        // matched to the synthesis filter subframe-for-subframe.
-        // G.723.1 §3.6 / trace §8: the pitch postfilter is defined over the
-        // *whole-frame* synthesis signal `{sy[n]}_{0..239}` — the forward
-        // cross-correlation `x[n + M_f]` (M_f ≈ L_i + 3) for samples near a
-        // subframe's tail reaches into the *next* subframe. Snapshot the
-        // raw (pre-postfilter) synthesis frame up front so each subframe's
-        // forward LTP search can read across the subframe boundary instead
-        // of truncating the correlation window at sample 60.
-        let raw_frame = *pcm;
+        if !self.postfilter_enabled {
+            return;
+        }
         for s in 0..SUBFRAMES_PER_FRAME {
             let lsp_interp = interpolate_lsp(s, prev_lsp, lsp_q);
             let a_sub = lsp_to_lpc(&lsp_interp);
-            // Reference lag for the LTP postfilter: L_0 covers subframes
-            // 0,1; L_2 covers subframes 2,3 (G.723.1 §3.6 prose).
-            let ref_lag = if s < 2 { lags[0] } else { lags[2] };
             let start = s * SUBFRAME_SIZE;
             let end = start + SUBFRAME_SIZE;
             let mut syn = [0.0f32; SUBFRAME_SIZE];
             syn.copy_from_slice(&pcm[start..end]);
             let mut post = [0.0f32; SUBFRAME_SIZE];
-            let fwd = ForwardCtx {
-                raw_frame: &raw_frame,
-                sf_start: start,
-            };
-            self.post_filter_subframe(&a_sub, &syn, fwd, ref_lag, rate, &mut post);
+            self.formant_postfilter_subframe(&a_sub, &syn, &mut post);
             pcm[start..end].copy_from_slice(&post);
         }
     }
@@ -2128,40 +2028,35 @@ impl SynthesisState {
                 }
             }
 
-            // 1/A(z) synthesis.
+            // Saturate the concealed excitation to the Word16 range,
+            // then 1/A(z) synthesis (eq. 48) with saturated output.
             let mut syn = [0.0f32; SUBFRAME_SIZE];
             for i in 0..SUBFRAME_SIZE {
+                exc[i] = exc[i].clamp(-1.0, I16_MAX_NORM);
                 let mut y = exc[i];
                 for k in 0..LPC_ORDER {
                     y -= a_sub[k + 1] * self.syn_mem[k];
                 }
+                y = y.clamp(-1.0, I16_MAX_NORM);
                 for k in (1..LPC_ORDER).rev() {
                     self.syn_mem[k] = self.syn_mem[k - 1];
                 }
                 self.syn_mem[0] = y;
                 syn[i] = y;
             }
-            // Post-filter. The erasure path has no rate signal, so we
-            // default to the high-rate γ_ltp (the more conservative
-            // value: 0.1875 vs 0.25) so concealment stays gentler than
-            // either rate's normal pitch postfilter would be.
-            //
-            // Concealment synthesises and post-filters subframe-by-subframe
-            // in one pass, so the whole-frame forward LTP context isn't
-            // available here — we present the current subframe at frame
-            // offset 0 with no successor samples, so the §3.6 forward reach
-            // past sample 60 contributes zero (the original window-shrinkage
-            // behaviour, kept deliberately gentle on the concealed signal).
-            let mut raw_sf = [0.0f32; FRAME_SIZE_SAMPLES];
-            raw_sf[..SUBFRAME_SIZE].copy_from_slice(&syn);
-            let mut post = [0.0f32; SUBFRAME_SIZE];
-            let fwd = ForwardCtx {
-                raw_frame: &raw_sf,
-                sf_start: 0,
-            };
-            self.post_filter_subframe(&a_sub, &syn, fwd, lag, Rate::High, &mut post);
+            // §3.8/§3.9 formant + tilt + AGC back half. Concealment
+            // regenerates the excitation directly from the pitch replay
+            // / random innovation, so the §3.6 pitch post-filter (whose
+            // job is boosting SNR at pitch multiples of a *decoded*
+            // residual) is skipped on erased frames.
             let start = s * SUBFRAME_SIZE;
-            pcm[start..start + SUBFRAME_SIZE].copy_from_slice(&post);
+            if self.postfilter_enabled {
+                let mut post = [0.0f32; SUBFRAME_SIZE];
+                self.formant_postfilter_subframe(&a_sub, &syn, &mut post);
+                pcm[start..start + SUBFRAME_SIZE].copy_from_slice(&post);
+            } else {
+                pcm[start..start + SUBFRAME_SIZE].copy_from_slice(&syn);
+            }
 
             // Advance excitation history with the concealed excitation.
             self.exc_history.rotate_left(SUBFRAME_SIZE);
@@ -2320,13 +2215,22 @@ impl SynthesisState {
         let lags = [lag0, lag1, lag2, lag3];
 
         let prev_lsp_snapshot = self.prev_lsp;
-        let mut pcm_f = [0.0f32; FRAME_SIZE_SAMPLES];
+        let rate = match p.rate {
+            PackedRate::High => Rate::High,
+            PackedRate::Low => Rate::Low,
+        };
+
+        // --- Phase 1: whole-frame excitation decode (§3.4/§3.5 →
+        // 2.17/2.18). §3.6 requires "the whole frame excitation signal
+        // {e[n]}n=0..239 is generated and saved" before the pitch
+        // post-filter runs, so build all four subframes' e[n] first.
+        // The pre-frame excitation history is snapshotted for the pitch
+        // post-filter's backward reach.
+        let hist_snapshot = self.exc_history;
+        let mut exc_frame = [0.0f32; FRAME_SIZE_SAMPLES];
         let mut fcb_gains = [0.0f32; SUBFRAMES_PER_FRAME];
         let mut last_taps_sum = 0.0f32;
         for s in 0..SUBFRAMES_PER_FRAME {
-            let lsp_interp = interpolate_lsp(s, &self.prev_lsp, &lsp_q);
-            let a_sub = lsp_to_lpc(&lsp_interp);
-
             // §2.14: the 85-entry short-lag gain codebook rule keys off
             // the subframe pair's reference lag L0 / L2.
             let lag_base = if s < 2 { lags[0] } else { lags[2] };
@@ -2359,13 +2263,39 @@ impl SynthesisState {
                 }
             };
 
-            // §2.17 step 7: e[n] = u[n] + v[n]; then §3.7 LPC synthesis.
-            let mut exc = [0.0f32; SUBFRAME_SIZE];
+            // §2.17 step 7: e[n] = u[n] + v[n]. Kept LINEAR (no Word16
+            // saturation): the fixed-point description of §1.5 clamps
+            // every stored sample, but emulating that in a float model
+            // measurably *hurts* conformance tracking — clipping at
+            // approximate amplitudes injects nonlinear error where the
+            // unclamped signal stays a scaled replica of the reference
+            // (OVERD53 whole-file corr 0.97 linear vs 0.63 clamped).
+            let start = s * SUBFRAME_SIZE;
             for n in 0..SUBFRAME_SIZE {
-                exc[n] = u[n] + v[n];
+                exc_frame[start + n] = u[n] + v[n];
             }
+            self.exc_history.rotate_left(SUBFRAME_SIZE);
+            let tail = self.exc_history.len() - SUBFRAME_SIZE;
+            self.exc_history[tail..].copy_from_slice(&exc_frame[start..start + SUBFRAME_SIZE]);
+        }
+
+        // --- Phase 2 + 3: per-subframe §3.6 pitch post-filter on the
+        // excitation, then §3.7 LPC synthesis (eq. 48) on ppf[n].
+        let mut pcm_f = [0.0f32; FRAME_SIZE_SAMPLES];
+        for s in 0..SUBFRAMES_PER_FRAME {
+            let lsp_interp = interpolate_lsp(s, &self.prev_lsp, &lsp_q);
+            let a_sub = lsp_to_lpc(&lsp_interp);
+            let start = s * SUBFRAME_SIZE;
+            let ppf = if self.postfilter_enabled {
+                let ref_lag = if s < 2 { lags[0] } else { lags[2] };
+                Self::pitch_postfilter_exc(&hist_snapshot, &exc_frame, start, ref_lag, rate)
+            } else {
+                let mut sf = [0.0f32; SUBFRAME_SIZE];
+                sf.copy_from_slice(&exc_frame[start..start + SUBFRAME_SIZE]);
+                sf
+            };
             for i in 0..SUBFRAME_SIZE {
-                let mut y = exc[i];
+                let mut y = ppf[i];
                 for k in 0..LPC_ORDER {
                     y -= a_sub[k + 1] * self.syn_mem[k];
                 }
@@ -2373,11 +2303,8 @@ impl SynthesisState {
                     self.syn_mem[k] = self.syn_mem[k - 1];
                 }
                 self.syn_mem[0] = y;
-                pcm_f[s * SUBFRAME_SIZE + i] = y;
+                pcm_f[start + i] = y;
             }
-            self.exc_history.rotate_left(SUBFRAME_SIZE);
-            let tail = self.exc_history.len() - SUBFRAME_SIZE;
-            self.exc_history[tail..].copy_from_slice(&exc);
         }
 
         // Persist the decoded LSP for the next frame's interpolation and
@@ -2385,12 +2312,9 @@ impl SynthesisState {
         self.prev_lsp = lsp_q;
         self.prev_lsp_freq = spec_lsp::lsp_cosines_to_freq(&lsp_q);
 
-        // Post-filter chain + concealment bookkeeping.
-        let rate = match p.rate {
-            PackedRate::High => Rate::High,
-            PackedRate::Low => Rate::Low,
-        };
-        self.apply_post_filter(&prev_lsp_snapshot, &lsp_q, &lags, rate, &mut pcm_f);
+        // --- Phase 4: §3.8/§3.9 formant post-filter + gain scaling,
+        // then concealment bookkeeping.
+        self.apply_formant_postfilter(&prev_lsp_snapshot, &lsp_q, &mut pcm_f);
         self.record_last_frame_spec(&lags, last_taps_sum, &fcb_gains);
         self.record_pcm_history(&pcm_f);
         to_i16_frame(&pcm_f)
@@ -2464,44 +2388,34 @@ mod tests {
         p
     }
 
-    /// Test helper: run the post-filter on a single subframe with no
-    /// whole-frame forward LTP context (the subframe sits at frame offset 0
-    /// with no successor samples, so the §3.6 forward reach contributes
-    /// zero — exactly the per-subframe behaviour these tilt / AGC / LTP
-    /// unit tests intend to exercise).
+    /// Test helper: run the §3.8/§3.9 formant + tilt + AGC back half of
+    /// the post-filter on a single subframe (the §3.6 pitch post-filter
+    /// now runs upstream in the excitation domain).
     fn pf_sf(
         st: &mut SynthesisState,
         a: &[f32; LPC_ORDER + 1],
         syn: &[f32; SUBFRAME_SIZE],
-        lag: i32,
-        rate: Rate,
+        _lag: i32,
+        _rate: Rate,
         out: &mut [f32; SUBFRAME_SIZE],
     ) {
-        let mut raw = [0.0f32; FRAME_SIZE_SAMPLES];
-        raw[..SUBFRAME_SIZE].copy_from_slice(syn);
-        let fwd = ForwardCtx {
-            raw_frame: &raw,
-            sf_start: 0,
-        };
-        st.post_filter_subframe(a, syn, fwd, lag, rate, out);
+        st.formant_postfilter_subframe(a, syn, out);
     }
 
-    /// Test helper: run only the §3.6 pitch postfilter on a single subframe
-    /// with no whole-frame forward context (forward reach past sample 60 →
-    /// zero), for the LTP-specific unit tests.
+    /// Test helper: run the §3.6 excitation-domain pitch postfilter on a
+    /// single subframe presented at frame offset 0 with an all-zero
+    /// pre-frame history and no successor samples (so the forward reach
+    /// is unavailable and the backward reach sees silence, unless the
+    /// caller supplies history).
     fn ltp_sf(
-        st: &SynthesisState,
-        syn: &[f32; SUBFRAME_SIZE],
+        hist: &[f32],
+        exc: &[f32; SUBFRAME_SIZE],
         lag: i32,
         rate: Rate,
     ) -> [f32; SUBFRAME_SIZE] {
-        let mut raw = [0.0f32; FRAME_SIZE_SAMPLES];
-        raw[..SUBFRAME_SIZE].copy_from_slice(syn);
-        let fwd = ForwardCtx {
-            raw_frame: &raw,
-            sf_start: 0,
-        };
-        st.ltp_post_filter_subframe(syn, fwd, lag, rate)
+        let mut frame = [0.0f32; FRAME_SIZE_SAMPLES];
+        frame[..SUBFRAME_SIZE].copy_from_slice(exc);
+        SynthesisState::pitch_postfilter_exc(hist, &frame, 0, lag, rate)
     }
 
     fn audio_frame(samples: &[i16]) -> Frame {
@@ -3305,9 +3219,9 @@ mod tests {
     /// to the input (g_p would otherwise divide by ~0 energy).
     #[test]
     fn ltp_postfilter_passes_silence_through_unchanged() {
-        let st = SynthesisState::new();
+        let hist = [0.0f32; PITCH_MAX + SUBFRAME_SIZE];
         let syn = [0.0f32; SUBFRAME_SIZE];
-        let out = ltp_sf(&st, &syn, 40, Rate::High);
+        let out = ltp_sf(&hist, &syn, 40, Rate::High);
         for &v in out.iter() {
             assert_eq!(v, 0.0);
         }
@@ -3320,7 +3234,6 @@ mod tests {
     /// output equals the input bit-for-bit.
     #[test]
     fn ltp_postfilter_gates_off_on_white_signal() {
-        let mut st = SynthesisState::new();
         let mut lcg: u32 = 0x1234_5678;
         let mut syn = [0.0f32; SUBFRAME_SIZE];
         for s in syn.iter_mut() {
@@ -3328,10 +3241,8 @@ mod tests {
             *s = ((lcg >> 8) & 0xFFFF) as f32 / 32_768.0 - 1.0;
         }
         // Empty history so the backward search starts from "silence".
-        for h in st.pf_syn_hist.iter_mut() {
-            *h = 0.0;
-        }
-        let out = ltp_sf(&st, &syn, 40, Rate::High);
+        let hist = [0.0f32; PITCH_MAX + SUBFRAME_SIZE];
+        let out = ltp_sf(&hist, &syn, 40, Rate::High);
         // Predominantly bypass — within a few percent or below the gate.
         let mut max_delta = 0.0f32;
         for n in 0..SUBFRAME_SIZE {
@@ -3356,20 +3267,19 @@ mod tests {
     /// degeneracy and see the LTP comb-filter actually act.
     #[test]
     fn ltp_postfilter_engages_on_periodic_signal() {
-        let mut st = SynthesisState::new();
         let period: i32 = 40;
         let two_pi = 2.0f32 * std::f32::consts::PI;
-        // Two-frame history with the same period but a slowly
-        // increasing envelope so the back-reference amplitude is
-        // smaller than the current subframe — this breaks the
-        // (g_p · (1 + γ) = 1) degeneracy.
-        let total_len = st.pf_syn_hist.len() + SUBFRAME_SIZE;
+        // History with the same period but a slowly increasing envelope
+        // so the back-reference amplitude is smaller than the current
+        // subframe — this breaks the (g_p · (1 + γ) = 1) degeneracy.
+        let mut hist = [0.0f32; PITCH_MAX + SUBFRAME_SIZE];
+        let total_len = hist.len() + SUBFRAME_SIZE;
         let env = |i: usize| -> f32 { 0.2 + 0.6 * (i as f32) / (total_len as f32) };
-        for (i, h) in st.pf_syn_hist.iter_mut().enumerate() {
+        for (i, h) in hist.iter_mut().enumerate() {
             let phase = two_pi * (i as f32) / period as f32;
             *h = phase.sin() * env(i);
         }
-        let start_idx = st.pf_syn_hist.len();
+        let start_idx = hist.len();
         let mut syn = [0.0f32; SUBFRAME_SIZE];
         for (n, s) in syn.iter_mut().enumerate() {
             let i = start_idx + n;
@@ -3377,7 +3287,7 @@ mod tests {
             *s = phase.sin() * env(i);
         }
         let in_e: f32 = syn.iter().map(|v| v * v).sum();
-        let out_high = ltp_sf(&st, &syn, period, Rate::High);
+        let out_high = ltp_sf(&hist, &syn, period, Rate::High);
         let out_high_e: f32 = out_high.iter().map(|v| v * v).sum();
         // g_p ≤ 1 normalises *total energy*, not per-sample peak — the
         // LTP comb-filter can locally push one sample up while pulling
@@ -3405,12 +3315,7 @@ mod tests {
         // heavily than high-rate γ_ltp = 0.1875, so the low-rate
         // output should deviate more from the input than the high-rate
         // output on the same input — confirms the rate threading.
-        let mut st2 = SynthesisState::new();
-        for (i, h) in st2.pf_syn_hist.iter_mut().enumerate() {
-            let phase = two_pi * (i as f32) / period as f32;
-            *h = phase.sin() * env(i);
-        }
-        let out_low = ltp_sf(&st2, &syn, period, Rate::Low);
+        let out_low = ltp_sf(&hist, &syn, period, Rate::Low);
         let mut delta_low = 0.0f32;
         for n in 0..SUBFRAME_SIZE {
             delta_low += (out_low[n] - syn[n]).powi(2);
@@ -3426,111 +3331,101 @@ mod tests {
         );
     }
 
-    /// Forward-lag search must lock onto the actual peak of a periodic
-    /// signal, reading across the subframe boundary into the whole-frame
-    /// synthesis buffer (§3.6 / trace §8) — for `M_f` near the period the
-    /// forward read at the subframe tail lands in the *next* subframe.
+    /// §3.6 forward reach: the pitch post-filter needs the whole-frame
+    /// excitation because `e[n + M_f]` for an early subframe lands in a
+    /// later one. A periodic excitation whose continuation lives only in
+    /// the successor subframes must engage the post-filter on subframe 0
+    /// — and zeroing that continuation (making the forward reach see a
+    /// broken pattern, with silent history killing the backward side)
+    /// must change the output.
     #[test]
-    fn ltp_forward_search_locks_on_period() {
-        let st = SynthesisState::new();
-        let period: i32 = 40;
-        let two_pi = 2.0f32 * std::f32::consts::PI;
-        // Whole-frame sinusoid so the forward reach past sample 60 reads a
-        // consistent continuation rather than zeros.
-        let mut raw = [0.0f32; FRAME_SIZE_SAMPLES];
-        for (n, s) in raw.iter_mut().enumerate() {
-            *s = (two_pi * (n as f32) / period as f32).sin();
-        }
-        let mut syn = [0.0f32; SUBFRAME_SIZE];
-        syn.copy_from_slice(&raw[..SUBFRAME_SIZE]);
-        // Search a window straddling the true period, starting at frame
-        // offset 0 (the first subframe).
-        let fwd = ForwardCtx {
-            raw_frame: &raw,
-            sf_start: 0,
-        };
-        let (best_m, c, d) = st.ltp_search_forward(&syn, fwd, 37, 43);
-        assert_eq!(best_m, 40, "forward search should pick the exact period 40");
-        assert!(c > 0.0);
-        assert!(d > 0.0);
-    }
-
-    /// The whole-frame forward reach (§3.6 / trace §8) must actually read
-    /// the successor subframe: a subframe whose tail samples differ only in
-    /// the *next* subframe of `raw_frame` must produce a different forward
-    /// correlation than the old window-shrinkage (zero past sample 60)
-    /// would. We compare a frame whose successor continues the pattern
-    /// against one whose successor is zeroed; with `M_f` large enough that
-    /// `n + M_f >= 60` for some `n`, the two must differ.
-    #[test]
-    fn ltp_forward_reach_reads_next_subframe() {
-        let st = SynthesisState::new();
+    fn pitch_postfilter_forward_reach_reads_later_subframes() {
+        let hist = [0.0f32; PITCH_MAX + SUBFRAME_SIZE];
         let two_pi = 2.0f32 * std::f32::consts::PI;
         let period = 40.0f32;
-        let mut syn = [0.0f32; SUBFRAME_SIZE];
-        for (n, s) in syn.iter_mut().enumerate() {
-            *s = (two_pi * (n as f32) / period).sin();
+        let mut frame_full = [0.0f32; FRAME_SIZE_SAMPLES];
+        for (n, s) in frame_full.iter_mut().enumerate() {
+            *s = (two_pi * (n as f32) / period).sin() * 0.4;
         }
+        let mut frame_trunc = [0.0f32; FRAME_SIZE_SAMPLES];
+        frame_trunc[..SUBFRAME_SIZE].copy_from_slice(&frame_full[..SUBFRAME_SIZE]);
 
-        // Continuation present in the second subframe.
-        let mut raw_full = [0.0f32; FRAME_SIZE_SAMPLES];
-        for (n, s) in raw_full.iter_mut().enumerate() {
-            *s = (two_pi * (n as f32) / period).sin();
+        let out_full = SynthesisState::pitch_postfilter_exc(&hist, &frame_full, 0, 40, Rate::High);
+        let out_trunc =
+            SynthesisState::pitch_postfilter_exc(&hist, &frame_trunc, 0, 40, Rate::High);
+        let mut diff = 0.0f32;
+        for n in 0..SUBFRAME_SIZE {
+            diff += (out_full[n] - out_trunc[n]).abs();
         }
-        // Successor zeroed (old window-shrinkage equivalent).
-        let mut raw_trunc = [0.0f32; FRAME_SIZE_SAMPLES];
-        raw_trunc[..SUBFRAME_SIZE].copy_from_slice(&syn);
-
-        // M_f = 38..42 forces n + M_f >= 60 for the tail samples.
-        let fwd_full = ForwardCtx {
-            raw_frame: &raw_full,
-            sf_start: 0,
-        };
-        let fwd_trunc = ForwardCtx {
-            raw_frame: &raw_trunc,
-            sf_start: 0,
-        };
-        let (_, c_full, d_full) = st.ltp_search_forward(&syn, fwd_full, 38, 42);
-        let (_, c_trunc, d_trunc) = st.ltp_search_forward(&syn, fwd_trunc, 38, 42);
         assert!(
-            (c_full - c_trunc).abs() > 1e-3 || (d_full - d_trunc).abs() > 1e-3,
-            "whole-frame forward reach must read the successor subframe \
-             (c_full={c_full}, c_trunc={c_trunc}, d_full={d_full}, d_trunc={d_trunc})"
+            diff > 1e-3,
+            "forward reach must read the successor subframes (diff={diff})"
         );
     }
 
-    /// Backward-lag search uses pf_syn_hist when n − M_b is negative;
-    /// when the history holds a sinusoid at the same period, the
-    /// search should still find that period.
+    /// §3.6: "if for some n ∈ [0..59] there is no sample value e[n + Mf]
+    /// available, then the corresponding weight and delay are set to 0"
+    /// — for the LAST subframe every M_f > 0 reaches past the frame end,
+    /// so only the backward side may engage; with white (uncorrelated)
+    /// content, silent history and a silent preceding subframe, the
+    /// backward gate fails too and the post-filter must pass the
+    /// subframe through unchanged.
     #[test]
-    fn ltp_backward_search_uses_history() {
-        let mut st = SynthesisState::new();
+    fn pitch_postfilter_last_subframe_has_no_forward_side() {
+        let hist = [0.0f32; PITCH_MAX + SUBFRAME_SIZE];
+        let mut frame = [0.0f32; FRAME_SIZE_SAMPLES];
+        // White content only in the final subframe: the backward reach
+        // at M_b ∈ [37, 43] sees zeros (subframe 2) or uncorrelated
+        // noise, so neither side clears the 1.25 dB gate.
+        let mut lcg: u32 = 0xCAFE_F00D;
+        for n in 3 * SUBFRAME_SIZE..FRAME_SIZE_SAMPLES {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            frame[n] = (((lcg >> 8) & 0xFFFF) as f32 / 32_768.0 - 1.0) * 0.4;
+        }
+        let out = SynthesisState::pitch_postfilter_exc(&hist, &frame, 180, 40, Rate::High);
+        for n in 0..SUBFRAME_SIZE {
+            assert_eq!(
+                out[n],
+                frame[180 + n],
+                "last subframe: no forward side and no backward structure ⇒ pass-through"
+            );
+        }
+    }
+
+    /// §3.6 backward reach: when the pre-frame excitation history holds
+    /// a sinusoid at the subframe's period, the backward side engages
+    /// and the post-filter output differs from the input.
+    #[test]
+    fn pitch_postfilter_backward_side_uses_history() {
         let period: i32 = 36;
         let two_pi = 2.0f32 * std::f32::consts::PI;
-        for (i, h) in st.pf_syn_hist.iter_mut().enumerate() {
-            *h = (two_pi * (i as f32) / period as f32).sin();
+        let mut hist = [0.0f32; PITCH_MAX + SUBFRAME_SIZE];
+        let hlen = hist.len();
+        for (i, h) in hist.iter_mut().enumerate() {
+            // Phase continuous with the frame below: history sample i sits
+            // at global index i − hlen.
+            let g = i as f32 - hlen as f32;
+            *h = (two_pi * g / period as f32).sin() * 0.3;
         }
-        let start_phase = st.pf_syn_hist.len() as f32;
-        let mut syn = [0.0f32; SUBFRAME_SIZE];
-        for (n, s) in syn.iter_mut().enumerate() {
-            *s = (two_pi * (start_phase + n as f32) / period as f32).sin();
+        let mut frame = [0.0f32; FRAME_SIZE_SAMPLES];
+        for (n, s) in frame.iter_mut().enumerate().take(SUBFRAME_SIZE) {
+            *s = (two_pi * (n as f32) / period as f32).sin() * 0.4;
         }
-        let (best_m, c, _) = st.ltp_search_backward(&syn, 33, 39);
-        assert_eq!(
-            best_m, 36,
-            "backward search should pick the exact period 36"
+        let out = SynthesisState::pitch_postfilter_exc(&hist, &frame, 0, period, Rate::High);
+        let mut diff = 0.0f32;
+        for n in 0..SUBFRAME_SIZE {
+            diff += (out[n] - frame[n]).abs();
+        }
+        assert!(
+            diff > 1e-3,
+            "backward side must engage on periodic history (diff={diff})"
         );
-        assert!(c > 0.0);
     }
 
-    /// `apply_post_filter` must respect §3.6 reference-lag rule: L_0
-    /// drives subframes 0 + 1 and L_2 drives subframes 2 + 3 (never
-    /// the per-subframe delta-decoded lags).  We exercise this
-    /// indirectly by confirming that the chain runs without panicking
-    /// on a four-subframe input whose lag pattern would otherwise be
-    /// ambiguous.
+    /// The formant post-filter chain must stay finite on a typical
+    /// voiced frame.
     #[test]
-    fn apply_post_filter_does_not_panic_on_typical_lags() {
+    fn apply_formant_postfilter_stays_finite() {
         let mut st = SynthesisState::new();
         let lsp_q = st.prev_lsp;
         let prev_lsp = st.prev_lsp;
@@ -3539,8 +3434,7 @@ mod tests {
         for (n, s) in pcm.iter_mut().enumerate() {
             *s = (two_pi * (n as f32) / 50.0).sin() * 0.3;
         }
-        let lags = [50, 51, 48, 49];
-        st.apply_post_filter(&prev_lsp, &lsp_q, &lags, Rate::High, &mut pcm);
+        st.apply_formant_postfilter(&prev_lsp, &lsp_q, &mut pcm);
         for v in pcm.iter() {
             assert!(v.is_finite());
         }
@@ -3573,17 +3467,15 @@ mod tests {
             // Shift each omega by +0.15 rad → a distinct but ordered LSP.
             prev[k] = ((k as f32 + 1.0) * step + 0.15).min(3.05).cos();
         }
-        let lags = [50, 51, 48, 49];
-
         // Run A: postfilter with the true previous-frame LSP.
         let mut st_a = SynthesisState::new();
         let mut pcm_a = make_pcm();
-        st_a.apply_post_filter(&prev, &cur, &lags, Rate::High, &mut pcm_a);
+        st_a.apply_formant_postfilter(&prev, &cur, &mut pcm_a);
 
         // Run B: postfilter with prev == cur (the old degenerate path).
         let mut st_b = SynthesisState::new();
         let mut pcm_b = make_pcm();
-        st_b.apply_post_filter(&cur, &cur, &lags, Rate::High, &mut pcm_b);
+        st_b.apply_formant_postfilter(&cur, &cur, &mut pcm_b);
 
         // Subframe 0 (weight 0.75 on prev) must differ when prev != cur.
         let sub0_diff: f32 = (0..SUBFRAME_SIZE)

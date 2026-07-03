@@ -70,8 +70,8 @@ pub mod bitreader;
 pub mod encoder;
 pub mod header;
 pub mod linepack;
-pub(crate) mod spec_exc;
-pub(crate) mod spec_lsp;
+pub mod spec_exc;
+pub mod spec_lsp;
 pub mod spec_tables;
 pub mod tables;
 
@@ -198,11 +198,22 @@ impl Decoder for G7231Decoder {
 
         let frame = match frame_type {
             FrameType::HighRate => {
-                let pcm = self.synthesis.decode_mpmlq(&packet.data)?;
+                // A size-valid frame whose *content* fails validation
+                // (e.g. an out-of-range pulse-position code from
+                // transmission errors — the PATHD63P conformance vector
+                // carries three such frames) is concealed like an
+                // erasure (§3.10) instead of killing the stream.
+                let pcm = self
+                    .synthesis
+                    .decode_mpmlq(&packet.data)
+                    .unwrap_or_else(|_| self.synthesis.decode_erased());
                 self.audio_frame_from_pcm(&pcm, pts)
             }
             FrameType::LowRate => {
-                let pcm = self.synthesis.decode_acelp(&packet.data)?;
+                let pcm = self
+                    .synthesis
+                    .decode_acelp(&packet.data)
+                    .unwrap_or_else(|_| self.synthesis.decode_erased());
                 self.audio_frame_from_pcm(&pcm, pts)
             }
             FrameType::SidFrame | FrameType::Untransmitted => {

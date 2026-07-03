@@ -530,10 +530,13 @@ fn spec_decoder_switches_rates_mid_stream() {
 }
 
 /// Free-form bytes with a legal discriminator + length must never
-/// panic: they either decode (in-range fields) or are rejected with an
-/// `Err` (e.g. out-of-range MSBPOS words / combinatorial codes).
+/// panic: in-range fields decode normally and content-invalid frames
+/// (out-of-range MSBPOS words / combinatorial codes — the shape of the
+/// transmission-error frames in the ITU `PATHD63P` conformance vector)
+/// are concealed like erasures (§3.10), so `send_packet` accepts every
+/// size-valid frame and always yields a 240-sample audio frame.
 #[test]
-fn spec_decoder_rejects_or_decodes_random_bytes_without_panic() {
+fn spec_decoder_conceals_or_decodes_random_bytes_without_panic() {
     let mut state = 0xdead_beef_1234_5678u64;
     let mut next_byte = move || -> u8 {
         state = state
@@ -542,24 +545,15 @@ fn spec_decoder_rejects_or_decodes_random_bytes_without_panic() {
         (state >> 33) as u8
     };
     let mut dec = make_decoder();
-    let mut decoded = 0usize;
-    let mut rejected = 0usize;
     for i in 0..2000 {
         let (first_bits, len) = if i % 2 == 0 { (0b00, 24) } else { (0b01, 20) };
         let mut data: Vec<u8> = (0..len).map(|_| next_byte()).collect();
         data[0] = (data[0] & !0b11) | first_bits;
-        match dec.send_packet(&packet(data)) {
-            Ok(()) => {
-                decoded += 1;
-                let _ = dec.receive_frame().unwrap();
-            }
-            Err(_) => rejected += 1,
-        }
+        dec.send_packet(&packet(data))
+            .expect("size-valid frames must decode or conceal, never error");
+        let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+            panic!("expected audio frame");
+        };
+        assert_eq!(af.samples, FRAME_SAMPLES as u32);
     }
-    // Random high-rate bodies frequently trip the MSBPOS /
-    // combinatorial range checks; low-rate bodies always decode. Both
-    // outcomes must occur — that proves the validation path and the
-    // decode path are both being exercised.
-    assert!(decoded > 0, "no random frame decoded");
-    assert!(rejected > 0, "no random frame was rejected");
 }
