@@ -60,7 +60,6 @@ use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, MediaType, Packet, Result, SampleFormat, TimeBase,
 };
 
-use crate::bitreader::BitReader;
 use crate::linepack::{PackedRate, SpecFrameParams};
 use crate::spec_exc;
 use crate::spec_lsp;
@@ -361,16 +360,15 @@ impl G7231Encoder {
     fn emit_frame(&mut self, pcm: &[i16; FRAME_SIZE_SAMPLES]) {
         let frame_idx = self.frame_index;
         self.frame_index += 1;
-        let packed = match self.mode {
-            EncoderMode::Acelp => {
-                let fields = self.analysis.analyse_acelp(pcm);
-                pack_acelp_frame(&fields)
-            }
-            EncoderMode::MpMlq => {
-                let fields = self.analysis.analyse_mpmlq(pcm);
-                pack_mpmlq_frame(&fields)
-            }
+        let rate = match self.mode {
+            EncoderMode::Acelp => PackedRate::Low,
+            EncoderMode::MpMlq => PackedRate::High,
         };
+        let params = self.analysis.analyse_spec(pcm, rate);
+        // `analyse_spec` emits in-range indices by construction, so the
+        // clause-4 packer cannot reject them.
+        let packed = crate::linepack::pack_frame(&params)
+            .expect("analyse_spec emits in-range clause-4 parameters");
         let mut pkt = Packet::new(0, self.time_base, packed);
         pkt.pts = Some(frame_idx as i64 * FRAME_SIZE_SAMPLES as i64);
         pkt.dts = pkt.pts;
@@ -3321,148 +3319,41 @@ impl SynthesisState {
         (best_gain_db > ERASURE_VOICED_THRESHOLD_DB, best_lag)
     }
 
-    /// Decode one ACELP (5.3 kbit/s) frame into 240 PCM samples.
+    /// Decode one ACELP (5.3 kbit/s) clause-4 frame into 240 PCM
+    /// samples: Table 6 unpack ([`crate::linepack`]) followed by the
+    /// spec-table §3.1 pipeline ([`Self::decode_spec_params`]).
     pub fn decode_acelp(&mut self, payload: &[u8]) -> Result<[i16; FRAME_SIZE_SAMPLES]> {
         if payload.len() < ACELP_PAYLOAD_BYTES {
             return Err(Error::invalid(
                 "G.723.1 decoder: ACELP payload smaller than 20 bytes",
             ));
         }
-        let mut br = BitReader::new(&payload[..ACELP_PAYLOAD_BYTES]);
-        let rate = br.read_u32(2)?;
-        if rate != 0b01 {
-            return Err(Error::invalid(format!(
-                "G.723.1 decoder: expected RATE=01 (ACELP), got {rate:02b}"
-            )));
+        let params = crate::linepack::unpack_frame(&payload[..ACELP_PAYLOAD_BYTES])?;
+        if params.rate != PackedRate::Low {
+            return Err(Error::invalid(
+                "G.723.1 decoder: expected RATEFLAG=1 (5.3 kbit/s ACELP)",
+            ));
         }
-        let lsp_idx = [br.read_u32(8)?, br.read_u32(8)?, br.read_u32(8)?];
-        let lsp_q = dequantise_lsp(&lsp_idx);
-        let acl0 = br.read_u32(7)?;
-        let acl1 = br.read_u32(2)?;
-        let acl2 = br.read_u32(7)?;
-        let acl3 = br.read_u32(2)?;
-        let mut gain = [0u32; SUBFRAMES_PER_FRAME];
-        for s in 0..SUBFRAMES_PER_FRAME {
-            gain[s] = br.read_u32(12)?;
-        }
-        let mut grid = [0u8; SUBFRAMES_PER_FRAME];
-        for s in 0..SUBFRAMES_PER_FRAME {
-            grid[s] = br.read_u32(1)? as u8;
-        }
-        let mut fcb = [0u32; SUBFRAMES_PER_FRAME];
-        for s in 0..SUBFRAMES_PER_FRAME {
-            fcb[s] = br.read_u32(16)?;
-        }
-
-        let lag0 = decode_abs_lag(acl0);
-        let lag1 = decode_delta_lag(acl1, lag0);
-        let lag2 = decode_abs_lag(acl2);
-        let lag3 = decode_delta_lag(acl3, lag2);
-        let lags = [lag0, lag1, lag2, lag3];
-
-        let mut pulses_per_subframe = [[0.0f32; SUBFRAME_SIZE]; SUBFRAMES_PER_FRAME];
-        for s in 0..SUBFRAMES_PER_FRAME {
-            let (positions, signs) = unpack_fcb_bits(fcb[s]);
-            place_pulses(&positions, signs, grid[s], &mut pulses_per_subframe[s]);
-        }
-
-        // Capture the previous frame's LSP before synthesise() advances
-        // self.prev_lsp to lsp_q, so the postfilter can reproduce the same
-        // §2.7 per-subframe interpolated formant filter the synthesis used.
-        let prev_lsp_snapshot = self.prev_lsp;
-        let mut pcm_f = [0.0f32; FRAME_SIZE_SAMPLES];
-        self.synthesise(
-            &lsp_q,
-            &lags,
-            &grid,
-            &gain,
-            &pulses_per_subframe,
-            &mut pcm_f,
-        );
-        // Post-filter chain: pitch + formant + tilt + AGC. Updates the
-        // `pf_*` post-filter memories; leaves `synthesise`'s state (exc
-        // history / syn_mem / prev_lsp) alone so the encoder's shadow
-        // synth sees the unmodified signal.  ACELP uses γ_ltp = 0.25 in
-        // the pitch postfilter (G.723.1 §3.6).
-        self.apply_post_filter(&prev_lsp_snapshot, &lsp_q, &lags, Rate::Low, &mut pcm_f);
-        self.record_last_frame(&lags, &gain);
-        self.record_pcm_history(&pcm_f);
-        Ok(to_i16_frame(&pcm_f))
+        Ok(self.decode_spec_params(&params))
     }
 
-    /// Decode one MP-MLQ (6.3 kbit/s) frame into 240 PCM samples.
+    /// Decode one MP-MLQ (6.3 kbit/s) clause-4 frame into 240 PCM
+    /// samples: Table 5 unpack ([`crate::linepack`], including the
+    /// 13-bit MSBPOS split) followed by the spec-table §3.1 pipeline
+    /// ([`Self::decode_spec_params`]).
     pub fn decode_mpmlq(&mut self, payload: &[u8]) -> Result<[i16; FRAME_SIZE_SAMPLES]> {
         if payload.len() < MPMLQ_PAYLOAD_BYTES {
             return Err(Error::invalid(
                 "G.723.1 decoder: MP-MLQ payload smaller than 24 bytes",
             ));
         }
-        let mut br = BitReader::new(&payload[..MPMLQ_PAYLOAD_BYTES]);
-        let rate = br.read_u32(2)?;
-        if rate != 0b00 {
-            return Err(Error::invalid(format!(
-                "G.723.1 decoder: expected RATE=00 (MP-MLQ), got {rate:02b}"
-            )));
+        let params = crate::linepack::unpack_frame(&payload[..MPMLQ_PAYLOAD_BYTES])?;
+        if params.rate != PackedRate::High {
+            return Err(Error::invalid(
+                "G.723.1 decoder: expected RATEFLAG=0 (6.3 kbit/s MP-MLQ)",
+            ));
         }
-        let lsp_idx = [br.read_u32(8)?, br.read_u32(8)?, br.read_u32(8)?];
-        let lsp_q = dequantise_lsp(&lsp_idx);
-        let acl0 = br.read_u32(7)?;
-        let acl1 = br.read_u32(2)?;
-        let acl2 = br.read_u32(7)?;
-        let acl3 = br.read_u32(2)?;
-        let mut gain = [0u32; SUBFRAMES_PER_FRAME];
-        for s in 0..SUBFRAMES_PER_FRAME {
-            gain[s] = br.read_u32(12)?;
-        }
-        let mut grid = [0u8; SUBFRAMES_PER_FRAME];
-        for s in 0..SUBFRAMES_PER_FRAME {
-            grid[s] = br.read_u32(1)? as u8;
-        }
-        let mut pulses_per_subframe = [[0.0f32; SUBFRAME_SIZE]; SUBFRAMES_PER_FRAME];
-        for s in 0..SUBFRAMES_PER_FRAME {
-            let n = if s % 2 == 0 {
-                MPMLQ_PULSES_ODD
-            } else {
-                MPMLQ_PULSES_EVEN
-            };
-            let bits = (n as u32) * (MPMLQ_POS_BITS + MPMLQ_SIGN_BITS);
-            let v = br.read_u32(bits)?;
-            let mp = unpack_mpmlq_pulses(v, n);
-            mpmlq_place_pulses(
-                &mp.positions,
-                &mp.signs,
-                n,
-                grid[s],
-                &mut pulses_per_subframe[s],
-            );
-        }
-        let _rsvd = br.read_u32(8)?;
-
-        let lag0 = decode_abs_lag(acl0);
-        let lag1 = decode_delta_lag(acl1, lag0);
-        let lag2 = decode_abs_lag(acl2);
-        let lag3 = decode_delta_lag(acl3, lag2);
-        let lags = [lag0, lag1, lag2, lag3];
-
-        // Capture the previous frame's LSP before synthesise() advances
-        // self.prev_lsp to lsp_q (see decode_acelp for the rationale).
-        let prev_lsp_snapshot = self.prev_lsp;
-        let mut pcm_f = [0.0f32; FRAME_SIZE_SAMPLES];
-        self.synthesise(
-            &lsp_q,
-            &lags,
-            &grid,
-            &gain,
-            &pulses_per_subframe,
-            &mut pcm_f,
-        );
-        // Same post-filter pipeline as ACELP (pitch + formant + tilt +
-        // AGC).  MP-MLQ uses γ_ltp = 0.1875 in the pitch postfilter
-        // (G.723.1 §3.6).
-        self.apply_post_filter(&prev_lsp_snapshot, &lsp_q, &lags, Rate::High, &mut pcm_f);
-        self.record_last_frame(&lags, &gain);
-        self.record_pcm_history(&pcm_f);
-        Ok(to_i16_frame(&pcm_f))
+        Ok(self.decode_spec_params(&params))
     }
 
     /// Decode one clause-4 spec-layout parameter set (either rate) into

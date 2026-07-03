@@ -1,19 +1,18 @@
 //! G.723.1 encoder -> decoder round-trip at both dual rates.
 //!
-//! Two kinds of round-trip are exercised here:
+//! The wire format is the ITU-T clause-4 spec layout (Table 5 / Table 6
+//! octet maps over the published quantiser tables). Two kinds of
+//! round-trip are exercised here:
 //!
-//!   1. Encoder -> `decode_{acelp,mpmlq}_local` — the encoder's sister
-//!      reference decoder, which inverts the *same* simplified VQ tables
-//!      the encoder uses. This confirms both bit-packing layouts are
-//!      self-consistent and that the analysis pipeline produces
-//!      non-trivial excitation for speech-like input.
+//!   1. Encoder -> `decode_{acelp,mpmlq}_local` — stateless per-frame
+//!      decode of the same clause-4 frames, confirming the packing is
+//!      self-consistent and the analysis produces non-trivial
+//!      excitation for speech-like input.
 //!
-//!   2. Encoder -> the registered framework decoder. The shipped decoder
-//!      is today a silence-emitting scaffold that validates framing and
-//!      emits 30 ms of zeros per packet (see the crate docstring). This
-//!      end-to-end path is still worth exercising: it pins down the
-//!      framing contract (rate discriminator, payload lengths, PTS) that
-//!      any future full decoder must satisfy.
+//!   2. Encoder -> the registered framework decoder — the full stateful
+//!      §3.1 synthesis + postfilter pipeline, plus the framing contract
+//!      (rate discriminator, payload lengths, PTS) and the §3.10
+//!      erasure-concealment behaviour.
 
 use oxideav_core::packet::PacketFlags;
 use oxideav_core::{
@@ -341,16 +340,17 @@ fn pts_rises_monotonically_for_both_rates() {
 }
 
 /// Full encode → framework-decoder round-trip, both rates, two seconds
-/// of voiced synthetic input, PSNR asserted above 15 dB per rate.
+/// of voiced synthetic input, decoding spec-layout clause-4 frames.
 ///
-/// Observed on a representative run (x86_64, release):
+/// Observed on a representative run (aarch64, release) with the
+/// spec-table wire format:
 ///
-/// - 5.3 kbit/s ACELP:  PSNR = 19–20 dB
-/// - 6.3 kbit/s MP-MLQ: PSNR = 22–23 dB
+/// - 5.3 kbit/s ACELP:  PSNR ≈ 23.9 dB (signal SNR ≈ 12.0 dB)
+/// - 6.3 kbit/s MP-MLQ: PSNR ≈ 26.4 dB (signal SNR ≈ 14.4 dB)
 ///
-/// The 15 dB floor leaves room for small DSP rounding drift across
-/// platforms while still catching any regression that would send the
-/// reconstruction back to the pre-fix ~5 dB level.
+/// The floors leave several dB of cross-platform float headroom while
+/// still catching any regression that would send the reconstruction
+/// back toward a broken (~5 dB) level.
 #[test]
 fn roundtrip_two_seconds_voiced_psnr_both_rates() {
     // 2 s @ 8 kHz = 16000 samples = 66.7 frames → use 66 frames of 240.
@@ -358,11 +358,10 @@ fn roundtrip_two_seconds_voiced_psnr_both_rates() {
     let input = voiced(FRAMES);
 
     // Per-rate PSNR floors: ACELP has 4 pulses per subframe (vs 5-6 for
-    // MP-MLQ) so it reconstructs less faithfully — 16 dB leaves ~2 dB of
-    // cross-platform rounding headroom above the measured ~18 dB floor.
-    // MP-MLQ steadily sits above 21 dB; 19 dB here is a catch-all for
-    // cross-platform float drift.
-    for (bit_rate, floor_db, label) in [(5300u64, 16.0, "ACELP"), (6300u64, 19.0, "MP-MLQ")] {
+    // MP-MLQ) so it reconstructs less faithfully. Floors sit ~4 dB under
+    // the measured release figures (23.9 / 26.4 dB) as cross-platform
+    // float headroom.
+    for (bit_rate, floor_db, label) in [(5300u64, 20.0, "ACELP"), (6300u64, 22.0, "MP-MLQ")] {
         let mut enc = make_encoder(Some(bit_rate));
         enc.send_frame(&audio_frame(&input)).unwrap();
         enc.flush().unwrap();

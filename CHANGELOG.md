@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **the wire format is now the ITU-T clause-4 spec layout** at both
+  rates: `emit_frame` routes through `analyse_spec` + the Table 5/6
+  packer, and `decode_acelp` / `decode_mpmlq` unpack clause-4 frames
+  and run the spec-table §3.1 pipeline. Frames now carry the published
+  quantiser indices (24-bit §2.5 split-VQ LSP word, eq. 37/38 lag
+  indices, eq. 36/39/40 combined 12-bit gain words over the published
+  85/170-row tap codebooks + 24-level gain table, `C(30,M)`
+  combinatorial MP-MLQ positions with the 13-bit MSBPOS word, Table 1
+  ACELP position words) in the exact Table 5/6 octet layout. Public
+  signatures (`make_encoder`, `Decoder`, `decode_*_local`) are
+  unchanged; the frame sizes and the 2-bit discriminator convention
+  were already spec-true. Round-trip quality *improves* on the 2 s
+  voiced integration signal (release): ACELP 23.9 dB PSNR (was
+  ~19–20), MP-MLQ 26.4 dB (was ~22–23); integration floors raised
+  16 → 20 dB and 19 → 22 dB. Streams produced by earlier releases of
+  this crate (the interim clean-room layout) no longer decode — that
+  layout was explicitly documented as non-interoperable.
 - spec-layout encoder analysis: `AnalysisState::analyse_spec` produces
   a clause-4 `SpecFrameParams` set through the §2 pipeline on the
   published tables. LSP: §2.5 predictive split VQ. Pitch (§2.14):
