@@ -28,74 +28,81 @@ oxideav-g7231 = "0.0"
 
 ## What is implemented
 
+The wire format is the **ITU-T clause-4 spec layout** at both rates:
+Table 5 (high rate, 24 octets) / Table 6 (low rate, 20 octets) octet
+maps carrying the published quantiser indices.
+
 ### Encoder (both rates)
 
 Full LPC → LSP → open-loop pitch → closed-loop adaptive-codebook →
-rate-specific fixed-codebook → joint gain quantisation pipeline,
-packed into the correct 20- or 24-byte frame with the right
-discriminator. Default rate (no `bit_rate` hint) is 6.3 kbit/s MP-MLQ;
-request `Some(5300)` to get ACELP.
+rate-specific fixed-codebook → gain-word pipeline on the published
+tables, packed into the clause-4 octet layout. Default rate (no
+`bit_rate` hint) is 6.3 kbit/s MP-MLQ; request `Some(5300)` for ACELP.
 
 - **Analysis by synthesis**: the encoder carries a shadow
-  `SynthesisState` mirroring the decoder frame-for-frame, so analysis
-  always targets what the decoder will actually produce.
-- **ACELP fixed-codebook search**: the §2.16 Table 1 4-pulse stride-8
-  track geometry (with the global 1-bit odd-shift grid), followed by
-  two passes of coordinate-descent refinement.
-- **MP-MLQ fixed-codebook search**: per-track greedy pick with 6 pulses
-  on odd subframes and 5 on even subframes; grid bit toggles phase.
-- **Joint gain quantisation**: 4-bit ACB + 7-bit FCB magnitude + 1-bit
-  FCB sign, with a small-neighbourhood refinement pass minimising
-  reconstruction error.
-- **LSP quantisation**: 24-bit factorial scalar split VQ in the
-  omega = acos(lsp) domain, with per-dim angle ranges keeping the LPC
-  stable by construction.
+  `SynthesisState` committed through the *exact* decode kernel, so
+  analysis always targets what the decoder will actually produce.
+- **LSP quantisation** (§2.5): predictive 3+3+4 split VQ over the
+  published 256-entry band codebooks, MA predictor `b = 12/32`, DC
+  removal, and the eq. 5 inverse-neighbour-gap weighted error.
+- **Closed-loop pitch** (§2.14): lag candidates around the open-loop
+  estimate (±1 on subframes 0/2, the −1..+2 delta window on 1/3)
+  jointly searched with the published 85-/170-row 5-tap gain-vector
+  codebook by maximising the error reduction `2·βᵀd − βᵀRβ` over the
+  filtered eq. 41 basis vectors.
+- **MP-MLQ fixed-codebook search** (§2.15): eq. 24/25 `G_max`
+  estimate, the `[Ĝ − 3.2 dB, Ĝ + 6.4 dB]` quantised-gain
+  neighbourhood × both grids × the short-lag Dirac-train mode, greedy
+  sequential pulse placement, and an exact 24-level MMSE gain re-pick;
+  positions transmitted as `C(30,M)` combinatorial codes with the
+  13-bit `MSBPOS` word.
+- **ACELP fixed-codebook search** (§2.16): the Table 1 4-pulse
+  stride-8 track geometry with coordinate-descent refinement, run
+  against the pitch-enhanced impulse response
+  (`h′[n] = h[n] + β·h′[n − L − ε]`), least-squares gain folded into
+  the pulse signs and quantised on the 24-level table.
+- **Gain words** (eq. 36/39/40): combined 12-bit
+  `PGIndex·24 + MGIndex` words, with the high-rate short-lag (L < 58)
+  85-row layout carrying the impulse-train bit in the MSB.
 
 ### Decoder (stateful, full-synthesis)
 
-The registered `Decoder` is a full synthesiser:
+The registered `Decoder` runs the §3.1 pipeline on the published
+tables:
 
-- Dispatches on the 2-bit rate discriminator and routes `01` / `00`
-  payloads through `SynthesisState::decode_acelp` / `decode_mpmlq`.
-- Excitation history, LPC synthesis filter memory, and previous-frame
-  LSP persist across packets, so a stream decodes without per-frame
-  cold-start transients. The previous-frame LSP cold-starts at the
-  long-term DC vector `p_DC` per §3.11.
-- **LSP stability**: the spec's iterative ordering procedure (§2.6,
-  eq. 6–7.3) with `Δ_min = 31.25 Hz` on the normal path and the wider
-  `62.5 Hz` on the erasure path (§3.10.1).
-- **Frame-erasure concealment** (§3.10.2): a voiced/unvoiced
-  classifier cross-correlates a trailing 120-sample window, regenerates
-  a periodic (voiced) or pseudo-random (unvoiced) excitation,
-  attenuates 2.5 dB per consecutive erased frame, and mutes after 3
-  frames. The erasure LSP path leaks toward `p_DC` per §3.10.1.
+- Clause-4 unpack (Table 5/6, MSBPOS split, field validation), then
+  §3.2 LSP decode (MA predictor + DC + split rows, §2.6 stability with
+  the previous-vector fallback), eq. 37/38 lag decode, the eq. 39/40
+  gain-word split (85-row rule keyed off the subframe pair's reference
+  lag), the eq. 41.1–41.2 **fifth-order adaptive codebook**, and the
+  rate-specific fixed-codebook reconstruction (MP-MLQ combinatorial +
+  Dirac trains; ACELP Table 1 + the §2.16 1-tap pitch enhancement).
 - **Post-filter chain**: §3.6 pitch (long-term) post-filter with
-  per-side prediction-gain weighting and rate-specific γ_ltp — the
-  forward cross-correlation reads across the subframe boundary into the
-  whole-frame synthesis signal (§3.6 / trace §8) rather than truncating
-  the window at sample 60; §3.8 formant filter `A(z/γ₁)/A(z/γ₂)` running
-  on the per-subframe interpolated synthesis LPC, with the γ₁ = 0.65 /
-  γ₂ = 0.75 tap weighting taken verbatim from the spec's exact Q15
-  `PostFiltZeroTable` / `PostFiltPoleTable` (§2.18) instead of a
-  recomputed float `gamma^i`; §3.8 signal-adaptive tilt compensation;
-  §3.9 leaky-integrator adaptive gain scaling.
-- `reset()` reinitialises the synthesiser to silence.
-- SID and untransmitted frames are accepted as framing-valid and feed
-  the §3.10.2 concealment path; comfort-noise generation (Annex A SID
-  parameter parsing) is future work.
+  per-side prediction-gain weighting and rate-specific γ_ltp; §3.8
+  formant filter `A(z/γ₁)/A(z/γ₂)` on the per-subframe interpolated
+  synthesis LPC with the exact Q15 §2.18 tap tables; signal-adaptive
+  tilt compensation; §3.9 leaky-integrator adaptive gain scaling.
+- **Frame-erasure concealment** (§3.10): voiced/unvoiced classifier,
+  periodic or pseudo-random regeneration, 2.5 dB/frame attenuation,
+  mute after 3 frames; §3.10.1 LSP extrapolation toward `p_DC` with
+  the erasure predictor `b_e = 23/32` and the wider 62.5 Hz ordering
+  floor. §3.11 cold start (previous LSP = `p_DC`, AGC gain = 1).
+- SID and untransmitted frames feed the concealment path; Annex A SID
+  parsing / CNG is future work (Annex A is not in the 1996 base
+  edition).
 
 ### Round-trip quality
 
-On a 2 s voiced synthetic signal (150 Hz fundamental + three harmonics)
-encoded and decoded end-to-end (release build):
+On 2 s of voiced synthetic speech (180 Hz fundamental + three
+harmonics) through the full encode → decode pipeline (release,
+peak-referenced PSNR):
 
-|    rate | frame size | PSNR      |
-| ------: | ---------: | :-------- |
-| 5.3 k/s |   20 bytes | ≈ 17.1 dB |
-| 6.3 k/s |   24 bytes | ≈ 21.1 dB |
+|    rate | frame size | PSNR      | signal SNR |
+| ------: | ---------: | :-------- | :--------- |
+| 5.3 k/s |   20 bytes | ≈ 23.9 dB | ≈ 12.0 dB  |
+| 6.3 k/s |   24 bytes | ≈ 26.4 dB | ≈ 14.4 dB  |
 
-See `tests/codec_roundtrip.rs` for the integration test and
-`encoder::tests` for the single-frame lower-bound checks. For a
+See `tests/codec_roundtrip.rs` for the integration tests. For a
 playable subjective sample:
 
 ```bash
@@ -105,60 +112,51 @@ aplay -f S16_LE -c 1 -r 8000 /tmp/g7231-sample.raw
 
 ## Bitstream interoperability
 
-The LSP split VQ, joint gain codebook, and MP-MLQ pulse track layout
-driving the encoder / decoder are a clean-room, pure-Rust design —
-internally consistent and decode-quality-equivalent, but **not**
-bit-compatible with the ITU-T Tables 5 / 7 / 9 bitstream layout. (The
-5.3 kbit/s ACELP fixed-codebook *positions* do follow §2.16 Table 1,
-but the surrounding gain word and bit packing remain the clean-room
-design.) Bitstreams produced by this encoder decode cleanly with this
-crate's own decoder at the PSNR figures above, but not with a
-spec-table-layout G.723.1 decoder. Achieving that interoperability
-requires the full ITU-T numeric tables driving a Q13 / Q15 fixed-point
-bit-exact gain quantiser plus the spec's bit-packing field order.
+Frames follow the Recommendation's clause-4 octet maps (Tables 5/6)
+over the published quantiser tables, so the layout, field order, and
+index semantics are the spec's own. Three caveats stand between this
+and a *proven* bit-exact interop claim:
+
+1. **MSBPOS digit order** — the mixed-radix (10, 9, 10, 9) combine of
+   the four combinatorial codes' top-4-bit digits is forced by the
+   `C(30,6)`/`C(30,5)` ranges (10·9·10·9 = 8100 ≤ 2¹³, exactly the
+   Table 2 note's 3-bit saving), but the digit *order* inside the
+   13-bit word is not pinned by the Recommendation's tables. This
+   crate packs subframe-major, most significant first (documented in
+   [`linepack`](src/linepack.rs)).
+2. **Intra-word pulse/sign conventions** — the assignment of pulses to
+   bit positions inside the low-rate `POS`/`PSIG` words and the
+   high-rate sign-bit order are documented crate conventions (Table 4
+   treats each parameter as one opaque integer).
+3. **Float vs fixed-point** — this is a floating-point implementation
+   of the clause 2/3 mathematical description; the Recommendation
+   makes the fixed-point code of clause 5 normative on discrepancies,
+   and no conformance test vectors are staged under
+   `docs/audio/g7231/`, so bit-exactness against them is unverified.
+
+Bitstreams produced by this encoder decode with this crate's own
+decoder at the PSNR figures above and carry spec-semantic indices
+throughout.
 
 ### Spec-table data in tree
 
 The 27 ITU-T G.723.1 normative numeric tables are exposed in
 [`spec_tables`](src/spec_tables.rs) as `static` arrays of `i16` / `u32`
-in their published Q-formats (§2.2 pre-filter constants, §2.4 LPC
-analysis primitives, §2.6 LSP split-VQ codebooks, §2.9 perceptual
-weighting, §2.13 MP-MLQ tables, §2.14 ACB gain tables, §2.16 LTP
-selector, §2.17 taming gain, §2.18 postfilter tables, bit-allocation
-offsets). Each constant carries a doc-comment naming its source CSV
-under `docs/audio/g7231/tables/` and the data SHA-256 from its `.meta`
-sidecar. Typed accessor helpers (`LspBand`, `SpecRate`,
-`fixed_codebook_gain`, `mpmlq_combinatorial`, `fcbk_pack_positions`,
-`fcbk_unpk_positions`, …) sit on top, with
-structural unit tests pinning lengths, symmetry, monotonicity, and the
-published bit-allocation constants. This data sits alongside (does not
-yet replace) the internally-consistent codebooks in
-[`tables`](src/tables.rs); threading it through the gain quantiser to
-produce a bit-exact spec-layout stream is future work.
+in their published Q-formats, each citing its source CSV under
+`docs/audio/g7231/tables/` and the data SHA-256. On top of the raw
+data sit typed accessors plus three codec layers that now **drive the
+codec**:
 
-### MP-MLQ combinatorial position codec (`Fcbk_Pack` / `Fcbk_Unpk`)
-
-§2.15 / §2.17 transmit each subframe's six (even) or five (odd) MP-MLQ
-pulse positions as one `C(30, M)` combinatorial index. `spec_tables`
-implements the spec-faithful codec — `fcbk_pack_positions` /
-`fcbk_unpk_positions` — as the standard combinatorial number system
-whose per-step weights *are* the published `MPMLQ_COMBINATORIAL` table
-(`T[r][c] = C(29 − c, 5 − r)`, with the M = 5 path reading the table
-shifted one row). The mapping is exhaustively verified bijective over
-**both** complete codeword spaces — `C(30, 5) = 142 506` and
-`C(30, 6) = 593 775` — and proven order-preserving (lexicographic
-pulse-set order ↔ index order). This is the position-index half of
-`Fcbk_Pack` / `Fcbk_Unpk`, recovered from the published table without
-recomputing any binomials.
-
-The remaining step — recombining the four subframes' codeword 4-MSBs
-into the 13-bit `MSBPOS` word (§2.15 note, Table 5 octets 13–14, via
-the `L_bseg = {2048, 18432, 231233}` / `base = {0, 32, 96}`
-segmentation constants) — stays a documented clean-room gap: the
-mixed-radix digit ranges `(10, 9, 10, 9)` follow from the combinatorial
-ranges (and explain the "3 bits saved": 10·9·10·9 = 8100 < 2¹³), but
-the exact recombination arithmetic that consumes `L_bseg`/`base` is
-deferred to the clause-5 ANSI C and is not reproduced.
+- [`linepack`](src/linepack.rs) — clause-4 Table 5/6 frame
+  pack/unpack + the 13-bit MSBPOS combine.
+- [`spec_lsp`](src/spec_lsp.rs) — the §2.5/§2.6 predictive split-VQ
+  LSP codec (Q15 normalised-frequency domain).
+- [`spec_exc`](src/spec_exc.rs) — eq. 36/39/40 gain words, the
+  eq. 41 five-tap adaptive codebook, MP-MLQ/ACELP fixed-vector
+  reconstruction, and the §2.16 pitch enhancement. The `C(30,M)`
+  combinatorial position codec (`fcbk_pack_positions` /
+  `fcbk_unpk_positions`) is exhaustively verified bijective over both
+  codeword spaces (`C(30,5) = 142 506`, `C(30,6) = 593 775`).
 
 ## Quick use
 

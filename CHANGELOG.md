@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- documentation sweep for the spec-layout flip: crate/encoder module
+  docstrings now describe the clause-4 pipeline (and cite the in-repo
+  03/96 edition), the README rewrites the implementation + interop
+  sections around the Table 5/6 wire format with the three remaining
+  caveats spelled out (MSBPOS digit order, intra-word pulse/sign
+  conventions, float-vs-normative-fixed-point with no conformance
+  vectors staged), the round-trip table carries the new 23.9 / 26.4 dB
+  figures, and the bitstream fuzz target's prose references the
+  clause-4 field map (its 96-bit shared-prefix truncation boundaries
+  already matched).
 - removed the retired interim wire format (−1100 LOC): the clean-room
   factorial-scalar LSP split VQ, the 4+7+1-bit joint gain codec, the
   per-pulse MP-MLQ position/sign words, the internal field tables and

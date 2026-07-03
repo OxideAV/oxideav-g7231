@@ -13,22 +13,21 @@
 //!
 //! ```text
 //!  PCM → LPC (autocorr + Levinson + lag window)
-//!      → LSP conversion (Chebyshev root-finding) + factorial scalar
-//!        split VQ (24 bits total, three 8-bit splits)
+//!      → LSP conversion (Chebyshev root-finding)
+//!      → §2.5 predictive split VQ on the published 3-band codebooks
+//!        (24-bit LPC word, MA predictor b = 12/32, eq. 5 weights)
 //!      → 4 × subframe loop:
-//!            open-loop pitch on ZIR-subtracted synthesis target
-//!          → 7-bit absolute (sub 0,2) or 2-bit delta (sub 1,3) lag
-//!          → ACB gain quant (4 bits)
-//!          → rate-specific FCB search
-//!               * ACELP: 4 pulses on T0..T3 with coordinate-descent
-//!                 refinement, stride-8 tracks + 1-bit grid to cover
-//!                 all 60 subframe positions
-//!               * MP-MLQ: 6 pulses (odd subframes) / 5 pulses (even)
-//!                 on stride-N tracks
-//!          → FCB gain quant (7 bit mag + 1 bit sign on log2 scale)
-//!      → canonical synthesise() pass commits decoder state
-//!      → bit-pack 158 bits (ACELP, 20 B, rate=01)
-//!         or 192 bits (MP-MLQ, 24 B, rate=00)
+//!            open-loop pitch on the ZIR-subtracted synthesis target
+//!          → §2.14 closed-loop lag (±1 / −1..+2 windows) jointly
+//!            searched with the 85-/170-row 5-tap gain-vector codebook
+//!          → rate-specific FCB search at quantised §2.15 gain levels
+//!               * ACELP: §2.16 Table 1 tracks + grid against the
+//!                 pitch-enhanced impulse response
+//!               * MP-MLQ: greedy multipulse over the Ĝ ± neighbourhood,
+//!                 both grids, and the short-lag Dirac-train mode
+//!          → eq. 36/39/40 combined 12-bit gain word
+//!      → canonical decode_spec_params() pass commits decoder state
+//!      → clause-4 Table 5/6 octet packing (24 B rate=00 / 20 B rate=01)
 //! ```
 //!
 //! The encoder's analysis loop runs against an internal [`encoder::SynthesisState`]
@@ -39,7 +38,8 @@
 //!
 //! [`Decoder::send_packet`] dispatches on the rate discriminator and
 //! routes ACELP / MP-MLQ payloads through the matching
-//! [`encoder::SynthesisState`] entry points. The pipeline is
+//! [`encoder::SynthesisState`] entry points (clause-4 unpack + the §3.1
+//! spec-table pipeline). The chain is
 //! synthesis → pitch post-filter → formant post-filter
 //! (A(z/γ₁)/A(z/γ₂)) → first-order tilt compensation → smoothed AGC.
 //! SID / untransmitted packets feed [`encoder::SynthesisState::decode_erased`],
@@ -48,17 +48,16 @@
 //! without audible clicks.  Decoder state persists across packets and
 //! `reset()` reinitialises to silence.
 //!
-//! # Not bit-compatible with ITU-T reference tables
+//! # Wire format
 //!
-//! The LSP split VQ, joint gain codebook, and fixed-codebook pulse track
-//! layout in this crate are a clean-room, pure-Rust design — internally
-//! consistent and decode-quality-equivalent to a reference G.723.1 codec,
-//! but **not** bit-compatible with ITU-T Tables 5/7/9. Bitstreams produced
-//! here decode cleanly with this crate's own decoder (high round-trip
-//! PSNR on voiced speech) but not with an external, spec-table G.723.1
-//! reference decoder. See `README.md` for the details.
+//! Frames are the ITU-T clause-4 spec layout: the Table 5 (high rate) /
+//! Table 6 (low rate) octet maps over the published quantiser tables —
+//! see [`linepack`] for the packing layer and the README for the two
+//! remaining documented derivation choices (MSBPOS digit order and the
+//! intra-word pulse/sign bit conventions) plus the conformance-vector
+//! caveat.
 //!
-//! Reference: ITU-T G.723.1 Recommendation (May 2006) and Annex B.
+//! Reference: ITU-T Recommendation G.723.1 (03/96).
 
 #![allow(
     clippy::needless_range_loop,

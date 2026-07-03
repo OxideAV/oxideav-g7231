@@ -7,9 +7,11 @@
 //! public `Decoder` trait with free-form bytes; this target instead
 //! *constructs* frames that are structurally close to legal — correct
 //! length, correct rate discriminator — then surgically corrupts a
-//! single field (LSP split index, absolute/delta lag, gain index, FCB
-//! pulse word, MP-MLQ reserved tail) or truncates the payload at an
-//! exact field boundary. The aim is to reach the deep parse/dequant
+//! single field (LSP word, absolute/delta lag, gain word, position
+//! word, frame tail) or truncates the payload at an exact field
+//! boundary of the clause-4 Table 5/6 layout (whose shared prefix is
+//! flags + 24-bit LPC + 7/2/7/2 ACL + 4×12 GAIN + 4×1 GRID = 96
+//! bits). The aim is to reach the deep parse/dequant
 //! paths inside `decode_acelp` / `decode_mpmlq` that free-form bytes
 //! reach only by luck, and to stress the `BitReader::read_u32`
 //! out-of-bits guard at every boundary.
@@ -35,14 +37,13 @@
 //! A free-form byte fuzzer that happens to set the rate byte to `00`
 //! still spends most of its energy on the length check and the rate
 //! mismatch branch. Field-targeted corruption guarantees the bytes
-//! *past* the discriminator are reached: a deliberately out-of-range
-//! LSP split index exercises `dequantise_lsp`'s table bound; a maxed
-//! delta-lag index exercises `decode_delta_lag`'s clamp; a saturated
-//! gain word exercises the joint-gain dequant; an all-ones FCB word
-//! exercises `unpack_fcb_bits` / `unpack_mpmlq_pulses` pulse placement
-//! (where a bad position could index a 60-sample subframe out of
-//! bounds if unclamped). All must return a frame or an `Err`, never
-//! panic.
+//! *past* the discriminator are reached: an extreme LSP word exercises
+//! the spec split-VQ row lookups; a maxed delta-lag index exercises
+//! the lag clamp; a saturated gain word exercises the eq. 39/40
+//! PGIndex/MGIndex split (including the non-conforming-row clamp); an
+//! all-ones position word exercises the combinatorial / Table 1 pulse
+//! placement and the 13-bit MSBPOS range rejection. All must return a
+//! frame or an `Err`, never panic.
 //!
 //! ## Fuzz input layout
 //!

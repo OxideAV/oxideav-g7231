@@ -4,12 +4,11 @@
 //!
 //! This module implements **both** rates of G.723.1:
 //!
-//! - **5.3 kbit/s ACELP** — 4 pulses per subframe on stride-8 tracks
-//!   (T0..T3 each with 8 positions, a 1-bit grid shifting all pulses by
-//!   +4 so the union of grids covers every sample); 20-byte payload,
-//!   discriminator `01`.
-//! - **6.3 kbit/s MP-MLQ** — 6 pulses on odd subframes (0, 2) and
-//!   5 pulses on even subframes (1, 3); 24-byte payload, discriminator `00`.
+//! - **5.3 kbit/s ACELP** — 4 pulses per subframe on the §2.16 Table 1
+//!   stride-8 tracks (T0..T3, 1-bit grid shifting the set to odd
+//!   positions); 20-byte payload, discriminator `01`.
+//! - **6.3 kbit/s MP-MLQ** — 6 pulses on even subframes (0, 2) and
+//!   5 pulses on odd subframes (1, 3); 24-byte payload, discriminator `00`.
 //!
 //! [`make_encoder`] dispatches between the two rates based on the
 //! `CodecParameters.bit_rate` hint: `Some(6300)` or unset → MP-MLQ;
@@ -22,34 +21,33 @@
 //!
 //! ```text
 //!  PCM s16 → LPC analysis (autocorrelation + Levinson + lag window)
-//!          → LSP conversion (Chebyshev root-finding) + factorial
-//!            scalar split VQ (24 bits across three 8-bit splits)
+//!          → LSP conversion (Chebyshev root-finding) + §2.5 predictive
+//!            split VQ on the published codebooks (24-bit LPC word)
 //!          → 4× subframe loop (ACB lookup against SynthesisState):
-//!                - zero-input response of 1/A_q(z) to form ZIR-free target
-//!                - open-loop lag search on the ZIR-free target
-//!                - ACB gain quantised (4 bits, 0.0..1.25)
-//!                - rate-specific FCB search against the ACB residual
-//!                    · ACELP:  4-pulse stride-8 tracks + grid, coord
-//!                              descent refinement
-//!                    · MP-MLQ: 6/5-pulse greedy search on stride-N tracks
-//!                - joint gain-pair refinement around the initial
-//!                  quantisation (27-pair neighbourhood scan)
-//!          → canonical SynthesisState::synthesise() commits decoder
-//!            state so encoder + decoder stay in lockstep
-//!          → bit-pack 158 bits (ACELP, 20 B, rate=01)
-//!               or 192 bits (MP-MLQ, 24 B, rate=00)
+//!                - zero-input response of 1/A_q(z) → ZIR-free target
+//!                - §2.14 closed-loop lag ±1 / −1..+2 candidates,
+//!                  jointly searched with the 85-/170-row 5-tap
+//!                  gain-vector codebook (max 2·βᵀd − βᵀRβ)
+//!                - rate-specific FCB search at quantised gain levels
+//!                    · ACELP:  §2.16 Table 1 tracks + grid against the
+//!                              pitch-enhanced impulse response
+//!                    · MP-MLQ: §2.15 greedy multipulse, gain
+//!                              neighbourhood × grids × Dirac trains
+//!                - eq. 36/39/40 combined 12-bit gain word
+//!          → canonical SynthesisState::decode_spec_params() commits
+//!            decoder state so encoder + decoder stay in lockstep
+//!          → clause-4 Table 5/6 octet packing (20 B rate=01 /
+//!            24 B rate=00)
 //! ```
 //!
-//! # Not bit-compatible with ITU-T reference tables
+//! # Wire format
 //!
-//! The LSP split VQ (a factorial scalar product code), joint gain
-//! codebook (4-bit ACB + 7-bit FCB magnitude on a log2 scale + 1-bit
-//! sign), and fixed-codebook pulse track layout here are a clean-room,
-//! pure-Rust design. They are internally consistent and give a solid
-//! round-trip PSNR (see the README and integration tests) but are not
-//! bit-compatible with ITU-T Tables 5 / 7 / 9, so a bitstream produced
-//! here does not decode to high-quality speech on an external,
-//! spec-table G.723.1 reference decoder.
+//! Frames are the ITU-T clause-4 spec layout on the published quantiser
+//! tables (see [`crate::linepack`] / [`crate::spec_lsp`] /
+//! [`crate::spec_exc`]). The README documents the two derivation
+//! choices the Recommendation's tables leave open (MSBPOS digit order,
+//! intra-word pulse/sign bit conventions) and the conformance-vector
+//! caveat.
 
 use std::collections::VecDeque;
 
