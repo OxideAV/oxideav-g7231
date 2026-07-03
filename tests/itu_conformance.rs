@@ -198,7 +198,10 @@ fn itu_streams_unpack_and_repack_byte_identically() {
         }
     }
     // 2 816 frames total minus the 3 error frames.
-    assert_eq!(total, MAIN_BODY_STREAMS.iter().map(|s| s.2).sum::<usize>() - 3);
+    assert_eq!(
+        total,
+        MAIN_BODY_STREAMS.iter().map(|s| s.2).sum::<usize>() - 3
+    );
 }
 
 /// Low-rate decoder tracking floor on the OVERD53 vector (post-filter
@@ -244,10 +247,7 @@ fn decoder_tracks_overd63p_cold_start() {
     let floors = [0.5f64, 0.8, 0.75, 0.65];
     for (i, floor) in floors.iter().enumerate() {
         let pcm = st.decode_mpmlq(&bs[i * 24..(i + 1) * 24]).unwrap();
-        let c = corr(
-            &reference[i * FRAME_SAMPLES..(i + 1) * FRAME_SAMPLES],
-            &pcm,
-        );
+        let c = corr(&reference[i * FRAME_SAMPLES..(i + 1) * FRAME_SAMPLES], &pcm);
         eprintln!("OVERD63P frame {i}: corr {c:.4}");
         assert!(c >= *floor, "frame {i} corr {c:.4} under floor {floor}");
     }
@@ -277,9 +277,21 @@ fn decoder_tracks_pathd53_cold_start() {
 fn decoder_full_runs_complete_with_exact_sample_budget() {
     let Some(dir) = corpus_dir() else { return };
     for (tco, rou, crc, fb, pf) in [
-        ("PATHD63P.TCO", "PATHD63P.ROU", Some("PATHD63P.CRC"), 24, true),
+        (
+            "PATHD63P.TCO",
+            "PATHD63P.ROU",
+            Some("PATHD63P.CRC"),
+            24,
+            true,
+        ),
         ("OVERD63P.TCO", "OVERD63P.ROU", None, 24, true),
-        ("TAMED63P.TCO", "TAMED63P.ROU", Some("TAMED63P.CRC"), 24, true),
+        (
+            "TAMED63P.TCO",
+            "TAMED63P.ROU",
+            Some("TAMED63P.CRC"),
+            24,
+            true,
+        ),
         ("PATHD53.TCO", "PATHD53.ROU", None, 20, false),
         ("OVERD53.TCO", "OVERD53.ROU", None, 20, false),
         ("INEQD53.TCO", "INEQD53.ROU", None, 20, false),
@@ -306,7 +318,13 @@ fn decoder_full_runs_complete_with_exact_sample_budget() {
 fn encoder_emits_self_valid_streams_on_itu_inputs() {
     let Some(dir) = corpus_dir() else { return };
     for (tin, rco, rate, fb, frames) in [
-        ("CODEC63.TIN", "CODEC63.RCO", PackedRate::High, 24usize, 40usize),
+        (
+            "CODEC63.TIN",
+            "CODEC63.RCO",
+            PackedRate::High,
+            24usize,
+            40usize,
+        ),
         ("PATHC53.TIN", "PATHC53.RCO", PackedRate::Low, 20, 40),
     ] {
         let pcm = read_pcm(&dir, tin);
