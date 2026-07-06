@@ -1016,7 +1016,11 @@ pub(crate) fn lsp_to_lpc(lsp: &[f32; LPC_ORDER]) -> [f32; LPC_ORDER + 1] {
 
 /// Interpolate LSP vectors between the previous and current frame for
 /// subframe `k in 0..4`.
-fn interpolate_lsp(k: usize, prev: &[f32; LPC_ORDER], cur: &[f32; LPC_ORDER]) -> [f32; LPC_ORDER] {
+pub(crate) fn interpolate_lsp(
+    k: usize,
+    prev: &[f32; LPC_ORDER],
+    cur: &[f32; LPC_ORDER],
+) -> [f32; LPC_ORDER] {
     let (wp, wc) = match k {
         0 => (0.75, 0.25),
         1 => (0.50, 0.50),

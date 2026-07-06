@@ -11,7 +11,12 @@
 //!
 //! - Adaptive-codebook gain rows: each of the 85 / 170 rows carries the
 //!   five predictor taps `β_i0..β_i4` in Q13 in its first five entries
-//!   (`tap = q / 8192`). The remaining 15 entries are the precomputed
+//!   (`tap = q / 16384` — r391 conformance arbitration: a least-squares
+//!   decomposition of the Ã(z)-deconvolved PATHD53 reference excitation
+//!   against the ACB/FCB bases lands both coefficients at ≈ 1.0 with
+//!   this scale and the doubled pulse amplitude, and the Q13 reading
+//!   makes the pitch loop diverge where the reference stays bounded).
+//!   The remaining 15 entries are the precomputed
 //!   closed-loop search energies `−2·β_i²` and `−2·β_i·β_j` (>> 15) —
 //!   verified numerically against the taps — and are not needed for
 //!   decoding.
@@ -88,7 +93,7 @@ pub(crate) fn acb_taps(rate: PackedRate, lag_base: i32, pgindex: usize) -> [f32;
     let row = pgindex.min(rows - 1) * ADAPTIVE_CODEBOOK_ROW_DIM;
     let mut taps = [0.0f32; ACB_TAPS];
     for (t, &q) in taps.iter_mut().zip(table[row..row + ACB_TAPS].iter()) {
-        *t = q as f32 / 8192.0;
+        *t = q as f32 / 16384.0;
     }
     taps
 }
@@ -173,12 +178,13 @@ pub(crate) fn acb_basis(history: &[f32], lag: i32) -> [[f32; SUBFRAME_SIZE]; ACB
     let l = lag.clamp(PITCH_MIN as i32, PITCH_MAX as i32) as usize;
     let hlen = history.len();
     debug_assert!(hlen >= l + 2);
-    let eprime = |n: usize| -> f32 {
-        let off = match n {
-            0 => l + 2,
-            1 => l + 1,
-            _ => l - (n % l),
-        };
+    // eq. 41.1, vector-arbitrated contiguous reading (r391): e′ is the
+    // history slice from e[−L−2], extended with period L —
+    // `e′[m] = e[((m − 2) mod L) − L]` for m ≥ 2, so tap j = 2 sits at
+    // delay L. See `qdec::acb_contribution` for the PATHD53 evidence
+    // against the literal "(n mod L)" reading (two-sample lead).
+    let eprime = |m: usize| -> f32 {
+        let off = if m < 2 { l + 2 - m } else { l - ((m - 2) % l) };
         history[hlen - off]
     };
     let mut basis = [[0.0f32; SUBFRAME_SIZE]; ACB_TAPS];
@@ -387,7 +393,7 @@ mod tests {
         // Row 5 of the 85-entry codebook (verified numerically in the
         // module docs): taps [-125, -40, -264, 381, 5027] / 8192.
         let taps = acb_taps(PackedRate::High, 20, 5);
-        let expected = [-125.0, -40.0, -264.0, 381.0, 5027.0].map(|q| q / 8192.0);
+        let expected = [-125.0, -40.0, -264.0, 381.0, 5027.0].map(|q| q / 16384.0);
         assert_eq!(taps, expected);
     }
 
@@ -413,8 +419,10 @@ mod tests {
         hist[hlen - 1] = 1.0;
         let taps = [0.0, 0.0, 1.0, 0.0, 0.0];
         let u = acb_contribution(&hist, lag as i32, &taps);
+        // Contiguous e' (vector-arbitrated, r391): tap j = 2 sits at
+        // delay L, so the spike appears at n = L - 1, 2L - 1, ...
         for (n, &s) in u.iter().enumerate() {
-            let expect = if (n + 2) % lag == lag - 1 { 1.0 } else { 0.0 };
+            let expect = if n % lag == lag - 1 { 1.0 } else { 0.0 };
             assert_eq!(s, expect, "sample {n}");
         }
 

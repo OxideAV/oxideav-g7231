@@ -71,7 +71,7 @@ pub mod bitreader;
 pub mod encoder;
 pub mod header;
 pub mod linepack;
-pub(crate) mod qdec;
+pub mod qdec;
 pub mod spec_exc;
 pub mod spec_lsp;
 pub mod spec_tables;
