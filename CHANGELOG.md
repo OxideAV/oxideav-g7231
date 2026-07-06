@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **Fixed-point decode-chain rebuild (r391)** — the registry decoder
+  now runs a saturating integer pipeline (`qdec::QSynthesis`) end to
+  end: Q15 LSP inverse quantisation / stability / interpolation, Q14
+  cosine lookup -> Q13 LPC, wide-accumulator excitation reconstruction,
+  §3.6 pitch post-filter, §3.7 synthesis, §3.8 formant + tilt, §3.9
+  AGC and §3.10 concealment, all on `basicop`-style saturating
+  arithmetic (new `basicop` module: add/sub/mult/l_mult/l_mac/shifts/
+  norm/div_s/isqrt64 with DSP saturation semantics).
+- **Three excitation-model corrections arbitrated by the ITU
+  conformance vectors** (clause 1-4 prose leaves them open; the
+  clause-5 C stays outside the wall — model pinned by deconvolving the
+  `PATHD53` reference output with the decoded LPC):
+  1. eq. 41.1 `e'` is the *contiguous* history slice from `e[-L-2]`
+     (the literal `(n mod L)` reading skips two samples and leads the
+     reference by exactly two samples);
+  2. fixed-codebook pulses land at **twice** the published gain-table
+     level with the synthesis output halved on emission (deconvolved
+     pulses match sample-exact);
+  3. the gain-vector rows act at an effective **/16384** — the /8192
+     reading makes the pitch loop diverge where the reference stays
+     bounded. Applied to both the fixed and float paths (the float
+     `OVERD53` corr 0.97 of r388 is retired as a clipping artifact:
+     that model's unclamped excitation reached 2^36 by frame 7 and the
+     fully-clipped output merely sign-matched the reference).
+- **Measured decoder tracking (whole-file corr / SNR)** against the
+  reference `.ROU` outputs, fixed pipeline: PATHD53 0.60 / +1.9 dB,
+  OVERD53 0.48 / +0.3 dB, INEQD53 0.83 / +4.5 dB, PATHD63P 0.77 /
+  +3.5 dB, OVERD63P 0.40 / +0.8 dB, TAMED63P 0.11 / -2.2 dB — five of
+  six streams up from deeply negative SNR (e.g. PATHD63P -12.8 dB,
+  INEQD53 -23.1 dB); floors pinned for all six. Remaining gap to
+  bit-exactness: the reference's overflow/scaling protocol on the
+  OVER/TAME torture classes is specified only by the clause-5 C.
+
 - **ITU conformance vectors (r388)** — first round against the newly
   staged official G.723.1 digital test sequences
   (`docs/audio/g7231/conformance/`, black-box I/O pairs; the clause-5

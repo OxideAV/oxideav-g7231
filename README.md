@@ -70,10 +70,13 @@ the ITU encoder-test configurations require.
   `PGIndex·24 + MGIndex` words, with the high-rate short-lag (L < 58)
   85-row layout carrying the impulse-train bit in the MSB.
 
-### Decoder (stateful, full-synthesis)
+### Decoder (stateful, full-synthesis, fixed-point)
 
-The registered `Decoder` runs the §3.1 pipeline on the published
-tables:
+The registered `Decoder` ships the r391 **saturating fixed-point
+pipeline** (`qdec::QSynthesis`): Q15 LSP domain, Q14 cosine lookup →
+Q13 LPC, wide-accumulator excitation reconstruction, and integer
+post-filters, built on the `basicop` saturating operator layer. The
+§3.1 chain on the published tables:
 
 - Clause-4 unpack (Table 5/6, MSBPOS split, field validation), then
   §3.2 LSP decode (MA predictor + DC + split rows, §2.6 stability with
@@ -142,18 +145,27 @@ bit meaning **negative**; low-rate `PSIG` bit `t` is the track-`t`
 sign with a set bit meaning **positive** (flipping it takes the
 whole-file `OVERD53` waveform correlation from −0.97 to +0.97).
 
-What remains between this and a *bit-exact* conformance claim is
-fixed-point arithmetic: this is a floating-point implementation of
-the clause 2/3 mathematical description, while the Recommendation
-makes the clause-5 fixed-point behaviour normative. Measured decoder
-tracking against the reference `.ROU` outputs (r388): `OVERD53`
-whole-file correlation 0.973 / mean per-frame 0.985 / SNR 7.3 dB
-(post-filter OFF per the test config); `OVERD63P` cold-start frames
-0–3 correlation 0.61/0.89/0.83/0.74 (post-filter ON). The `OVER..` /
-`TAME..` classes deliberately drive sustained Word16-saturation
-chains that only a bit-exact fixed-point pipeline tracks long-range —
-that rebuild (Q15 saturating basic ops through analysis + synthesis)
-is the remaining conformance work. See
+The r391 round rebuilt the decoder in saturating fixed point and
+arbitrated three excitation-model choices the clause 1–4 prose leaves
+open, by deconvolving the reference decoder output with the decoded
+LPC (the clause-5 reference C stays outside the clean-room wall):
+the eq. 41.1 `e′` view is the contiguous history slice from
+`e[−L−2]`; fixed-codebook pulses land at twice the published
+gain-table level with the synthesis output halved on emission
+(pulse-exact against the deconvolved reference); and the gain-vector
+rows act at an effective /16384 (the /8192 reading diverges where the
+reference stays bounded — r388's OVERD53 corr 0.97 is retired as a
+clipping artifact of that divergent loop).
+
+Measured whole-file tracking against the reference `.ROU` outputs
+(r391 fixed pipeline, corr / SNR): PATHD53 0.60 / +1.9 dB, OVERD53
+0.48 / +0.3 dB, INEQD53 0.83 / +4.5 dB, PATHD63P 0.77 / +3.5 dB,
+OVERD63P 0.40 / +0.8 dB, TAMED63P 0.11 / −2.2 dB — five of six
+streams up from deeply negative SNR (PATHD63P was −12.8 dB, INEQD53
+−23.1 dB). What remains between this and a *bit-exact* claim is the
+reference's overflow/scaling protocol on the OVER/TAME saturation-
+torture classes plus per-stage rounding details, which the
+Recommendation specifies only in the clause-5 C. See
 [`tests/itu_conformance.rs`](tests/itu_conformance.rs) for the pinned
 floors.
 
@@ -181,6 +193,9 @@ codec**:
   combinatorial position codec (`fcbk_pack_positions` /
   `fcbk_unpk_positions`) is exhaustively verified bijective over both
   codeword spaces (`C(30,5) = 142 506`, `C(30,6) = 593 775`).
+- [`basicop`](src/basicop.rs) — the saturating Word16/Word32 DSP
+  operator layer (r391), and [`qdec`](src/qdec.rs) — the fixed-point
+  §3.1 decode pipeline the registry decoder ships.
 
 ## Quick use
 
