@@ -1507,6 +1507,119 @@ mod tests {
     }
 
     #[test]
+    fn pitch_postfilter_passes_uncorrelated_noise_through() {
+        // A white-ish excitation has no pitch structure at any lag in
+        // [L-3, L+3]; the eq. 45-46 prediction-gain gate must skip the
+        // post-filter and return the subframe unchanged.
+        let mut lcg = 12345u32;
+        let mut frame = [0i32; FRAME_SIZE_SAMPLES];
+        for v in frame.iter_mut() {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *v = (((lcg >> 8) & 0xFFF) as i32) - 2048;
+        }
+        let hist = [0i32; EXC_HIST];
+        let out = pitch_postfilter(&hist, &frame, 0, 60, PackedRate::Low);
+        assert_eq!(&out[..], &frame[..SUBFRAME_SIZE]);
+    }
+
+    #[test]
+    fn pitch_postfilter_boosts_periodic_excitation_without_energy_gain() {
+        // A perfectly periodic excitation at lag 40 passes the gate;
+        // eq. 47's g_p keeps the output energy at or below the input
+        // energy (attenuate-only) while preserving the period.
+        let mut frame = [0i32; FRAME_SIZE_SAMPLES];
+        let mut hist = [0i32; EXC_HIST];
+        for n in 0..FRAME_SIZE_SAMPLES {
+            frame[n] = if n % 40 == 0 { 8000 } else { 100 };
+        }
+        for n in 0..EXC_HIST {
+            // History continues the same period backwards.
+            let phase = (EXC_HIST - n) % 40;
+            hist[n] = if phase == 0 { 8000 } else { 100 };
+        }
+        let sub = 1; // interior subframe with both reaches available
+        let out = pitch_postfilter(&hist, &frame, sub * SUBFRAME_SIZE, 40, PackedRate::Low);
+        let e_in: i64 = frame[sub * SUBFRAME_SIZE..(sub + 1) * SUBFRAME_SIZE]
+            .iter()
+            .map(|&v| v as i64 * v as i64)
+            .sum();
+        let e_out: i64 = out.iter().map(|&v| v as i64 * v as i64).sum();
+        assert!(e_out > 0);
+        // Attenuate-only within one rounding unit per sample.
+        assert!(e_out <= e_in + SUBFRAME_SIZE as i64);
+        // The pitch pulses stay in place.
+        for n in 0..SUBFRAME_SIZE {
+            if (sub * SUBFRAME_SIZE + n) % 40 == 0 {
+                assert!(out[n] > 4000, "pulse at {n} vanished: {}", out[n]);
+            }
+        }
+    }
+
+    #[test]
+    fn formant_agc_is_silent_on_silence_and_bounded_on_speechlike_input() {
+        let mut pf = PostfilterState::new();
+        let a = lsp_to_lpc_q13(&lsp_dc());
+        let silence = [0i16; SUBFRAME_SIZE];
+        let mut out = [0i16; SUBFRAME_SIZE];
+        pf.formant_agc_subframe(&a, &silence, &mut out);
+        assert_eq!(out, [0i16; SUBFRAME_SIZE]);
+
+        // A bounded periodic input stays bounded through the chain (the
+        // AGC pins the output energy near the synthesis energy).
+        let mut sy = [0i16; SUBFRAME_SIZE];
+        for (n, v) in sy.iter_mut().enumerate() {
+            *v = (6000.0 * (n as f32 * 0.35).sin()) as i16;
+        }
+        let mut pf = PostfilterState::new();
+        let mut e_in = 0i64;
+        let mut e_out = 0i64;
+        for _ in 0..8 {
+            pf.formant_agc_subframe(&a, &sy, &mut out);
+            e_in += sy.iter().map(|&v| v as i64 * v as i64).sum::<i64>();
+            e_out += out.iter().map(|&v| v as i64 * v as i64).sum::<i64>();
+        }
+        assert!(
+            e_out > e_in / 4 && e_out < e_in * 4,
+            "AGC drifted: {e_in} vs {e_out}"
+        );
+    }
+
+    #[test]
+    fn erasure_run_attenuates_then_mutes() {
+        // Decode a loud-ish frame, then a sustained erasure run: energy
+        // must be non-increasing and reach silence after the 3-frame
+        // mute point.
+        let mut st = QSynthesis::new();
+        st.set_postfilter(false);
+        let mut p = SpecFrameParams::zeroed(PackedRate::Low);
+        p.gain = [23 * 24 + 20; SUBFRAMES_PER_FRAME]; // strong gains
+        p.pos = [1 | (2 << 3) | (3 << 6) | (4 << 9); SUBFRAMES_PER_FRAME];
+        for _ in 0..4 {
+            let _ = st.decode_params(&p);
+        }
+        let energy = |pcm: &[i16; FRAME_SIZE_SAMPLES]| -> i64 {
+            pcm.iter().map(|&v| v as i64 * v as i64).sum()
+        };
+        let e1 = energy(&st.decode_erased());
+        let e2 = energy(&st.decode_erased());
+        let e3 = energy(&st.decode_erased());
+        let e4 = energy(&st.decode_erased());
+        let e5 = energy(&st.decode_erased());
+        assert!(e1 > 0, "first concealed frame should not be silent");
+        assert!(e2 <= e1);
+        assert!(e3 <= e2);
+        // After ERASURE_MUTE_AFTER_FRAMES(3) the regenerated excitation
+        // is muted; only filter ringing remains, and by the fifth frame
+        // the output is essentially silent.
+        assert!(e4 < e1 / 4);
+        assert!(e5 <= e4.max(1));
+
+        // A good frame ends the run and restores signal.
+        let e_good = energy(&st.decode_params(&p));
+        assert!(e_good > e5);
+    }
+
+    #[test]
     fn qsynthesis_decodes_zeroed_frames_at_both_rates() {
         let mut st = QSynthesis::new();
         st.set_postfilter(false);

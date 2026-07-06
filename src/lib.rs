@@ -363,6 +363,30 @@ mod tests {
     }
 
     #[test]
+    fn registry_decoder_matches_qsynthesis_bit_for_bit() {
+        // The registry decoder is a thin shell over the fixed-point
+        // QSynthesis pipeline: the emitted PCM must be identical.
+        let mut dec = G7231Decoder::new();
+        let mut qs = qdec::QSynthesis::new();
+        let mut payload = vec![0u8; 24];
+        for i in 0..6u8 {
+            payload[1] = i.wrapping_mul(37);
+            payload[3] = 0x21 ^ i;
+            payload[7] = 0x55;
+            dec.send_packet(&packet(payload.clone())).unwrap();
+            let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+                panic!("expected audio frame");
+            };
+            let expect = qs.decode_mpmlq(&payload).unwrap();
+            let got: Vec<i16> = af.data[0]
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            assert_eq!(got.as_slice(), &expect[..], "frame {i}");
+        }
+    }
+
+    #[test]
     fn flush_then_eof() {
         let mut dec = G7231Decoder::new();
         let pkt = packet(vec![0u8; 24]);
