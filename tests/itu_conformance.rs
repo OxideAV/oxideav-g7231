@@ -321,21 +321,37 @@ fn decoder_full_runs_complete_with_exact_sample_budget() {
 }
 
 /// Decode a whole fixed-rate stream through the fixed-point
-/// [`QSynthesis`] pipeline.
+/// [`QSynthesis`] pipeline (the shipped registry decode path):
+/// CRC-driven erasure concealment where a companion track exists, and
+/// invalid-frame concealment for content that fails field validation.
 fn decode_stream_fixed(
     dir: &Path,
     bs_name: &str,
     frame_bytes: usize,
     postfilter: bool,
+    crc: Option<&str>,
 ) -> Vec<i16> {
     let bs = std::fs::read(dir.join(bs_name)).unwrap();
     let n = bs.len() / frame_bytes;
+    let erased = match crc {
+        Some(c) => read_crc(dir, c),
+        None => vec![false; n],
+    };
     let mut st = QSynthesis::new();
     st.set_postfilter(postfilter);
     let mut out = Vec::with_capacity(n * FRAME_SAMPLES);
     for i in 0..n {
-        let p = unpack_frame(&bs[i * frame_bytes..(i + 1) * frame_bytes]).unwrap();
-        out.extend_from_slice(&st.decode_params(&p));
+        let frame = &bs[i * frame_bytes..(i + 1) * frame_bytes];
+        let pcm = if erased[i] {
+            st.decode_erased()
+        } else if frame_bytes == 24 {
+            st.decode_mpmlq(frame)
+                .unwrap_or_else(|_| st.decode_erased())
+        } else {
+            st.decode_acelp(frame)
+                .unwrap_or_else(|_| st.decode_erased())
+        };
+        out.extend_from_slice(&pcm);
     }
     out
 }
@@ -371,7 +387,58 @@ fn fixed_decoder_tracks_pf_off_vectors() {
         ("INEQD53.TCO", "INEQD53.ROU", 20, 0.80, 4.0),
     ] {
         let reference = read_pcm(&dir, rou);
-        let ours = decode_stream_fixed(&dir, tco, fb, false);
+        let ours = decode_stream_fixed(&dir, tco, fb, false, None);
+        assert_eq!(ours.len(), reference.len(), "{tco}: sample budget");
+        let c = corr(&reference, &ours);
+        let snr = snr_db(&reference, &ours);
+        let (exact, max_d) = exactness(&reference, &ours);
+        eprintln!(
+            "fixed {tco}: corr {c:.4}, SNR {snr:.2} dB, exact {:.2}%, max|d| {max_d}",
+            exact * 100.0
+        );
+        assert!(
+            c >= corr_floor,
+            "{tco}: corr {c:.4} under floor {corr_floor}"
+        );
+        assert!(
+            snr >= snr_floor,
+            "{tco}: SNR {snr:.2} under floor {snr_floor}"
+        );
+    }
+}
+
+/// Fixed-point decoder tracking on the post-filter-ON decoder vectors
+/// (PATHD63P / OVERD63P / TAMED63P per TSTG7231 Table 1) — the full
+/// §3.6 pitch post-filter → §3.7 synthesis → §3.8 formant → §3.9 AGC
+/// chain in saturating integer arithmetic, with CRC-driven erasure
+/// concealment where a companion track exists. r391 measured floors.
+#[test]
+fn fixed_decoder_tracks_pf_on_vectors() {
+    let Some(dir) = corpus_dir() else { return };
+    // r391 measured: PATHD63P 0.7743 / +3.51 dB, OVERD63P 0.3989 /
+    // +0.75 dB, TAMED63P 0.1086 / −2.19 dB. (Float baseline before
+    // this round: 0.02 / −12.8 dB, 0.01 / −3.8 dB, −0.00 / −1.1 dB.)
+    // The OVER/TAME whole-file numbers stay loose pending the
+    // reference's clause-5 overflow protocol.
+    for (tco, rou, crc, corr_floor, snr_floor) in [
+        (
+            "PATHD63P.TCO",
+            "PATHD63P.ROU",
+            Some("PATHD63P.CRC"),
+            0.75f64,
+            3.0f64,
+        ),
+        ("OVERD63P.TCO", "OVERD63P.ROU", None, 0.35, 0.5),
+        (
+            "TAMED63P.TCO",
+            "TAMED63P.ROU",
+            Some("TAMED63P.CRC"),
+            0.05,
+            -3.0,
+        ),
+    ] {
+        let reference = read_pcm(&dir, rou);
+        let ours = decode_stream_fixed(&dir, tco, 24, true, crc);
         assert_eq!(ours.len(), reference.len(), "{tco}: sample budget");
         let c = corr(&reference, &ours);
         let snr = snr_db(&reference, &ours);

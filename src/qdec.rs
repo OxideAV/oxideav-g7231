@@ -35,10 +35,6 @@
 //!   `e[−L−2]` (the literal "(n mod L)" reading skips two samples and
 //!   leads the reference by exactly two samples on PATHD53).
 
-// The module is wired into the decoder stage-by-stage over r391; the
-// allow shrinks as each stage's entry points go live.
-#![allow(dead_code)]
-
 use crate::basicop::*;
 use crate::linepack::{PackedRate, SpecFrameParams};
 use crate::spec_tables::{
@@ -533,6 +529,289 @@ pub(crate) fn frame_lpc_q13(
 }
 
 // ---------------------------------------------------------------------
+// §3.6 pitch post-filter (excitation domain)
+// ---------------------------------------------------------------------
+
+/// §3.6 rate-specific LTP weighting γ_ltp in Q15 (0.1875 high /
+/// 0.25 low — both exact).
+fn ltp_gamma_q15(rate: PackedRate) -> i16 {
+    match rate {
+        PackedRate::High => 6_144,
+        PackedRate::Low => 8_192,
+    }
+}
+
+/// One subframe of the §3.6 forward/backward pitch post-filter
+/// (eq. 42–47) on the wide excitation domain, wide (i64) correlation
+/// arithmetic, Q15 gains.
+///
+/// `hist` is the pre-frame excitation history (most recent last),
+/// `frame` the saved whole-frame excitation, `start` the subframe
+/// offset and `ref_lag` `L_0` for subframes 0–1 / `L_2` for 2–3.
+///
+/// The eq. 45–46 prediction-gain gate `−10·log10(1 − C²/(D·T)) <
+/// 1.25 dB` is the exact ratio test `4·C² < D·T` (1 − 10^(−0.125) =
+/// 0.2501 — the spec constant is a quarter in the fixed domain).
+fn pitch_postfilter(
+    hist: &[i32],
+    frame: &[i32; FRAME_SIZE_SAMPLES],
+    start: usize,
+    ref_lag: i32,
+    rate: PackedRate,
+) -> [i32; SUBFRAME_SIZE] {
+    let mut sf = [0i32; SUBFRAME_SIZE];
+    sf.copy_from_slice(&frame[start..start + SUBFRAME_SIZE]);
+
+    let lag_c = ref_lag.clamp(
+        crate::tables::PITCH_MIN as i32,
+        crate::tables::PITCH_MAX as i32,
+    );
+    let m_lo = (lag_c - 3).max(1);
+    let m_hi = lag_c + 3;
+
+    // eq. 44.3 subframe energy.
+    let mut t_en = 0i64;
+    for &v in sf.iter() {
+        t_en += v as i64 * v as i64;
+    }
+    if t_en == 0 {
+        return sf;
+    }
+
+    let hlen = hist.len();
+    let past = |gidx: isize| -> i64 {
+        if gidx >= 0 {
+            frame[gidx as usize] as i64
+        } else {
+            let k = (-gidx) as usize;
+            if k <= hlen {
+                hist[hlen - k] as i64
+            } else {
+                0
+            }
+        }
+    };
+
+    // Forward search (eq. 43.1) with the §3.6 availability rule: any
+    // reach past the saved frame drops the candidate.
+    let mut best_f: Option<(usize, i64, i64)> = None; // (M, C, D)
+    for m in m_lo..=m_hi {
+        let mu = m as usize;
+        if start + SUBFRAME_SIZE - 1 + mu >= FRAME_SIZE_SAMPLES {
+            continue;
+        }
+        let (mut c, mut d) = (0i64, 0i64);
+        for n in 0..SUBFRAME_SIZE {
+            let x = frame[start + n + mu] as i64;
+            c += sf[n] as i64 * x;
+            d += x * x;
+        }
+        let better = |best: &Option<(usize, i64, i64)>| {
+            best.map_or(true, |(_, bc, bd)| {
+                (c as i128 * c as i128) * bd as i128 > (bc as i128 * bc as i128) * d as i128
+            })
+        };
+        if c > 0 && d > 0 && better(&best_f) {
+            best_f = Some((mu, c, d));
+        }
+    }
+
+    // Backward search (eq. 43.2), reaching into the history.
+    let mut best_b: Option<(usize, i64, i64)> = None;
+    for m in m_lo..=m_hi {
+        let mu = m as usize;
+        let (mut c, mut d) = (0i64, 0i64);
+        for n in 0..SUBFRAME_SIZE {
+            let x = past((start + n) as isize - mu as isize);
+            c += sf[n] as i64 * x;
+            d += x * x;
+        }
+        let better = |best: &Option<(usize, i64, i64)>| {
+            best.map_or(true, |(_, bc, bd)| {
+                (c as i128 * c as i128) * bd as i128 > (bc as i128 * bc as i128) * d as i128
+            })
+        };
+        if c > 0 && d > 0 && better(&best_b) {
+            best_b = Some((mu, c, d));
+        }
+    }
+
+    // Case selection (§3.6 cases 0–3): larger C²/D wins.
+    let metric = |o: &Option<(usize, i64, i64)>| -> i128 {
+        o.map_or(-1, |(_, c, d)| {
+            // C²/D as a comparable rational — scale by 2^20 for
+            // integer comparison headroom.
+            (c as i128 * c as i128) / d.max(1) as i128
+        })
+    };
+    let mf = metric(&best_f);
+    let mb = metric(&best_b);
+    if mf < 0 && mb < 0 {
+        return sf;
+    }
+    let (m_best, c, d, forward) = if mf >= mb {
+        let (m, c, d) = best_f.unwrap();
+        (m, c, d, true)
+    } else {
+        let (m, c, d) = best_b.unwrap();
+        (m, c, d, false)
+    };
+
+    // Prediction-gain gate: skip unless 4·C² ≥ D·T_en (= 1.25 dB).
+    if 4 * (c as i128 * c as i128) < d as i128 * t_en as i128 {
+        return sf;
+    }
+
+    // eq. 46: g = C/D in Q15, clamped to [0, 1]; weighted by γ_ltp.
+    let g_q15: i64 = if c >= d {
+        32_767
+    } else {
+        ((c << 15) / d.max(1)).clamp(0, 32_767)
+    };
+    let gg_q15 = (g_q15 * ltp_gamma_q15(rate) as i64) >> 15;
+
+    // eq. 42 inner term + eq. 47 energy-normalising gain.
+    let mut ppf = [0i32; SUBFRAME_SIZE];
+    let mut den = 0i64;
+    for n in 0..SUBFRAME_SIZE {
+        let x = if forward {
+            frame[start + n + m_best] as i64
+        } else {
+            past((start + n) as isize - m_best as isize)
+        };
+        let v = sat32(sf[n] as i64 + ((gg_q15 * x) >> 15));
+        ppf[n] = v;
+        den += v as i64 * v as i64;
+    }
+    // eq. 47: g_p = √(T_en / Σ ppf′²), forced to 1 when the denominator
+    // is smaller than the numerator (attenuate-only).
+    if den < t_en || den == 0 {
+        return ppf;
+    }
+    // Q15 root of the Q30-scaled ratio.
+    let ratio_q30 = ((t_en as i128) << 30) / den as i128;
+    let gp_q15 = isqrt64(ratio_q30 as u64) as i64;
+    for v in ppf.iter_mut() {
+        *v = sat32(((*v as i64 * gp_q15) + (1 << 14)) >> 15);
+    }
+    ppf
+}
+
+// ---------------------------------------------------------------------
+// §3.8 formant post-filter + tilt, §3.9 gain scaling
+// ---------------------------------------------------------------------
+
+/// Post-filter state (all §3.11-zeroed except the AGC gain).
+#[derive(Clone)]
+struct PostfilterState {
+    /// A(z/λ1) FIR memory (input history, most recent first).
+    num_mem: [i16; LPC_ORDER],
+    /// 1/A(z/λ2) IIR memory (output history, most recent first).
+    den_mem: [i16; LPC_ORDER],
+    /// One-sample tilt-compensation memory.
+    tilt_prev: i16,
+    /// eq. 49.2 smoothed k1 in Q15.
+    tilt_k1: i16,
+    /// §3.9 smoothed AGC gain in Q12 (unity = 4096 at cold start).
+    agc_gain_q12: i32,
+}
+
+impl PostfilterState {
+    fn new() -> Self {
+        Self {
+            num_mem: [0; LPC_ORDER],
+            den_mem: [0; LPC_ORDER],
+            tilt_prev: 0,
+            tilt_k1: 0,
+            agc_gain_q12: 1 << 12,
+        }
+    }
+
+    /// §3.8 formant post-filter (eq. 49.1–49.3) + §3.9 gain scaling
+    /// (eq. 50–52) over one Word16 subframe of synthesis output.
+    fn formant_agc_subframe(
+        &mut self,
+        a: &[i16; LPC_ORDER],
+        sy: &[i16; SUBFRAME_SIZE],
+        out: &mut [i16; SUBFRAME_SIZE],
+    ) {
+        // Weighted coefficient sets: ã·λ1^i (numerator) / ã·λ2^i
+        // (denominator), Q13 × Q15 → Q13.
+        let mut an = [0i16; LPC_ORDER];
+        let mut ad = [0i16; LPC_ORDER];
+        for i in 0..LPC_ORDER {
+            an[i] = mult(a[i], crate::spec_tables::POSTFILTER_ZERO_Q15[i]);
+            ad[i] = mult(a[i], crate::spec_tables::POSTFILTER_POLE_Q15[i]);
+        }
+        // ARMA filter: w[n] = sy[n] − Σ an·sy[n−i] (F(z) numerator is
+        // 1 − Σ ã λ1 z⁻¹ with ã the eq. 48 predictor taps), then
+        // y[n] = w[n] + Σ ad·y[n−i].
+        let mut after_formant = [0i16; SUBFRAME_SIZE];
+        for n in 0..SUBFRAME_SIZE {
+            let x = sy[n];
+            let mut acc = (x as i64) << 13;
+            for k in 0..LPC_ORDER {
+                acc -= an[k] as i64 * self.num_mem[k] as i64;
+                acc += ad[k] as i64 * self.den_mem[k] as i64;
+            }
+            let y = saturate(sat32((acc + (1 << 12)) >> 13));
+            for k in (1..LPC_ORDER).rev() {
+                self.num_mem[k] = self.num_mem[k - 1];
+                self.den_mem[k] = self.den_mem[k - 1];
+            }
+            self.num_mem[0] = x;
+            self.den_mem[0] = y;
+            after_formant[n] = y;
+        }
+
+        // eq. 49.1–49.2 tilt compensation: k = r(1)/r(0) of the
+        // synthesis input in Q15, smoothed 3/4·old + 1/4·new, applied
+        // as (1 − 0.25·k1·z⁻¹).
+        let (mut r0, mut r1) = (0i64, 0i64);
+        for n in 1..SUBFRAME_SIZE {
+            r0 += sy[n] as i64 * sy[n] as i64;
+            r1 += sy[n] as i64 * sy[n - 1] as i64;
+        }
+        r0 += sy[0] as i64 * sy[0] as i64;
+        let k_q15: i32 = if r0 > 0 {
+            (((r1 << 15) / r0).clamp(-32_768, 32_767)) as i32
+        } else {
+            0
+        };
+        self.tilt_k1 = saturate((3 * self.tilt_k1 as i32 + k_q15 + 2) >> 2);
+        let mu_q15 = (self.tilt_k1 >> 2) as i32; // 0.25 · k1
+        let mut after_tilt = [0i16; SUBFRAME_SIZE];
+        let mut prev = self.tilt_prev;
+        for n in 0..SUBFRAME_SIZE {
+            let x = after_formant[n];
+            after_tilt[n] = saturate(x as i32 - ((mu_q15 * prev as i32) >> 15));
+            prev = x;
+        }
+        self.tilt_prev = prev;
+
+        // §3.9 gain scaling: g_s = √(Σ sy² / Σ pf²) in Q12, leaky
+        // integrator with α = 1/16, output boost (1 + α) = 17/16.
+        let (mut e_in, mut e_out) = (0i64, 0i64);
+        for n in 0..SUBFRAME_SIZE {
+            e_in += sy[n] as i64 * sy[n] as i64;
+            e_out += after_tilt[n] as i64 * after_tilt[n] as i64;
+        }
+        let gs_q12: i32 = if e_out == 0 {
+            1 << 12
+        } else {
+            let ratio_q24 = ((e_in as i128) << 24) / e_out as i128;
+            (isqrt64(ratio_q24.min(u64::MAX as i128) as u64) as i32).min(1 << 20)
+        };
+        for n in 0..SUBFRAME_SIZE {
+            // g[n] = (1 − 1/16)·g[n−1] + (1/16)·g_s, per sample.
+            self.agc_gain_q12 += (gs_q12 - self.agc_gain_q12) >> 4;
+            let q = (after_tilt[n] as i64 * self.agc_gain_q12 as i64 * 17 + (1 << 15)) >> 16;
+            out[n] = saturate(sat32(q));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Frame-level fixed-point decoder
 // ---------------------------------------------------------------------
 
@@ -548,6 +827,22 @@ pub struct QSynthesis {
     prev_lsp: [i16; LPC_ORDER],
     exc_hist: [i32; EXC_HIST],
     syn_mem: [i32; LPC_ORDER],
+    pf: PostfilterState,
+    // §3.10 concealment state -----------------------------------------
+    /// Last decoded subframe-3 lag.
+    last_lag: i32,
+    /// Last decoded subframe-2 lag (classifier centre).
+    last_lag2: i32,
+    /// Tap sum of the last subframe's gain row in Q15 (voiced replay
+    /// gain), clamped to [0, 1].
+    last_taps_sum_q15: i32,
+    /// Average of the last frame's subframe-2/3 fixed-codebook
+    /// amplitudes (doubled domain) — the unvoiced drive level.
+    last_gain_unvoiced: i32,
+    /// Trailing 120 samples of decoded output for the classifier.
+    pcm_hist: [i16; crate::tables::ERASURE_CLASSIFIER_HISTORY_LEN],
+    /// Consecutive erased frames (0 = last frame was good).
+    erased_run: u32,
     postfilter: bool,
     /// Synthesis-memory domain (vector-arbitration switch): `true`
     /// carries Word16-saturated values in the recursion, `false` the
@@ -561,6 +856,13 @@ impl QSynthesis {
             prev_lsp: lsp_dc(),
             exc_hist: [0; EXC_HIST],
             syn_mem: [0; LPC_ORDER],
+            pf: PostfilterState::new(),
+            last_lag: 60,
+            last_lag2: 60,
+            last_taps_sum_q15: 0,
+            last_gain_unvoiced: 0,
+            pcm_hist: [0; crate::tables::ERASURE_CLASSIFIER_HISTORY_LEN],
+            erased_run: 0,
             postfilter: true,
             clamp_syn_mem: true,
         }
@@ -582,12 +884,6 @@ impl QSynthesis {
         self.postfilter = enabled;
     }
 
-    /// Arbitration switch: synthesis-memory domain (see
-    /// [`synthesis_subframe`]).
-    pub(crate) fn set_clamp_syn_mem(&mut self, clamp: bool) {
-        self.clamp_syn_mem = clamp;
-    }
-
     /// Decode one unpacked clause-4 parameter set into 240 PCM samples.
     pub fn decode_params(&mut self, p: &SpecFrameParams) -> [i16; FRAME_SIZE_SAMPLES] {
         // --- LSP decode (§3.2 → 2.6) with stability fallback.
@@ -606,11 +902,19 @@ impl QSynthesis {
 
         // --- Whole-frame excitation (§3.6 requires it generated and
         // saved before the pitch post-filter runs). The loop runs in
-        // the wide Word32 domain (see [`acb_contribution`]).
+        // the wide Word32 domain (see [`acb_contribution`]). The
+        // pre-frame history is snapshotted for the pitch post-filter's
+        // backward reach.
+        let hist_snapshot = self.exc_hist;
         let mut exc = [0i32; FRAME_SIZE_SAMPLES];
+        let mut fcb_gains = [0i32; SUBFRAMES_PER_FRAME];
+        let mut last_taps_sum_q15 = 0i32;
         for s in 0..SUBFRAMES_PER_FRAME {
             let lag_base = if s < 2 { lags[0] } else { lags[2] };
             let g = gain_decode(p.rate, lag_base, p.gain[s]);
+            fcb_gains[s] = g.fcb_gain as i32;
+            // Effective tap value is q/16384; Q15 sum is Σq·2.
+            last_taps_sum_q15 = g.taps.iter().map(|&t| t as i32 * 2).sum();
             let u = acb_contribution(&self.exc_hist, lags[s], &g.taps);
             let v = match p.rate {
                 PackedRate::High => {
@@ -637,22 +941,34 @@ impl QSynthesis {
             self.push_excitation(&exc[start..start + SUBFRAME_SIZE]);
         }
 
-        // --- §3.7 synthesis per subframe on the interpolated Q13 LPC.
-        // (§3.6 pitch post-filter + §3.8/§3.9 back half land with the
-        // post-filter stage; until then the switch selects the plain
-        // synthesis output on both settings.)
+        // --- §3.6 pitch post-filter on the saved excitation, §3.7
+        // synthesis, then the §3.8/§3.9 back half, per subframe.
         let lpc = frame_lpc_q13(&self.prev_lsp, &cur);
         let mut pcm = [0i16; FRAME_SIZE_SAMPLES];
         for s in 0..SUBFRAMES_PER_FRAME {
             let start = s * SUBFRAME_SIZE;
-            let mut x = [0i32; SUBFRAME_SIZE];
-            x.copy_from_slice(&exc[start..start + SUBFRAME_SIZE]);
+            let x = if self.postfilter {
+                let ref_lag = if s < 2 { lags[0] } else { lags[2] };
+                pitch_postfilter(&hist_snapshot, &exc, start, ref_lag, p.rate)
+            } else {
+                let mut x = [0i32; SUBFRAME_SIZE];
+                x.copy_from_slice(&exc[start..start + SUBFRAME_SIZE]);
+                x
+            };
             let mut sy = [0i16; SUBFRAME_SIZE];
             synthesis_subframe(&lpc[s], &x, &mut self.syn_mem, &mut sy, self.clamp_syn_mem);
-            pcm[start..start + SUBFRAME_SIZE].copy_from_slice(&sy);
+            if self.postfilter {
+                let mut post = [0i16; SUBFRAME_SIZE];
+                self.pf.formant_agc_subframe(&lpc[s], &sy, &mut post);
+                pcm[start..start + SUBFRAME_SIZE].copy_from_slice(&post);
+            } else {
+                pcm[start..start + SUBFRAME_SIZE].copy_from_slice(&sy);
+            }
         }
 
         self.prev_lsp = cur;
+        self.record_last_frame(&lags, last_taps_sum_q15, fcb_gains[2], fcb_gains[3]);
+        self.record_pcm_history(&pcm);
         pcm
     }
 
@@ -661,6 +977,212 @@ impl QSynthesis {
         self.exc_hist.copy_within(SUBFRAME_SIZE.., 0);
         let tail = EXC_HIST - SUBFRAME_SIZE;
         self.exc_hist[tail..].copy_from_slice(sub);
+    }
+
+    /// Decode one 5.3 kbit/s (ACELP) clause-4 payload: Table 6 unpack
+    /// + rate check + the fixed-point §3.1 pipeline.
+    pub fn decode_acelp(
+        &mut self,
+        payload: &[u8],
+    ) -> oxideav_core::Result<[i16; FRAME_SIZE_SAMPLES]> {
+        let params = crate::linepack::unpack_frame(payload)?;
+        if params.rate != PackedRate::Low {
+            return Err(oxideav_core::Error::invalid(
+                "G.723.1 decoder: expected RATEFLAG=1 (5.3 kbit/s ACELP)",
+            ));
+        }
+        Ok(self.decode_params(&params))
+    }
+
+    /// Decode one 6.3 kbit/s (MP-MLQ) clause-4 payload: Table 5 unpack
+    /// (MSBPOS split) + rate check + the fixed-point §3.1 pipeline.
+    pub fn decode_mpmlq(
+        &mut self,
+        payload: &[u8],
+    ) -> oxideav_core::Result<[i16; FRAME_SIZE_SAMPLES]> {
+        let params = crate::linepack::unpack_frame(payload)?;
+        if params.rate != PackedRate::High {
+            return Err(oxideav_core::Error::invalid(
+                "G.723.1 decoder: expected RATEFLAG=0 (6.3 kbit/s MP-MLQ)",
+            ));
+        }
+        Ok(self.decode_params(&params))
+    }
+
+    /// §3.10 frame-erasure concealment in fixed point.
+    ///
+    /// 1. **LSP** (§3.10.1): residual zeroed, predictor `b_e = 23/32`,
+    ///    stability at the relaxed `Δ_min = 512` units (62.5 Hz).
+    /// 2. **Residual** (§3.10.2): the voiced/unvoiced classifier
+    ///    cross-correlates the saved 120-sample post-filtered tail with
+    ///    itself at `L_2 ± 3`; the 0.58 dB prediction-gain threshold is
+    ///    the exact ratio test `8·C² ≥ E·T` (1 − 10^(−0.058) = 0.1249 —
+    ///    one eighth in the fixed domain). Voiced frames replay the
+    ///    excitation periodically at the classifier lag scaled by the
+    ///    saved tap-sum gain; unvoiced frames drive a deterministic LCG
+    ///    innovation scaled by the saved subframe-2/3 average gain.
+    ///    Each consecutive erased frame attenuates by 2.5 dB
+    ///    (≈ 3/4 = 24576 in Q15); after 3 frames the output mutes.
+    pub fn decode_erased(&mut self) -> [i16; FRAME_SIZE_SAMPLES] {
+        self.erased_run = self.erased_run.saturating_add(1);
+
+        // Cumulative 3/4-per-frame attenuation in Q15 (0 = mute).
+        let mut atten_q15: i32 = if self.erased_run > crate::tables::ERASURE_MUTE_AFTER_FRAMES {
+            0
+        } else {
+            let mut a: i32 = 1 << 15;
+            for _ in 0..self.erased_run {
+                a = (a * 24_576) >> 15;
+            }
+            a
+        };
+        if self.erased_run > crate::tables::ERASURE_MUTE_AFTER_FRAMES {
+            atten_q15 = 0;
+        }
+
+        // §3.10.1 LSP extrapolation with the relaxed ordering floor.
+        let cur = lsp_check_or_previous(
+            lsp_extrapolate(&self.prev_lsp),
+            &self.prev_lsp,
+            LSP_DELTA_MIN_ERASURE_Q15,
+        );
+
+        // §3.10.2 classifier.
+        let (voiced, class_lag) = self.classify_erasure_voicing();
+        let lag = if voiced { class_lag } else { self.last_lag }.clamp(
+            crate::tables::PITCH_MIN as i32,
+            crate::tables::PITCH_MAX as i32,
+        );
+
+        // Deterministic LCG innovation for the unvoiced branch.
+        let mut lcg = 0xDEAD_BEEFu32.wrapping_add(self.erased_run.wrapping_mul(0x9E37_79B9));
+        let mut next_rand_q15 = || -> i32 {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (((lcg >> 8) & 0xFFFF) as i32) - 32_768
+        };
+
+        let g_adapt_q15 = ((self.last_taps_sum_q15 as i64 * atten_q15 as i64) >> 15) as i32;
+        let g_unvoiced = ((self.last_gain_unvoiced as i64 * atten_q15 as i64) >> 15) as i32;
+
+        let lpc = frame_lpc_q13(&self.prev_lsp, &cur);
+        let mut pcm = [0i16; FRAME_SIZE_SAMPLES];
+        for s in 0..SUBFRAMES_PER_FRAME {
+            // Regenerated excitation for this subframe.
+            let mut exc = [0i32; SUBFRAME_SIZE];
+            if voiced {
+                // Periodic replay of the excitation history at the
+                // classifier pitch, tap-sum scaled.
+                let l = lag as usize;
+                let hlen = self.exc_hist.len();
+                for n in 0..SUBFRAME_SIZE {
+                    let idx = if l > n {
+                        hlen - (l - n)
+                    } else {
+                        hlen - l + ((n - l) % l)
+                    };
+                    exc[n] = sat32((self.exc_hist[idx] as i64 * g_adapt_q15 as i64) >> 15);
+                }
+            } else {
+                for e in exc.iter_mut() {
+                    *e = sat32((g_unvoiced as i64 * next_rand_q15() as i64) >> 15);
+                }
+            }
+            for e in exc.iter_mut() {
+                *e = (*e).clamp(-EXC_RAIL - 1, EXC_RAIL);
+            }
+            self.push_excitation(&exc);
+
+            // Synthesis + (formant-only) post-filter — concealment
+            // regenerates the excitation directly, so the §3.6 pitch
+            // post-filter is skipped like the float path does.
+            let mut sy = [0i16; SUBFRAME_SIZE];
+            synthesis_subframe(
+                &lpc[s],
+                &exc,
+                &mut self.syn_mem,
+                &mut sy,
+                self.clamp_syn_mem,
+            );
+            let start = s * SUBFRAME_SIZE;
+            if self.postfilter {
+                let mut post = [0i16; SUBFRAME_SIZE];
+                self.pf.formant_agc_subframe(&lpc[s], &sy, &mut post);
+                pcm[start..start + SUBFRAME_SIZE].copy_from_slice(&post);
+            } else {
+                pcm[start..start + SUBFRAME_SIZE].copy_from_slice(&sy);
+            }
+        }
+
+        // The concealed vector feeds the next frame's predictor
+        // (§3.10.1) and the classifier history.
+        self.prev_lsp = cur;
+        self.record_pcm_history(&pcm);
+        pcm
+    }
+
+    /// §3.10.2 voiced/unvoiced classifier on the saved 120-sample
+    /// post-filtered tail: forward autocorrelation at `L_2 ± 3`,
+    /// prediction-gain threshold 0.58 dB as the ratio test `8·C² ≥ E·T`.
+    fn classify_erasure_voicing(&self) -> (bool, i32) {
+        let hist = &self.pcm_hist;
+        let n = hist.len();
+        let centre = self.last_lag2;
+        let mut best_lag = centre;
+        let mut voiced = false;
+        let mut best_r_q30 = -1i128; // C²/(E·T) in Q30
+        for d in -3i32..=3 {
+            let lag = (d + centre).clamp(
+                crate::tables::PITCH_MIN as i32,
+                crate::tables::PITCH_MAX as i32,
+            ) as usize;
+            if lag >= n {
+                continue;
+            }
+            let (mut c, mut e, mut t) = (0i64, 0i64, 0i64);
+            for k in lag..n {
+                let curv = hist[k] as i64;
+                let prev = hist[k - lag] as i64;
+                c += curv * prev;
+                e += prev * prev;
+                t += curv * curv;
+            }
+            if e == 0 || t == 0 || c <= 0 {
+                continue;
+            }
+            // Rank candidates by C²/(E·T) in Q30 (num ≤ 2^74, so the
+            // shifted numerator stays inside i128).
+            let num = c as i128 * c as i128;
+            let den = (e as i128 * t as i128).max(1);
+            let r_q30 = (num << 30) / den;
+            if r_q30 > best_r_q30 {
+                best_r_q30 = r_q30;
+                best_lag = lag as i32;
+                // 0.58 dB gate: voiced iff 8·C² ≥ E·T.
+                voiced = num * 8 >= den;
+            }
+        }
+        (voiced, best_lag)
+    }
+
+    /// Save the §3.10.2 classifier inputs from a decoded frame.
+    fn record_last_frame(
+        &mut self,
+        lags: &[i32; SUBFRAMES_PER_FRAME],
+        taps_sum_q15: i32,
+        g2: i32,
+        g3: i32,
+    ) {
+        self.last_lag = lags[SUBFRAMES_PER_FRAME - 1];
+        self.last_lag2 = lags[2];
+        self.last_taps_sum_q15 = taps_sum_q15.clamp(0, 32_767);
+        self.last_gain_unvoiced = (g2 + g3) / 2;
+        self.erased_run = 0;
+    }
+
+    /// Update the trailing-PCM classifier history from a fresh frame.
+    fn record_pcm_history(&mut self, pcm: &[i16; FRAME_SIZE_SAMPLES]) {
+        let tail = FRAME_SIZE_SAMPLES - self.pcm_hist.len();
+        self.pcm_hist.copy_from_slice(&pcm[tail..]);
     }
 }
 

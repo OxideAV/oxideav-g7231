@@ -37,16 +37,18 @@
 //! # Decoder
 //!
 //! [`Decoder::send_packet`] dispatches on the rate discriminator and
-//! routes ACELP / MP-MLQ payloads through the matching
-//! [`encoder::SynthesisState`] entry points (clause-4 unpack + the §3.1
-//! spec-table pipeline). The chain is
-//! synthesis → pitch post-filter → formant post-filter
-//! (A(z/γ₁)/A(z/γ₂)) → first-order tilt compensation → smoothed AGC.
-//! SID / untransmitted packets feed [`encoder::SynthesisState::decode_erased`],
-//! which extrapolates the last lag, attenuates the gains on a per-frame
-//! schedule, and seeds a pseudo-random innovation so repeated loss decays
-//! without audible clicks.  Decoder state persists across packets and
-//! `reset()` reinitialises to silence.
+//! routes ACELP / MP-MLQ payloads through the fixed-point
+//! [`qdec::QSynthesis`] pipeline (clause-4 unpack + the §3.1 chain on
+//! saturating integer arithmetic — see the `qdec` module docs for the
+//! conformance-vector-arbitrated scaling model). The chain is
+//! pitch post-filter (excitation domain) → synthesis → formant
+//! post-filter (A(z/λ₁)/A(z/λ₂)) → first-order tilt compensation →
+//! smoothed AGC. SID / untransmitted packets feed
+//! [`qdec::QSynthesis::decode_erased`], which extrapolates the LSP
+//! envelope toward `p_DC`, replays or regenerates the excitation per
+//! the §3.10.2 classifier, and attenuates 2.5 dB per erased frame.
+//! Decoder state persists across packets and `reset()` reinitialises
+//! to silence.
 //!
 //! # Wire format
 //!
@@ -121,23 +123,23 @@ fn make_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 /// Full-synthesis G.723.1 decoder. Dispatches on the 2-bit rate
 /// discriminator in the first payload byte:
 ///
-/// - `00` → 6.3 kbit/s MP-MLQ, routed through [`encoder::SynthesisState::decode_mpmlq`]
-/// - `01` → 5.3 kbit/s ACELP,  routed through [`encoder::SynthesisState::decode_acelp`]
+/// - `00` → 6.3 kbit/s MP-MLQ, routed through [`qdec::QSynthesis::decode_mpmlq`]
+/// - `01` → 5.3 kbit/s ACELP,  routed through [`qdec::QSynthesis::decode_acelp`]
 /// - `10` → SID (silence-insertion descriptor) — handled by the same
-///          concealment path as erasures ([`encoder::SynthesisState::decode_erased`])
+///          concealment path as erasures ([`qdec::QSynthesis::decode_erased`])
 ///          since we do not yet parse SID parameters
-/// - `11` → Untransmitted (erasure) — [`encoder::SynthesisState::decode_erased`]
+/// - `11` → Untransmitted (erasure) — [`qdec::QSynthesis::decode_erased`]
 ///          extrapolates the last frame with attenuated gains and a
 ///          pseudo-random innovation so repeated loss fades smoothly
 ///
 /// State (excitation history, previous-frame LSP, synthesis filter
-/// memory, post-filter memory) persists across packets via
-/// [`encoder::SynthesisState`] so a steady stream of packets decodes
-/// without per-frame cold-start transients. `reset()` reinitialises the
-/// synthesiser to silence.
+/// memory, post-filter memory) persists across packets via the
+/// fixed-point [`qdec::QSynthesis`] so a steady stream of packets
+/// decodes without per-frame cold-start transients. `reset()`
+/// reinitialises the synthesiser to silence.
 struct G7231Decoder {
     codec_id: CodecId,
-    synthesis: encoder::SynthesisState,
+    synthesis: qdec::QSynthesis,
     pending: std::collections::VecDeque<Frame>,
     drained: bool,
     next_pts: i64,
@@ -147,7 +149,7 @@ impl G7231Decoder {
     fn new() -> Self {
         Self {
             codec_id: CodecId::new(CODEC_ID_STR),
-            synthesis: encoder::SynthesisState::new(),
+            synthesis: qdec::QSynthesis::new(),
             pending: std::collections::VecDeque::new(),
             drained: false,
             next_pts: 0,
