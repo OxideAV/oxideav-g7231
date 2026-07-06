@@ -954,7 +954,7 @@ fn cheby_roots(coeffs: &[f32]) -> Vec<f32> {
 }
 
 /// Convert LSPs (cosine-domain) back to direct-form LPC coefficients.
-fn lsp_to_lpc(lsp: &[f32; LPC_ORDER]) -> [f32; LPC_ORDER + 1] {
+pub(crate) fn lsp_to_lpc(lsp: &[f32; LPC_ORDER]) -> [f32; LPC_ORDER + 1] {
     // Reconstruct A(z) from LSPs in the cosine domain. Standard
     // construction (e.g. ITU-T G.729 / G.723.1 reference):
     //
