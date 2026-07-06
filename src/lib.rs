@@ -66,6 +66,7 @@
     clippy::doc_overindented_list_items
 )]
 
+pub mod basicop;
 pub mod bitreader;
 pub mod encoder;
 pub mod header;
