@@ -33,8 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      covers stream samples `[k·240 − 60, k·240 + 180)`. This is how
      the spec's 7.5 ms lookahead / 37.5 ms total delay is realised;
      at this offset (and no other) the encoder's LSP decisions lock
-     to the reference. The r405-interim lookahead-parameter API is
-     gone again: `SpecEncoder::encode_frame(pcm)` and the registry
+     to the reference. The interim lookahead-parameter API from
+     earlier in this round is gone again:
+     `SpecEncoder::encode_frame(pcm)` and the registry
      encoder are back to plain 240-sample blocks with the delay
      handled internally.
   3. **Output scale**: the synthesis output is emitted *unshifted*
