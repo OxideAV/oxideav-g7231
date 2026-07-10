@@ -27,6 +27,13 @@ pub const LPC_WINDOW: usize = 180;
 pub const PITCH_MIN: usize = 18;
 pub const PITCH_MAX: usize = 142;
 
+/// Encoder lookahead in samples (§2.4): the LPC analysis window of
+/// [`LPC_WINDOW`] samples is *centered* on each 60-sample subframe, so
+/// the last subframe's window reaches 60 samples past the frame end —
+/// the 7.5 ms of algorithmic lookahead that makes G.723.1's total
+/// one-way delay 37.5 ms.
+pub const LOOKAHEAD_SAMPLES: usize = SUBFRAME_SIZE;
+
 /// High-rate (6.3 kbit/s, MP-MLQ) frame size in bytes (§5.4, Table 6).
 pub const HIGH_RATE_BYTES: usize = 24;
 /// Total bits per 6.3 kbit/s frame.

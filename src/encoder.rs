@@ -64,12 +64,12 @@ use crate::spec_lsp;
 use crate::tables::{
     ERASURE_ATTENUATION_DB_PER_FRAME, ERASURE_CLASSIFIER_HISTORY_LEN,
     ERASURE_CLASSIFIER_LAG_RADIUS, ERASURE_MUTE_AFTER_FRAMES, ERASURE_VOICED_THRESHOLD_DB,
-    FRAME_SIZE_SAMPLES, HIGH_RATE_BYTES, LOW_RATE_BYTES, LPC_ORDER, LSP_PREDICTOR_BE,
-    LSP_STABILITY_DELTA_MIN_ERASURE_HZ, LSP_STABILITY_DELTA_MIN_HZ, LSP_STABILITY_MAX_ITERATIONS,
-    PITCH_MAX, PITCH_MIN, POSTFILTER_AGC_ALPHA, POSTFILTER_AGC_INIT_GAIN,
-    POSTFILTER_LTP_GAMMA_HIGH, POSTFILTER_LTP_GAMMA_LOW, POSTFILTER_LTP_PRED_GAIN_DB_MIN,
-    POSTFILTER_LTP_SEARCH_RADIUS, POSTFILTER_TILT_BASE, POSTFILTER_TILT_SMOOTH_ALPHA,
-    SAMPLE_RATE_HZ, SUBFRAMES_PER_FRAME, SUBFRAME_SIZE,
+    FRAME_SIZE_SAMPLES, HIGH_RATE_BYTES, LOOKAHEAD_SAMPLES, LOW_RATE_BYTES, LPC_ORDER, LPC_WINDOW,
+    LSP_PREDICTOR_BE, LSP_STABILITY_DELTA_MIN_ERASURE_HZ, LSP_STABILITY_DELTA_MIN_HZ,
+    LSP_STABILITY_MAX_ITERATIONS, PITCH_MAX, PITCH_MIN, POSTFILTER_AGC_ALPHA,
+    POSTFILTER_AGC_INIT_GAIN, POSTFILTER_LTP_GAMMA_HIGH, POSTFILTER_LTP_GAMMA_LOW,
+    POSTFILTER_LTP_PRED_GAIN_DB_MIN, POSTFILTER_LTP_SEARCH_RADIUS, POSTFILTER_TILT_BASE,
+    POSTFILTER_TILT_SMOOTH_ALPHA, SAMPLE_RATE_HZ, SUBFRAMES_PER_FRAME, SUBFRAME_SIZE,
 };
 
 /// Total payload size for an ACELP (5.3 kbit/s) frame.
@@ -235,32 +235,47 @@ impl Encoder for G7231Encoder {
 
 impl G7231Encoder {
     fn drain(&mut self, final_flush: bool) {
-        while self.pcm_queue.len() >= FRAME_SIZE_SAMPLES {
+        // §2.4 windowing needs 60 samples of lookahead past the frame
+        // end, so a frame is emitted only once its lookahead is
+        // buffered too. On the final flush the missing lookahead (and
+        // any partial final frame) is zero-padded — the encoder's
+        // §2.21 rest state.
+        while self.pcm_queue.len() >= FRAME_SIZE_SAMPLES + LOOKAHEAD_SAMPLES {
             let mut pcm = [0i16; FRAME_SIZE_SAMPLES];
             pcm.copy_from_slice(&self.pcm_queue[..FRAME_SIZE_SAMPLES]);
+            let mut la = [0i16; LOOKAHEAD_SAMPLES];
+            la.copy_from_slice(
+                &self.pcm_queue[FRAME_SIZE_SAMPLES..FRAME_SIZE_SAMPLES + LOOKAHEAD_SAMPLES],
+            );
             self.pcm_queue.drain(..FRAME_SIZE_SAMPLES);
-            self.emit_frame(&pcm);
+            self.emit_frame(&pcm, &la);
         }
-        if final_flush && !self.pcm_queue.is_empty() {
-            let mut pcm = [0i16; FRAME_SIZE_SAMPLES];
-            let n = self.pcm_queue.len();
-            for (i, &s) in self.pcm_queue.iter().enumerate() {
-                pcm[i] = s;
+        if final_flush {
+            while !self.pcm_queue.is_empty() {
+                let take = self.pcm_queue.len().min(FRAME_SIZE_SAMPLES);
+                let mut pcm = [0i16; FRAME_SIZE_SAMPLES];
+                pcm[..take].copy_from_slice(&self.pcm_queue[..take]);
+                let mut la = [0i16; LOOKAHEAD_SAMPLES];
+                let rest = (self.pcm_queue.len() - take).min(LOOKAHEAD_SAMPLES);
+                la[..rest].copy_from_slice(&self.pcm_queue[take..take + rest]);
+                self.pcm_queue.drain(..take);
+                self.emit_frame(&pcm, &la);
             }
-            let _ = n;
-            self.pcm_queue.clear();
-            self.emit_frame(&pcm);
         }
     }
 
-    fn emit_frame(&mut self, pcm: &[i16; FRAME_SIZE_SAMPLES]) {
+    fn emit_frame(
+        &mut self,
+        pcm: &[i16; FRAME_SIZE_SAMPLES],
+        lookahead: &[i16; LOOKAHEAD_SAMPLES],
+    ) {
         let frame_idx = self.frame_index;
         self.frame_index += 1;
         let rate = match self.mode {
             EncoderMode::Acelp => PackedRate::Low,
             EncoderMode::MpMlq => PackedRate::High,
         };
-        let params = self.analysis.analyse_spec(pcm, rate);
+        let params = self.analysis.analyse_spec(pcm, lookahead, rate);
         // `analyse_spec` emits in-range indices by construction, so the
         // clause-4 packer cannot reject them.
         let packed = crate::linepack::pack_frame(&params)
@@ -301,6 +316,14 @@ struct AnalysisState {
     hp_x_prev: f32,
     /// One-sample y[n−1] memory of the §2.3 filter.
     hp_y_prev: f32,
+    /// §2.4 windowing look-back: the high-pass-filtered last 60 samples
+    /// of the previous frame. The 180-sample analysis window centered on
+    /// subframe 0 reaches 60 samples *before* the frame start.
+    lpc_tail: [f32; SUBFRAME_SIZE],
+    /// Previous frame's *unquantised* LSP vector (cosine domain) — the
+    /// fallback when the current frame's LPC → LSP root search fails on
+    /// a degenerate model. Initialised to `p_DC` (§2.21).
+    prev_unq_lsp: [f32; LPC_ORDER],
 }
 
 impl AnalysisState {
@@ -310,6 +333,8 @@ impl AnalysisState {
             highpass: true,
             hp_x_prev: 0.0,
             hp_y_prev: 0.0,
+            lpc_tail: [0.0; SUBFRAME_SIZE],
+            prev_unq_lsp: crate::tables::lsp_dc_cosines(),
         }
     }
 
@@ -353,6 +378,7 @@ impl AnalysisState {
     fn analyse_spec(
         &mut self,
         pcm: &[i16; FRAME_SIZE_SAMPLES],
+        lookahead: &[i16; LOOKAHEAD_SAMPLES],
         rate: PackedRate,
     ) -> SpecFrameParams {
         let mut sig = [0.0f32; FRAME_SIZE_SAMPLES];
@@ -364,10 +390,55 @@ impl AnalysisState {
         if self.highpass {
             self.highpass_frame(&mut sig);
         }
+        // The 60 lookahead samples belong to the *next* frame; they are
+        // high-pass filtered with a scratch copy of the filter memory so
+        // they see the same §2.3 output they will when the next frame is
+        // analysed for real, without advancing the committed state.
+        let mut la = [0.0f32; LOOKAHEAD_SAMPLES];
+        for (o, &s) in la.iter_mut().zip(lookahead.iter()) {
+            *o = s as f32 * (1.0 / 32_768.0);
+        }
+        if self.highpass {
+            const POLE: f32 = 127.0 / 128.0;
+            let (mut xp, mut yp) = (self.hp_x_prev, self.hp_y_prev);
+            for v in la.iter_mut() {
+                let x = *v;
+                let y = x - xp + POLE * yp;
+                xp = x;
+                yp = y;
+                *v = y;
+            }
+        }
 
-        // ---- LPC → LSP → spec split VQ (§2.4–2.6). ----
-        let a = lpc_analysis(&sig);
-        let lsp_cur_cos = lpc_to_lsp(&a);
+        // ---- §2.4: per-subframe LPC on the 180-sample centered
+        // windows. The analysis buffer is
+        // [previous-frame tail | this frame | lookahead]; the window
+        // for subframe `s` covers buffer samples `s·60 .. s·60+180`,
+        // i.e. is centered on the subframe.
+        let mut wind_buf = [0.0f32; SUBFRAME_SIZE + FRAME_SIZE_SAMPLES + LOOKAHEAD_SAMPLES];
+        wind_buf[..SUBFRAME_SIZE].copy_from_slice(&self.lpc_tail);
+        wind_buf[SUBFRAME_SIZE..SUBFRAME_SIZE + FRAME_SIZE_SAMPLES].copy_from_slice(&sig);
+        wind_buf[SUBFRAME_SIZE + FRAME_SIZE_SAMPLES..].copy_from_slice(&la);
+        self.lpc_tail
+            .copy_from_slice(&sig[FRAME_SIZE_SAMPLES - SUBFRAME_SIZE..]);
+        let mut a_unq = [[0.0f32; LPC_ORDER + 1]; SUBFRAMES_PER_FRAME];
+        for (s, a_s) in a_unq.iter_mut().enumerate() {
+            *a_s = lpc_analysis(&wind_buf[s * SUBFRAME_SIZE..s * SUBFRAME_SIZE + LPC_WINDOW]);
+        }
+
+        // ---- §2.5: bandwidth-expand A3(z) by 7.5 Hz (the published
+        // Q15 per-tap weights), then quantise it with the predictive
+        // split VQ (§2.5–2.6). Only the last subframe's LPC set is
+        // transmitted.
+        let mut a3_exp = a_unq[SUBFRAMES_PER_FRAME - 1];
+        for (k, w) in crate::spec_tables::LPC_BANDWIDTH_EXPANSION_Q15
+            .iter()
+            .enumerate()
+        {
+            a3_exp[k + 1] *= *w as f32 / 32_768.0;
+        }
+        let lsp_cur_cos = lpc_to_lsp(&a3_exp).unwrap_or(self.prev_unq_lsp);
+        self.prev_unq_lsp = lsp_cur_cos;
         let lsp_cur_freq = spec_lsp::lsp_cosines_to_freq(&lsp_cur_cos);
         let (lsp_index, decoded_freq) =
             spec_lsp::quantise_lsp_freq(&lsp_cur_freq, &self.decoder.prev_lsp_freq);
@@ -749,36 +820,42 @@ fn best_gain_level(c_ty: f32, e_yy: f32, e_tt: f32) -> (usize, f32) {
 
 // ---------- LPC analysis ----------
 
-/// Autocorrelation + Levinson-Durbin on the full 240-sample frame. Output
-/// is `[1, a_1..a_10]` in direct form.
-fn lpc_analysis(sig: &[f32; FRAME_SIZE_SAMPLES]) -> [f32; LPC_ORDER + 1] {
-    // Hamming window of length 240 (approximation of the spec's LPC window).
-    let mut windowed = [0.0f32; FRAME_SIZE_SAMPLES];
-    let n = FRAME_SIZE_SAMPLES as f32;
-    for i in 0..FRAME_SIZE_SAMPLES {
-        let w = 0.54 - 0.46 * ((2.0 * std::f32::consts::PI * i as f32) / (n - 1.0)).cos();
-        windowed[i] = sig[i] * w;
+/// §2.4 LPC analysis on one 180-sample window (a slice of the encoder's
+/// [tail | frame | lookahead] analysis buffer, centered on a subframe).
+/// The published Q15 Hamming window is applied, eleven autocorrelation
+/// coefficients are computed, `R[0]` gets the `1025/1024` white-noise
+/// correction and `R[1..=10]` are shaped by the published Q15 binomial
+/// lag window, then the conventional Levinson-Durbin recursion produces
+/// `[1, a_1..a_10]` in direct form.
+fn lpc_analysis(window: &[f32]) -> [f32; LPC_ORDER + 1] {
+    debug_assert_eq!(window.len(), LPC_WINDOW);
+    let mut windowed = [0.0f32; LPC_WINDOW];
+    for (i, o) in windowed.iter_mut().enumerate() {
+        let w = crate::spec_tables::LPC_HAMMING_WINDOW_Q15[i] as f32 / 32_768.0;
+        *o = window[i] * w;
     }
     // Autocorrelation r[0..=LPC_ORDER].
     let mut r = [0.0f64; LPC_ORDER + 1];
-    for k in 0..=LPC_ORDER {
+    for (k, rk) in r.iter_mut().enumerate() {
         let mut acc = 0.0f64;
-        for i in k..FRAME_SIZE_SAMPLES {
+        for i in k..LPC_WINDOW {
             acc += windowed[i] as f64 * windowed[i - k] as f64;
         }
-        r[k] = acc;
+        *rk = acc;
     }
-    // Small bandwidth-expansion factor on the autocorrelation (white-noise
-    // correction, ~40 Hz lag window).
-    r[0] *= 1.0001;
+    // §2.4: white-noise correction R[0] ← R[0]·(1 + 1/1024), then the
+    // binomial lag window on the other ten coefficients.
+    r[0] *= 1025.0 / 1024.0;
     for k in 1..=LPC_ORDER {
-        let w = (-0.5
-            * (2.0 * std::f32::consts::PI * 60.0 * k as f32 / SAMPLE_RATE_HZ as f32).powi(2))
-            as f64;
-        r[k] *= w.exp();
+        r[k] *= crate::spec_tables::LPC_BINOMIAL_LAG_WINDOW_Q15[k - 1] as f64 / 32_768.0;
     }
 
-    // Levinson-Durbin recursion.
+    // Levinson-Durbin recursion. If the prediction-error energy
+    // collapses (perfectly predictable input, e.g. a pure sine) or a
+    // reflection coefficient leaves the unit interval, the recursion
+    // stops early and keeps the coefficients computed so far — the
+    // lower-order model is valid and stable, unlike bailing out to the
+    // trivial A(z) = 1.
     let mut a = [0.0f64; LPC_ORDER + 1];
     let mut a_prev = [0.0f64; LPC_ORDER + 1];
     a[0] = 1.0;
@@ -794,19 +871,22 @@ fn lpc_analysis(sig: &[f32; FRAME_SIZE_SAMPLES]) -> [f32; LPC_ORDER + 1] {
             acc += a_prev[j] * r[i - j];
         }
         let k = -acc / e;
+        if !k.is_finite() || k.abs() >= 1.0 {
+            break;
+        }
         a[i] = k;
         for j in 1..i {
             a[j] = a_prev[j] + k * a_prev[i - j];
         }
         e *= 1.0 - k * k;
-        if e <= 1e-20 {
-            return default_a();
-        }
         a_prev.copy_from_slice(&a);
+        if e <= 0.0 {
+            break;
+        }
     }
     let mut out = [0.0f32; LPC_ORDER + 1];
     for i in 0..=LPC_ORDER {
-        out[i] = a[i] as f32;
+        out[i] = a_prev[i] as f32;
     }
     out
 }
@@ -849,9 +929,13 @@ fn postfilter_expand(
 // ---------- LPC <-> LSP ----------
 
 /// Convert LPC direct-form coefficients to Line Spectral Pairs in the
-/// cosine domain (lsp[i] = cos(omega_i)). Uses the standard Chebyshev
-/// root-finding on the P(z) / Q(z) polynomials.
-fn lpc_to_lsp(a: &[f32; LPC_ORDER + 1]) -> [f32; LPC_ORDER] {
+/// cosine domain (lsp[i] = cos(omega_i)). Uses Chebyshev root-finding
+/// on the P(z) / Q(z) sum/difference polynomials (§2.5 step 1:
+/// "searching along the unit circle and interpolating for zero
+/// crossings"). Returns `None` when the full set of 5 + 5 interlaced
+/// roots cannot be located (a degenerate model); the caller falls back
+/// to the previous frame's LSP vector.
+fn lpc_to_lsp(a: &[f32; LPC_ORDER + 1]) -> Option<[f32; LPC_ORDER]> {
     // Form f1(z) = A(z) + z^-(p+1) A(z^-1); f2(z) = A(z) - z^-(p+1) A(z^-1).
     // After factoring out the trivial roots, we get polynomials of degree
     // p/2 in cos(omega) (Chebyshev expansion).
@@ -861,10 +945,16 @@ fn lpc_to_lsp(a: &[f32; LPC_ORDER + 1]) -> [f32; LPC_ORDER] {
     // f1_i = a_i + a_{p-i}, i = 0..p/2; remove (1 + z^-1) factor:
     // recursive: f1[i] = (a[i] + a[p-i]) - f1[i-1]
     // f2[i] = (a[i] - a[p-i]) + f2[i-1]
+    // Deflation recursions (P by (1 + z⁻¹), Q by (1 − z⁻¹)):
+    //   f1[i] = (a_i + a_{p+1−i}) − f1[i−1]
+    //   f2[i] = (a_i − a_{p+1−i}) + f2[i−1]
+    // seeded with f1[0] = f2[0] = 1 (the previous *deflated*
+    // coefficient, not zero — seeding with zero corrupts every
+    // subsequent coefficient).
     f1[0] = 1.0;
     f2[0] = 1.0;
-    let mut prev_f1 = 0.0f32;
-    let mut prev_f2 = 0.0f32;
+    let mut prev_f1 = f1[0];
+    let mut prev_f2 = f2[0];
     for i in 1..=p / 2 {
         let ai = a[i];
         let api = a[p + 1 - i];
@@ -873,66 +963,84 @@ fn lpc_to_lsp(a: &[f32; LPC_ORDER + 1]) -> [f32; LPC_ORDER] {
         prev_f1 = f1[i];
         prev_f2 = f2[i];
     }
-    // Evaluate both polynomials on [-1, 1] in cos-domain; interleave roots
-    // of f1 and f2 strictly, as required.
+    // Locate roots of both polynomials in the cosine domain and
+    // interleave them (LSPs strictly alternate between the two sets).
     let roots_f1 = cheby_roots(&f1);
     let roots_f2 = cheby_roots(&f2);
+    if roots_f1.len() != LPC_ORDER / 2 || roots_f2.len() != LPC_ORDER / 2 {
+        return None;
+    }
     let mut lsp = [0.0f32; LPC_ORDER];
-    // Interleave: LSP ordering alternates between f1 and f2 roots.
-    let n1 = roots_f1.len();
-    let n2 = roots_f2.len();
-    for k in 0..LPC_ORDER {
-        if k % 2 == 0 && k / 2 < n1 {
-            lsp[k] = roots_f1[k / 2];
-        } else if k / 2 < n2 {
-            lsp[k] = roots_f2[k / 2];
-        } else {
-            // Fallback: uniform spacing.
-            let step = std::f32::consts::PI / (LPC_ORDER as f32 + 1.0);
-            lsp[k] = (step * (k as f32 + 1.0)).cos();
-        }
+    for k in 0..LPC_ORDER / 2 {
+        lsp[2 * k] = roots_f1[k];
+        lsp[2 * k + 1] = roots_f2[k];
     }
-    // Ensure strictly decreasing cos (= increasing omega).
+    // The interlaced set must be strictly decreasing in cos (= strictly
+    // ascending frequency); a violation means the located roots do not
+    // form a valid LSP vector.
     for k in 1..LPC_ORDER {
-        if lsp[k] >= lsp[k - 1] - 1e-4 {
-            lsp[k] = lsp[k - 1] - 1e-3;
+        if lsp[k] >= lsp[k - 1] {
+            return None;
         }
     }
-    lsp
+    Some(lsp)
 }
 
-/// Find roots of a Chebyshev-expanded polynomial in the cos-domain on
-/// `[-1, 1]` by bisection / root-bracketing across a fine grid.
+/// Find the roots (in x = cos ω) of a deflated sum/difference LSP
+/// polynomial given by its symmetric-half coefficients
+/// `coeffs[0..=deg]`, by sign-change bracketing on a fine grid that is
+/// uniform in *angle* ω (so resolution does not collapse near
+/// cos ω = ±1), refined by bisection.
+///
+/// A degree-2·deg symmetric polynomial `Σ c_i z^{-i}` with
+/// `c_i = c_{2·deg−i}` (half stored as `coeffs`) evaluates on the unit
+/// circle, up to a phase factor, as the real function
+///
+/// ```text
+///   G(ω) = 2·Σ_{k=0..deg−1} coeffs[k]·cos((deg−k)·ω) + coeffs[deg]
+/// ```
+///
+/// i.e. in x = cos ω a Chebyshev series with the *reversed* coefficient
+/// order and a half-weight constant term:
+/// `G(x) = 2·Σ_{k<deg} coeffs[k]·T_{deg−k}(x) + coeffs[deg]·T_0(x)`.
 fn cheby_roots(coeffs: &[f32]) -> Vec<f32> {
-    // Evaluate the (implicit) polynomial in x = cos(omega).
-    // coeffs[0] + coeffs[1] * T_1(x) + ... + coeffs[deg] * T_deg(x)
-    // For our needs, an approximate grid-bisection search suffices.
     let deg = coeffs.len() - 1;
-    let eval = |x: f32| -> f32 {
-        // Clenshaw's algorithm for Chebyshev series.
-        let mut b2 = 0.0f32;
-        let mut b1 = 0.0f32;
+    // Chebyshev-basis coefficients: c[m] multiplies T_m(x). The overall
+    // factor 2 is dropped (it does not move the roots).
+    let mut c = vec![0.0f64; deg + 1];
+    c[0] = coeffs[deg] as f64 * 0.5;
+    for m in 1..=deg {
+        c[m] = coeffs[deg - m] as f64;
+    }
+    // Clenshaw's recurrence on Σ c[m]·T_m(x).
+    let eval = |x: f64| -> f64 {
+        let mut b2 = 0.0f64;
+        let mut b1 = 0.0f64;
         for k in (1..=deg).rev() {
-            let b0 = 2.0 * x * b1 - b2 + coeffs[k];
+            let b0 = 2.0 * x * b1 - b2 + c[k];
             b2 = b1;
             b1 = b0;
         }
-        x * b1 - b2 + coeffs[0]
+        x * b1 - b2 + c[0]
     };
-    const GRID: usize = 200;
+    // 1024 angle steps across (0, π) — matches the quantiser's own
+    // frequency resolution scale (Q15 domain / 32) so genuinely
+    // distinct LSP lines land in distinct grid cells.
+    const GRID: usize = 1024;
     let mut roots = Vec::with_capacity(deg);
-    let mut prev_x = 1.0f32;
+    let mut prev_x = 1.0f64;
     let mut prev_y = eval(prev_x);
     for i in 1..=GRID {
-        let x = 1.0 - 2.0 * (i as f32 / GRID as f32);
+        let x = (std::f64::consts::PI * i as f64 / GRID as f64).cos();
         let y = eval(x);
-        if prev_y * y < 0.0 {
-            // Bisect.
+        if prev_y == 0.0 {
+            roots.push(prev_x as f32);
+        } else if prev_y * y < 0.0 {
+            // Bisect [x, prev_x] down to the root.
             let mut lo = x;
             let mut hi = prev_x;
             let mut flo = y;
-            let _fhi = prev_y;
-            for _ in 0..40 {
+            for _ in 0..50 {
                 let mid = 0.5 * (lo + hi);
                 let fm = eval(mid);
                 if fm * flo < 0.0 {
@@ -942,10 +1050,10 @@ fn cheby_roots(coeffs: &[f32]) -> Vec<f32> {
                     flo = fm;
                 }
             }
-            roots.push(0.5 * (lo + hi));
-            if roots.len() == deg {
-                break;
-            }
+            roots.push((0.5 * (lo + hi)) as f32);
+        }
+        if roots.len() == deg {
+            break;
         }
         prev_x = x;
         prev_y = y;
@@ -2438,8 +2546,17 @@ impl SpecEncoder {
 
     /// Encode one 240-sample frame into its clause-4 octet sequence
     /// (24 bytes at the high rate, 20 at the low rate).
-    pub fn encode_frame(&mut self, pcm: &[i16; FRAME_SIZE_SAMPLES]) -> Vec<u8> {
-        let params = self.analysis.analyse_spec(pcm, self.rate);
+    ///
+    /// `lookahead` is the first 60 samples of the *next* frame — the
+    /// §2.4 LPC window centered on the last subframe reaches 7.5 ms
+    /// past the frame end. Pass zeros at end of stream (§2.21 rest
+    /// state).
+    pub fn encode_frame(
+        &mut self,
+        pcm: &[i16; FRAME_SIZE_SAMPLES],
+        lookahead: &[i16; LOOKAHEAD_SAMPLES],
+    ) -> Vec<u8> {
+        let params = self.analysis.analyse_spec(pcm, lookahead, self.rate);
         crate::linepack::pack_frame(&params)
             .expect("analyse_spec emits in-range clause-4 parameters")
     }
@@ -2499,6 +2616,56 @@ mod tests {
             pts: Some(0),
             data: vec![bytes],
         })
+    }
+
+    /// LPC → LSP → LPC roundtrip: the Chebyshev root search must
+    /// recover the exact line set the polynomial was built from. This
+    /// pins the deflation-recursion seeding (f1[0]/f2[0] carried into
+    /// the recursion) and the reversed-order Chebyshev evaluation of
+    /// the symmetric deflated halves — both had silent historical bugs
+    /// that made the analysis LSPs diverge wholesale from the model.
+    #[test]
+    fn lpc_lsp_roundtrip_recovers_exact_lines() {
+        // The DC vector plus perturbed variants spanning the range.
+        let dc = crate::tables::lsp_dc_cosines();
+        let mut cases: Vec<[f32; LPC_ORDER]> = vec![dc];
+        let mut lcg: u32 = 0xC0FF_EE01;
+        for _ in 0..25 {
+            let mut omega = [0.0f32; LPC_ORDER];
+            for w in omega.iter_mut() {
+                lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *w = ((lcg >> 8) & 0xFFFF) as f32 / 65_536.0;
+            }
+            omega.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            // Space the lines by ≥ 0.02 rad and keep off the edges.
+            let mut prev = 0.05f32;
+            let mut cos = [0.0f32; LPC_ORDER];
+            for (i, w) in omega.iter().enumerate() {
+                let v = (prev + 0.02).max(0.05 + w * (std::f32::consts::PI - 0.4));
+                let v = v.min(std::f32::consts::PI - 0.05 - 0.02 * (LPC_ORDER - i) as f32);
+                cos[i] = v.max(prev + 0.02).cos();
+                prev = v.max(prev + 0.02);
+            }
+            cases.push(cos);
+        }
+        for (ci, lsp_in) in cases.iter().enumerate() {
+            let a = lsp_to_lpc(lsp_in);
+            let lsp_out = lpc_to_lsp(&a)
+                .unwrap_or_else(|| panic!("case {ci}: root search failed on a valid LSP set"));
+            for i in 0..LPC_ORDER {
+                // f32 polynomial construction limits the recovery
+                // accuracy for closely spaced lines; 1e-3 in the cosine
+                // domain is far tighter than the wholesale divergence
+                // the two historical bugs caused, while staying robust
+                // across platforms.
+                assert!(
+                    (lsp_out[i] - lsp_in[i]).abs() < 1.0e-3,
+                    "case {ci} line {i}: {} vs {}",
+                    lsp_out[i],
+                    lsp_in[i]
+                );
+            }
+        }
     }
 
     fn sine_mixture(frames: usize) -> Vec<i16> {
@@ -2563,6 +2730,9 @@ mod tests {
         let mut enc = make_encoder(&params(Some(5300))).unwrap();
         let pcm = vec![0i16; FRAME_SIZE_SAMPLES];
         enc.send_frame(&audio_frame(&pcm)).unwrap();
+        // The §2.4 windows reach 7.5 ms past the frame end, so a frame
+        // is only emitted once its lookahead is buffered — or at flush.
+        enc.flush().unwrap();
         let pkt = enc.receive_packet().unwrap();
         assert_eq!(pkt.data.len(), ACELP_PAYLOAD_BYTES);
         assert_eq!(pkt.data[0] & 0b11, 0b01, "discriminator must be 01");
@@ -2574,6 +2744,8 @@ mod tests {
         let mut enc = make_encoder(&params(Some(6300))).unwrap();
         let pcm = vec![0i16; FRAME_SIZE_SAMPLES];
         enc.send_frame(&audio_frame(&pcm)).unwrap();
+        // See the ACELP variant: emission waits for the §2.4 lookahead.
+        enc.flush().unwrap();
         let pkt = enc.receive_packet().unwrap();
         assert_eq!(pkt.data.len(), MPMLQ_PAYLOAD_BYTES);
         assert_eq!(pkt.data[0] & 0b11, 0b00, "discriminator must be 00");
@@ -3335,8 +3507,9 @@ mod tests {
             let mut enc_on = SpecEncoder::new(rate);
             let mut enc_off = SpecEncoder::new(rate);
             enc_off.set_highpass(false);
-            let f_on = enc_on.encode_frame(&pcm);
-            let f_off = enc_off.encode_frame(&pcm);
+            let la = [0i16; LOOKAHEAD_SAMPLES];
+            let f_on = enc_on.encode_frame(&pcm, &la);
+            let f_off = enc_off.encode_frame(&pcm, &la);
             assert_eq!(f_on.len(), rate.frame_bytes());
             assert_eq!(f_off.len(), rate.frame_bytes());
             let p_on = crate::linepack::unpack_frame(&f_on).unwrap();
@@ -3978,6 +4151,21 @@ mod tests {
     /// maps, decode with a *fresh* decoder, and measure PSNR against
     /// the input. Floors are set conservatively below the measured
     /// debug-build figures.
+    /// Slice out frame `f` of `pcm` plus its 60-sample §2.4 lookahead
+    /// (zero-padded at end of stream).
+    fn frame_and_lookahead(
+        pcm: &[i16],
+        f: usize,
+    ) -> ([i16; FRAME_SIZE_SAMPLES], [i16; LOOKAHEAD_SAMPLES]) {
+        let mut frame = [0i16; FRAME_SIZE_SAMPLES];
+        frame.copy_from_slice(&pcm[f * FRAME_SIZE_SAMPLES..(f + 1) * FRAME_SIZE_SAMPLES]);
+        let mut la = [0i16; LOOKAHEAD_SAMPLES];
+        let start = (f + 1) * FRAME_SIZE_SAMPLES;
+        let n = pcm.len().saturating_sub(start).min(LOOKAHEAD_SAMPLES);
+        la[..n].copy_from_slice(&pcm[start..start + n]);
+        (frame, la)
+    }
+
     fn spec_roundtrip_psnr(rate: PackedRate) -> f64 {
         let frames = 20usize;
         let pcm = voiced_signal(frames);
@@ -3985,9 +4173,8 @@ mod tests {
         let mut dec = SynthesisState::new();
         let mut out = Vec::with_capacity(pcm.len());
         for f in 0..frames {
-            let mut frame = [0i16; FRAME_SIZE_SAMPLES];
-            frame.copy_from_slice(&pcm[f * FRAME_SIZE_SAMPLES..(f + 1) * FRAME_SIZE_SAMPLES]);
-            let params = analysis.analyse_spec(&frame, rate);
+            let (frame, la) = frame_and_lookahead(&pcm, f);
+            let params = analysis.analyse_spec(&frame, &la, rate);
             let bytes = crate::linepack::pack_frame(&params).unwrap();
             assert_eq!(
                 bytes.len(),
@@ -4039,9 +4226,8 @@ mod tests {
         let mut analysis = AnalysisState::new();
         let mut dec = SynthesisState::new();
         for f in 0..frames {
-            let mut frame = [0i16; FRAME_SIZE_SAMPLES];
-            frame.copy_from_slice(&pcm[f * FRAME_SIZE_SAMPLES..(f + 1) * FRAME_SIZE_SAMPLES]);
-            let params = analysis.analyse_spec(&frame, PackedRate::High);
+            let (frame, la) = frame_and_lookahead(&pcm, f);
+            let params = analysis.analyse_spec(&frame, &la, PackedRate::High);
             let _ = dec.decode_spec_params(&params);
             for i in 0..LPC_ORDER {
                 assert!(
@@ -4063,9 +4249,8 @@ mod tests {
         let pcm = voiced_signal(3);
         let mut analysis = AnalysisState::new();
         for f in 0..3 {
-            let mut frame = [0i16; FRAME_SIZE_SAMPLES];
-            frame.copy_from_slice(&pcm[f * FRAME_SIZE_SAMPLES..(f + 1) * FRAME_SIZE_SAMPLES]);
-            let params = analysis.analyse_spec(&frame, PackedRate::Low);
+            let (frame, la) = frame_and_lookahead(&pcm, f);
+            let params = analysis.analyse_spec(&frame, &la, PackedRate::Low);
             let lag0 = decode_abs_lag(params.acl[0]);
             let lag1 = decode_delta_lag(params.acl[1], lag0);
             let lag2 = decode_abs_lag(params.acl[2]);

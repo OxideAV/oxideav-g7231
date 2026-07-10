@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **§2.4/§2.5 encoder LPC analysis rebuilt on the spec windows
+  (r406)**: four LPC sets per frame, each from the published Q15
+  Hamming window over 180 samples *centered on its subframe* — which
+  introduces the Recommendation's 7.5 ms (60-sample) encoder
+  lookahead (total one-way delay now 37.5 ms; the registry encoder
+  buffers one subframe of lookahead and `SpecEncoder::encode_frame`
+  takes the next frame's first 60 samples, zero-padded at end of
+  stream). Autocorrelation now carries the spec's `1025/1024`
+  white-noise correction and the published Q15 binomial lag window;
+  the transmitted set is A3(z) after the §2.5 7.5 Hz bandwidth
+  expansion (published Q15 per-tap weights).
+- **Two silent LPC→LSP conversion bugs fixed** (predating this
+  round; found by ITU-vector disagreement, pinned by a new
+  LSP→LPC→LSP roundtrip test): the sum/difference polynomial
+  deflation seeded its recursion with 0 instead of the leading
+  deflated coefficient, corrupting every subsequent coefficient; and
+  the Chebyshev root search evaluated `Σ c_k·T_k(x)` where the
+  symmetric deflated halves evaluate as
+  `2·Σ c_k·T_{deg−k}(x) + c_deg` (reversed order, half-weight
+  constant term) — the root finder was solving the wrong polynomial.
+  The root scan now walks 1024 angle-uniform grid cells (was 200
+  cosine-uniform), Levinson-Durbin terminates early on collapsed
+  prediction error (pure-sine inputs) keeping the valid lower-order
+  model instead of bailing to `A(z) = 1`, and a failed root search
+  falls back to the previous frame's unquantised LSP vector rather
+  than a fabricated uniform spread. Unquantised-LSP distance to the
+  reference decoder's decoded LSPs on `PATHC53` drops 4× (mean 4761
+  → 1190 Q15 units); LSP band-index agreement with the reference
+  `.RCO` streams moves from ~0% to 16–50% on the middle band.
+
 - **Fixed-point decode-chain rebuild (r391)** — the registry decoder
   now runs a saturating integer pipeline (`qdec::QSynthesis`) end to
   end: Q15 LSP inverse quantisation / stability / interpolation, Q14

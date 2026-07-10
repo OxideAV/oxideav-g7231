@@ -61,6 +61,16 @@ fn read_pcm(dir: &Path, name: &str) -> Vec<i16> {
         .collect()
 }
 
+/// The §2.4 encoder lookahead for frame `i` of `pcm`: the next frame's
+/// first 60 samples, zero-padded at end of stream.
+fn lookahead_of(pcm: &[i16], i: usize) -> [i16; 60] {
+    let mut la = [0i16; 60];
+    let start = (i + 1) * FRAME_SAMPLES;
+    let n = pcm.len().saturating_sub(start).min(60);
+    la[..n].copy_from_slice(&pcm[start..start + n]);
+    la
+}
+
 /// Per-frame erasure flags from a `.CRC` companion (16-bit LE words,
 /// 1 = the frame is to be treated as erased).
 fn read_crc(dir: &Path, name: &str) -> Vec<bool> {
@@ -485,7 +495,7 @@ fn encoder_emits_self_valid_streams_on_itu_inputs() {
         for i in 0..frames {
             let mut frame_pcm = [0i16; FRAME_SAMPLES];
             frame_pcm.copy_from_slice(&pcm[i * FRAME_SAMPLES..(i + 1) * FRAME_SAMPLES]);
-            let bytes = enc.encode_frame(&frame_pcm);
+            let bytes = enc.encode_frame(&frame_pcm, &lookahead_of(&pcm, i));
             assert_eq!(bytes.len(), fb, "{tin} frame {i}: frame size");
             let p = unpack_frame(&bytes).unwrap_or_else(|e| {
                 panic!("{tin} frame {i}: our encoder emitted an invalid frame: {e}")
