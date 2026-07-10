@@ -153,7 +153,13 @@ pub(crate) fn lsp_interpolate(
 /// argument indexes at `f >> 7` with `f & 127` as the interpolation
 /// fraction.
 pub(crate) fn cos_q14(freq_q15: i16) -> i16 {
-    debug_assert!(freq_q15 >= 0);
+    // Conforming streams only produce non-negative frequencies, but an
+    // adversarial LSP index can drive the MA predictor + codebook sum
+    // negative before the ordering repair reaches the first line (the
+    // §2.6 stability sweep constrains consecutive *gaps*, not the
+    // absolute position of line 0) — clamp to the table domain instead
+    // of asserting. Found by the `decode` fuzz target (r406).
+    let freq_q15 = freq_q15.max(0);
     let idx = (freq_q15 >> 7) as usize; // 0..=255 for f < 32768
     let frac = freq_q15 & 0x7F;
     let base = LSP_COSINE_LOOKUP_Q15[idx];
@@ -1458,6 +1464,19 @@ mod tests {
         assert_eq!(v[8], 502);
         assert_eq!(v[18], -502);
         assert_eq!(v.iter().filter(|&&s| s != 0).count(), 2);
+    }
+
+    /// Adversarial LSP indices can drive the MA predictor + codebook
+    /// sum negative before the §2.6 ordering repair reaches line 0;
+    /// `cos_q14` must clamp to the table domain instead of panicking
+    /// (r406, found by the `decode`/`bitstream` fuzz targets — the
+    /// crash inputs are pinned under `fuzz/seeds/`).
+    #[test]
+    fn cos_q14_clamps_negative_frequencies() {
+        assert_eq!(cos_q14(-1), cos_q14(0));
+        assert_eq!(cos_q14(i16::MIN), cos_q14(0));
+        // Top of the domain stays in range too.
+        let _ = cos_q14(i16::MAX);
     }
 
     #[test]

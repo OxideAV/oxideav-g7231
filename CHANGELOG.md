@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **Fuzz hardening (r406)**: adversarial LSP indices can drive the MA
+  predictor + codebook sum negative before the §2.6 ordering repair
+  reaches line 0; the fixed-point cosine lookup now clamps to its
+  table domain instead of panicking on the debug assertion (found by
+  the `decode` and `bitstream` fuzz targets after the band-order fix
+  re-mapped their input space; both crash inputs pinned as regression
+  seeds under `fuzz/seeds/`, plus a unit test). All four targets
+  re-run clean under ASan with the r406 pipeline (roundtrip 150 s,
+  decode/bitstream 120 s each, params 60 s).
+
 - **Three vector-arbitrated interop corrections (r406) — decoder
   fidelity and encoder agreement transformed**:
   1. **LSP band order in the 24-bit LPC word**: band 0 (lines 0–2)
