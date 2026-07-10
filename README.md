@@ -36,9 +36,14 @@ maps carrying the published quantiser indices.
 
 ### Encoder (both rates)
 
-Full §2.3 high-pass → LPC → LSP → open-loop pitch → closed-loop
-adaptive-codebook → rate-specific fixed-codebook → gain-word pipeline
-on the published tables, packed into the clause-4 octet layout.
+The full clause-2 analysis pipeline on the published tables, packed
+into the clause-4 octet layout: §2.2 framer (the input is coded
+delayed by one subframe — the spec's 7.5 ms lookahead, 37.5 ms total
+delay) → §2.3 high-pass → §2.4 per-subframe windowed LPC → §2.5 LSP
+quantisation → §2.8 formant weighting → §2.9 open-loop pitch →
+§2.11 harmonic noise shaping → §2.12/§2.13 combined-filter target →
+§2.14 closed-loop adaptive codebook → §2.15/§2.16 fixed codebook →
+eq. 36/39/40 gain words → §2.19 memory update.
 Default rate (no `bit_rate` hint) is 6.3 kbit/s MP-MLQ; request
 `Some(5300)` for ACELP. The §2.3 DC-removal filter (eq. 1) defaults ON
 per §2.2; `encoder::SpecEncoder` exposes the rate + high-pass switches
@@ -47,14 +52,28 @@ the ITU encoder-test configurations require.
 - **Analysis by synthesis**: the encoder carries a shadow
   `SynthesisState` committed through the *exact* decode kernel, so
   analysis always targets what the decoder will actually produce.
-- **LSP quantisation** (§2.5): predictive 3+3+4 split VQ over the
-  published 256-entry band codebooks, MA predictor `b = 12/32`, DC
-  removal, and the eq. 5 inverse-neighbour-gap weighted error.
-- **Closed-loop pitch** (§2.14): lag candidates around the open-loop
-  estimate (±1 on subframes 0/2, the −1..+2 delta window on 1/3)
-  jointly searched with the published 85-/170-row 5-tap gain-vector
-  codebook by maximising the error reduction `2·βᵀd − βᵀRβ` over the
-  filtered eq. 41 basis vectors.
+- **LPC analysis** (§2.4): four LPC sets per frame, each from the
+  published Q15 Hamming window over 180 samples centered on its
+  subframe, `1025/1024` white-noise correction, published binomial
+  lag window, Levinson-Durbin.
+- **LSP quantisation** (§2.5): the 7.5 Hz bandwidth-expanded A3(z)
+  through a predictive 3+3+4 split VQ over the published 256-entry
+  band codebooks, MA predictor `b = 12/32`, DC removal, and the eq. 5
+  inverse-neighbour-gap weighted error.
+- **Weighted-domain targets** (§2.8–§2.13): per-subframe formant
+  weighting `W(z) = A(z/0.9)/A(z/0.5)` on the unquantised LPC
+  (published Q15 tap weights); two half-frame open-loop pitch
+  estimates on the weighted speech (eq. 12 with the smaller-lag
+  1.25 dB preference); harmonic noise shaping `P(z) = 1 − β·z^−L`
+  gated by the eq. 17 2.0 dB prediction-gain test; and ringing
+  subtraction of the combined filter `S(z) = Ã(z)·W(z)·P(z)` — every
+  closed-loop search below runs against this target and impulse
+  response.
+- **Closed-loop pitch** (§2.14): lag candidates around the §2.9
+  open-loop estimate (±1 on subframes 0/2, the −1..+2 delta window on
+  1/3) jointly searched with the published 85-/170-row 5-tap
+  gain-vector codebook by maximising the error reduction
+  `2·βᵀd − βᵀRβ` over the filtered eq. 41 basis vectors.
 - **MP-MLQ fixed-codebook search** (§2.15): eq. 24/25 `G_max`
   estimate, the `[Ĝ − 3.2 dB, Ĝ + 6.4 dB]` quantised-gain
   neighbourhood × both grids × the short-lag Dirac-train mode, greedy
@@ -113,8 +132,8 @@ peak-referenced PSNR):
 
 |    rate | frame size | PSNR      | signal SNR |
 | ------: | ---------: | :-------- | :--------- |
-| 5.3 k/s |   20 bytes | ≈ 23.9 dB | ≈ 12.0 dB  |
-| 6.3 k/s |   24 bytes | ≈ 26.4 dB | ≈ 14.4 dB  |
+| 5.3 k/s |   20 bytes | ≈ 25.2 dB | ≈ 13.3 dB  |
+| 6.3 k/s |   24 bytes | ≈ 31.2 dB | ≈ 19.3 dB  |
 
 See `tests/codec_roundtrip.rs` for the integration tests. For a
 playable subjective sample:
@@ -139,40 +158,48 @@ in `PATHD63P.TCO` correctly fail field validation and are concealed
 as erasures. Decoded pulse positions were additionally verified
 against Â(z)-deconvolved reference decoder output.
 
-The intra-word sign conventions are pinned by the vectors: high-rate
+The intra-word conventions are pinned by the vectors: high-rate
 `PSIG` stores signs MSB-first over ascending pulse order with a set
 bit meaning **negative**; low-rate `PSIG` bit `t` is the track-`t`
-sign with a set bit meaning **positive** (flipping it takes the
-whole-file `OVERD53` waveform correlation from −0.97 to +0.97).
+sign with a set bit meaning **positive**; and the 24-bit `LPC` word
+carries **band 0 in its most-significant byte** (r406 — with the
+LSB-first reading, every reference stream decodes its two edge LSP
+bands through the wrong codebooks).
 
-The r391 round rebuilt the decoder in saturating fixed point and
-arbitrated three excitation-model choices the clause 1–4 prose leaves
-open, by deconvolving the reference decoder output with the decoded
-LPC (the clause-5 reference C stays outside the clean-room wall):
-the eq. 41.1 `e′` view is the contiguous history slice from
-`e[−L−2]`; fixed-codebook pulses land at twice the published
-gain-table level with the synthesis output halved on emission
-(pulse-exact against the deconvolved reference); and the gain-vector
-rows act at an effective /16384 (the /8192 reading diverges where the
-reference stays bounded — r388's OVERD53 corr 0.97 is retired as a
-clipping artifact of that divergent loop).
+Where the clause 1–4 prose leaves a model choice open, it is
+arbitrated against the vectors (the clause-5 reference C stays
+outside the clean-room wall). Current model (r391, re-arbitrated r406
+after the LSP band-order fix): the eq. 41.1 `e′` view is the
+contiguous history slice from `e[−L−2]`; fixed-codebook pulses land
+at twice the published gain-table level with the synthesis output
+emitted **unshifted** (whole-file least-squares scale vs the
+reference = 0.9995; r391's halved-output stage compensated the
+band-swapped LSP distortion); gain-vector rows act at an effective
+/16384; the stored excitation saturates at the plain Word16 rail; and
+the §2.2 framer codes the input **delayed by one subframe** — the
+7.5 ms lookahead alignment at which (and only at which) the encoder's
+LSP decisions lock to the reference.
 
-Measured whole-file tracking against the reference `.ROU` outputs
-(r391 fixed pipeline, corr / SNR): PATHD53 0.60 / +1.9 dB, OVERD53
-0.48 / +0.3 dB, INEQD53 0.83 / +4.5 dB, PATHD63P 0.77 / +3.5 dB,
-OVERD63P 0.40 / +0.8 dB, TAMED63P 0.11 / −2.2 dB — five of six
-streams up from deeply negative SNR (PATHD63P was −12.8 dB, INEQD53
-−23.1 dB). What remains between this and a *bit-exact* claim is the
-reference's overflow/scaling protocol on the OVER/TAME saturation-
-torture classes plus per-stage rounding details, which the
-Recommendation specifies only in the clause-5 C. See
-[`tests/itu_conformance.rs`](tests/itu_conformance.rs) for the pinned
+Measured whole-file decoder tracking against the reference `.ROU`
+outputs (r406 fixed pipeline, corr / SNR): **PATHD53 1.0000 /
++54.4 dB** (max sample error 27 LSB), OVERD53 0.9993 / +28.1 dB,
+INEQD53 0.9811 / +12.5 dB (50.8% of samples bit-exact), PATHD63P
+0.9123 / +7.6 dB, OVERD63P 0.9715 / +12.5 dB, TAMED63P 0.9643 /
++11.5 dB. What remains between this and a *bit-exact* claim is the
+reference's per-stage rounding and overflow protocol (dominant on the
+post-filter-ON and OVER/TAME saturation-torture classes), which the
+Recommendation specifies only in the clause-5 C.
+
+Encoder parameter agreement against the reference `.RCO` bitstreams
+(whole files, float analysis vs the bit-exact fixed-point reference):
+LSP word 77–90.8% exact on the PATH/OVER/CODE classes, ACL0/ACL2
+within ±1 on 53–100% of subframes (OVERC53H 100%), fixed-gain index
+up to 81% exact. The TAME/INEQ classes are built around the
+reference's exact fixed-point rounding (taming is clause-5-only), so
+their parameter floors stay loose. Every encoder-emitted frame on the
+ITU test inputs is a legal clause-4 stream; see
+[`tests/itu_conformance.rs`](tests/itu_conformance.rs) for all pinned
 floors.
-
-Bitstreams produced by this encoder decode with this crate's own
-decoder at the PSNR figures above, carry spec-semantic indices
-throughout, and every encoder-emitted frame on the ITU test inputs is
-a legal clause-4 stream.
 
 ### Spec-table data in tree
 
@@ -251,7 +278,10 @@ bit_rate = anything else -> Error::Unsupported
 
 The output `CodecParameters` returned by the encoder always has
 `bit_rate` set to the exact quantised rate it is operating at. The
-encoder has no VAD / CNG — every frame is coded as speech.
+encoder has no VAD / CNG — every frame is coded as speech. Per §2.2
+the coded signal is the input delayed by one subframe (7.5 ms — the
+spec's lookahead), so decoded sample `n` renders input sample
+`n − 60`.
 
 ## Benchmarks
 
