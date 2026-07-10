@@ -20,12 +20,23 @@
 //! For each 30 ms frame (240 samples at 8 kHz, mono S16):
 //!
 //! ```text
-//!  PCM s16 → LPC analysis (autocorrelation + Levinson + lag window)
-//!          → LSP conversion (Chebyshev root-finding) + §2.5 predictive
-//!            split VQ on the published codebooks (24-bit LPC word)
-//!          → 4× subframe loop (ACB lookup against SynthesisState):
-//!                - zero-input response of 1/A_q(z) → ZIR-free target
-//!                - §2.14 closed-loop lag ±1 / −1..+2 candidates,
+//!  PCM s16 → §2.3 high-pass (switchable)
+//!          → §2.4 per-subframe LPC: 180-sample Hamming windows centered
+//!            on each subframe (60-sample lookahead), 1025/1024
+//!            white-noise correction, binomial lag window, Levinson
+//!          → §2.5 A3(z): 7.5 Hz bandwidth expansion → LSP (Chebyshev
+//!            root-finding) → predictive split VQ (24-bit LPC word)
+//!          → §2.8 formant weighting W(z) = A(z/0.9)/A(z/0.5) on the
+//!            unquantised LPC → weighted speech f[n]
+//!          → §2.9 two open-loop pitch estimates per frame on f[n]
+//!            (eq. 12 with the smaller-lag 1.25 dB preference)
+//!          → 4× subframe loop:
+//!                - §2.11 harmonic noise shaping P(z) = 1 − β·z^−L
+//!                  around the open-loop lag → target w[n] (eq. 18)
+//!                - §2.12 impulse response of the combined filter
+//!                  S(z) = Ã(z)·W(z)·P(z); §2.13 its zero-input
+//!                  response → ringing-subtracted target t[n]
+//!                - §2.14 closed-loop lag: OL±1 / −1..+2 candidates,
 //!                  jointly searched with the 85-/170-row 5-tap
 //!                  gain-vector codebook (max 2·βᵀd − βᵀRβ)
 //!                - rate-specific FCB search at quantised gain levels
@@ -34,6 +45,8 @@
 //!                    · MP-MLQ: §2.15 greedy multipulse, gain
 //!                              neighbourhood × grids × Dirac trains
 //!                - eq. 36/39/40 combined 12-bit gain word
+//!                - §2.19 memory update: reconstructed excitation
+//!                  through S(z)
 //!          → canonical SynthesisState::decode_spec_params() commits
 //!            decoder state so encoder + decoder stay in lockstep
 //!          → clause-4 Table 5/6 octet packing (20 B rate=01 /
@@ -324,6 +337,55 @@ struct AnalysisState {
     /// fallback when the current frame's LPC → LSP root search fails on
     /// a degenerate model. Initialised to `p_DC` (§2.21).
     prev_unq_lsp: [f32; LPC_ORDER],
+    /// §2.8 input-path formant weighting filter memories: the last ten
+    /// inputs (x, for the FIR numerator `A(z/γ₁)`) and outputs (f, for
+    /// the IIR denominator `1/A(z/γ₂)`), carried across subframes and
+    /// frames. `[0]` is the most recent sample.
+    wght_x_mem: [f32; LPC_ORDER],
+    wght_f_mem: [f32; LPC_ORDER],
+    /// Weighted-speech history `f[n − j]` for the §2.9 open-loop pitch
+    /// (eq. 12 reaches `j = 142`) and the §2.11 harmonic-noise-shaping
+    /// search (up to `L_OL + 3 = 145`). Oldest sample first.
+    wspeech_hist: [f32; WSPEECH_HIST],
+    /// §2.13 / §2.19 memories of the combined filter
+    /// `S_i(z) = Ã_i(z)·W_i(z)·P_i(z)` — updated once per subframe by
+    /// passing the reconstructed excitation through the filter, read by
+    /// the zero-input-response computation of the next subframe.
+    comb_mem: CombinedMem,
+}
+
+/// Number of weighted-speech history samples the encoder keeps: the
+/// §2.9 open-loop search reaches back `PITCH_MAX` samples and the
+/// §2.11 harmonic-noise-shaping search up to `L_OL + 3`.
+const WSPEECH_HIST: usize = PITCH_MAX + 3;
+
+/// Filter memories of the §2.12 combined filter
+/// `S_i(z) = Ã_i(z)·W_i(z)·P_i(z)` (eq. 19), one field per cascade
+/// stage in processing order. The §2.13 zero-input response runs the
+/// cascade on a *clone* with zero input; the §2.19 memory update
+/// commits the reconstructed excitation through the real one.
+#[derive(Clone)]
+struct CombinedMem {
+    /// `1/Ã_i(z)` synthesis-stage output history (`[0]` most recent).
+    syn: [f32; LPC_ORDER],
+    /// `A(z/γ₁)` FIR-stage input history.
+    wz: [f32; LPC_ORDER],
+    /// `1/A(z/γ₂)` IIR-stage output history.
+    wp: [f32; LPC_ORDER],
+    /// `P_i(z) = 1 − β·z^{−L}` stage *input* history (oldest first) —
+    /// long enough for the maximum harmonic lag `L = L_OL + 3 = 145`.
+    p_hist: [f32; WSPEECH_HIST],
+}
+
+impl CombinedMem {
+    fn new() -> Self {
+        Self {
+            syn: [0.0; LPC_ORDER],
+            wz: [0.0; LPC_ORDER],
+            wp: [0.0; LPC_ORDER],
+            p_hist: [0.0; WSPEECH_HIST],
+        }
+    }
 }
 
 impl AnalysisState {
@@ -335,6 +397,10 @@ impl AnalysisState {
             hp_y_prev: 0.0,
             lpc_tail: [0.0; SUBFRAME_SIZE],
             prev_unq_lsp: crate::tables::lsp_dc_cosines(),
+            wght_x_mem: [0.0; LPC_ORDER],
+            wght_f_mem: [0.0; LPC_ORDER],
+            wspeech_hist: [0.0; WSPEECH_HIST],
+            comb_mem: CombinedMem::new(),
         }
     }
 
@@ -361,15 +427,24 @@ impl AnalysisState {
     /// parameter set — the §2 encoder pipeline running on the published
     /// tables:
     ///
-    /// - §2.4–2.5: LPC analysis + the predictive split-VQ LSP quantiser
+    /// - §2.4–2.5: per-subframe windowed LPC analysis + the predictive
+    ///   split-VQ LSP quantiser on the bandwidth-expanded A3(z)
     ///   ([`crate::spec_lsp`]).
-    /// - §2.14 closed-loop pitch: lag candidates around the per-subframe
-    ///   open-loop estimate (±1 on subframes 0/2; the −1..+2 delta window
-    ///   on 1/3), jointly searched with the 85-/170-row gain-vector
+    /// - §2.8–2.9: formant-weighted speech on the unquantised LPC and
+    ///   the two half-frame open-loop pitch estimates.
+    /// - §2.11–2.13: per-subframe harmonic noise shaping, the combined
+    ///   filter `S_i(z) = Ã_i(z)·W_i(z)·P_i(z)` impulse response, and
+    ///   ringing subtraction of its zero-input response — all searches
+    ///   below run in this weighted domain.
+    /// - §2.14 closed-loop pitch: lag candidates around the open-loop
+    ///   estimate (±1 on subframes 0/2; the −1..+2 delta window on
+    ///   1/3), jointly searched with the 85-/170-row gain-vector
     ///   codebook by maximising `2·βᵀd − βᵀRβ` over the filtered eq. 41
     ///   basis vectors.
     /// - §2.15 / §2.16 fixed-codebook search at the quantised gain
     ///   levels (see [`mpmlq_spec_search`] / [`acelp_spec_search`]).
+    /// - §2.19: the reconstructed excitation is passed through the
+    ///   combined filter to carry its ringing into the next subframe.
     ///
     /// After parameter selection the shadow decoder is rolled back and
     /// committed through the *exact* decode kernel
@@ -448,8 +523,34 @@ impl AnalysisState {
             lsp_q = self.decoder.prev_lsp;
         }
 
+        // ---- §2.8: perceptually weighted speech f[n], per subframe on
+        // the *unquantised* LPC, memories carried across subframes and
+        // frames. The frame's weighted output is appended to the
+        // 145-sample history so the pitch searches can reach back.
+        let mut wbuf = [0.0f32; WSPEECH_HIST + FRAME_SIZE_SAMPLES];
+        wbuf[..WSPEECH_HIST].copy_from_slice(&self.wspeech_hist);
+        let mut wtaps = [([0.0f32; LPC_ORDER], [0.0f32; LPC_ORDER]); SUBFRAMES_PER_FRAME];
+        for s in 0..SUBFRAMES_PER_FRAME {
+            wtaps[s] = weighting_taps(&a_unq[s]);
+            let (wz, wp) = &wtaps[s];
+            let start = s * SUBFRAME_SIZE;
+            let f = weight_subframe(
+                &sig[start..start + SUBFRAME_SIZE],
+                wz,
+                wp,
+                &mut self.wght_x_mem,
+                &mut self.wght_f_mem,
+            );
+            wbuf[WSPEECH_HIST + start..WSPEECH_HIST + start + SUBFRAME_SIZE].copy_from_slice(&f);
+        }
+        self.wspeech_hist
+            .copy_from_slice(&wbuf[FRAME_SIZE_SAMPLES..]);
+
+        // ---- §2.9: two open-loop pitch estimates per frame on the
+        // weighted speech — one for subframes 0/1, one for 2/3.
+        let ol_lags = [open_loop_pitch(&wbuf, 0), open_loop_pitch(&wbuf, 1)];
+
         let exc_snapshot = self.decoder.exc_history;
-        let syn_snapshot = self.decoder.syn_mem;
         let prev_lsp_snapshot = self.decoder.prev_lsp;
 
         let mut params = SpecFrameParams::zeroed(rate);
@@ -459,16 +560,41 @@ impl AnalysisState {
             let lsp_interp = interpolate_lsp(s, &prev_lsp_snapshot, &lsp_q);
             let a_sub = lsp_to_lpc(&lsp_interp);
             let start = s * SUBFRAME_SIZE;
+            let (wz, wp) = wtaps[s];
+            let ol = ol_lags[s / 2];
 
-            let zir = zero_input_response(&a_sub, &self.decoder.syn_mem, SUBFRAME_SIZE);
+            // ---- §2.11: harmonic noise shaping around the open-loop
+            // estimate; the target vector is w[n] = f[n] − β·f[n−L]
+            // (eq. 18).
+            let hns = harmonic_noise_shaping(&wbuf, WSPEECH_HIST + start, ol);
+            let mut w_target = [0.0f32; SUBFRAME_SIZE];
+            for n in 0..SUBFRAME_SIZE {
+                let idx = WSPEECH_HIST + start + n;
+                w_target[n] = wbuf[idx] - hns.beta * wbuf[idx - hns.lag as usize];
+            }
+
+            // ---- §2.12 / §2.13: impulse response of the combined
+            // filter S_i(z) = Ã_i(z)·W_i(z)·P_i(z) and its zero-input
+            // response; ringing subtraction yields the closed-loop
+            // target t[n] = w[n] − z[n].
+            let h = combined_impulse_response(&a_sub, &wz, &wp, hns);
+            let mut zir_mem = self.comb_mem.clone();
+            let zir = run_combined(
+                &mut zir_mem,
+                &[0.0f32; SUBFRAME_SIZE],
+                &a_sub,
+                &wz,
+                &wp,
+                hns,
+            );
             let mut target = [0.0f32; SUBFRAME_SIZE];
             for n in 0..SUBFRAME_SIZE {
-                target[n] = sig[start + n] - zir[n];
+                target[n] = w_target[n] - zir[n];
             }
-            let h = impulse_response(&a_sub, SUBFRAME_SIZE);
 
-            // ---- Closed-loop pitch + gain-vector search (§2.14). ----
-            let ol = open_loop_acb_lag(&target, &self.decoder.exc_history, &h);
+            // ---- Closed-loop pitch + gain-vector search (§2.14):
+            // lag candidates around the §2.9 open-loop estimate (±1 on
+            // subframes 0/2; the −1..+2 delta window on 1/3).
             let lag_range = PITCH_MIN as i32..=PITCH_MAX as i32;
             let candidates: Vec<i32> = if s % 2 == 0 {
                 (ol - 1..=ol + 1)
@@ -603,14 +729,17 @@ impl AnalysisState {
             self.decoder.exc_history.rotate_left(SUBFRAME_SIZE);
             let tail = self.decoder.exc_history.len() - SUBFRAME_SIZE;
             self.decoder.exc_history[tail..].copy_from_slice(&exc);
-            advance_syn_mem(&a_sub, &exc, &mut self.decoder.syn_mem);
+            // ---- §2.19 memory update: pass the reconstructed
+            // excitation through the combined filter so the next
+            // subframe's zero-input response starts from the committed
+            // ringing state.
+            let _ = run_combined(&mut self.comb_mem, &exc, &a_sub, &wz, &wp, hns);
         }
 
         // Roll back and commit through the canonical decode kernel so
         // the shadow decoder state is bit-for-bit what a real decoder
         // holds after this frame.
         self.decoder.exc_history = exc_snapshot;
-        self.decoder.syn_mem = syn_snapshot;
         let _ = self.decoder.decode_spec_params(&params);
         params
     }
@@ -895,6 +1024,242 @@ fn default_a() -> [f32; LPC_ORDER + 1] {
     let mut a = [0.0f32; LPC_ORDER + 1];
     a[0] = 1.0;
     a
+}
+
+// ---------- weighted-domain analysis (§2.8–§2.13) ----------
+
+/// §2.8 formant perceptual weighting filter tap sets from one
+/// *unquantised* LPC vector (eq. 11):
+/// `W_i(z) = A(z/γ₁)/A(z/γ₂)` with γ₁ = 0.9, γ₂ = 0.5 applied through
+/// the published Q15 per-tap weight tables. Returns
+/// `(numerator taps, denominator taps)` where entry `k` weights the
+/// order-`k+1` LPC coefficient.
+fn weighting_taps(a: &[f32; LPC_ORDER + 1]) -> ([f32; LPC_ORDER], [f32; LPC_ORDER]) {
+    let mut wz = [0.0f32; LPC_ORDER];
+    let mut wp = [0.0f32; LPC_ORDER];
+    for k in 0..LPC_ORDER {
+        wz[k] = a[k + 1] * (crate::spec_tables::PERCEPTUAL_ZERO_Q15[k] as f32 / 32_768.0);
+        wp[k] = a[k + 1] * (crate::spec_tables::PERCEPTUAL_POLE_Q15[k] as f32 / 32_768.0);
+    }
+    (wz, wp)
+}
+
+/// §2.8: filter one 60-sample subframe of input speech through
+/// `W_i(z)` with persistent memories (`x_mem` = past inputs for the
+/// FIR numerator, `f_mem` = past outputs for the IIR denominator,
+/// most recent first), producing the weighted speech `f[n]`.
+///
+/// With the crate's coefficient storage `A(z) = 1 + Σ a_{k+1} z^{−k−1}`
+/// the filter recursion is
+/// `f[n] = x[n] + Σ wz_k·x[n−k−1] − Σ wp_k·f[n−k−1]`.
+fn weight_subframe(
+    x: &[f32],
+    wz: &[f32; LPC_ORDER],
+    wp: &[f32; LPC_ORDER],
+    x_mem: &mut [f32; LPC_ORDER],
+    f_mem: &mut [f32; LPC_ORDER],
+) -> [f32; SUBFRAME_SIZE] {
+    debug_assert_eq!(x.len(), SUBFRAME_SIZE);
+    let mut out = [0.0f32; SUBFRAME_SIZE];
+    for n in 0..SUBFRAME_SIZE {
+        let mut acc = x[n];
+        for k in 0..LPC_ORDER {
+            acc += wz[k] * x_mem[k] - wp[k] * f_mem[k];
+        }
+        for k in (1..LPC_ORDER).rev() {
+            x_mem[k] = x_mem[k - 1];
+            f_mem[k] = f_mem[k - 1];
+        }
+        x_mem[0] = x[n];
+        f_mem[0] = acc;
+        out[n] = acc;
+    }
+    out
+}
+
+/// §2.9 open-loop pitch estimation on the perceptually weighted speech
+/// (eq. 12): maximise `C_OL(j) = (Σ f[n]·f[n−j])² / Σ f[n−j]²` over
+/// `18 ≤ j ≤ 142` for one 120-sample half-frame, with the smaller-lag
+/// preference rule — a candidate at least 18 lags above the incumbent
+/// must beat it by 1.25 dB, closer candidates only have to exceed it.
+///
+/// `wbuf` is `[history (145) | weighted frame (240)]`; `half` selects
+/// samples `0..120` or `120..240` of the frame part.
+fn open_loop_pitch(wbuf: &[f32], half: usize) -> i32 {
+    // 1.25 dB on the eq. 12 energy-ratio criterion.
+    const DB_1_25: f64 = 1.333_521_432_163_324;
+    const HALF_LEN: usize = FRAME_SIZE_SAMPLES / 2;
+    let o = WSPEECH_HIST + half * HALF_LEN;
+    let mut best_lag = PITCH_MIN as i32;
+    let mut best_col = f64::NEG_INFINITY;
+    for j in PITCH_MIN..=PITCH_MAX {
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for n in 0..HALF_LEN {
+            let fj = wbuf[o + n - j] as f64;
+            num += wbuf[o + n] as f64 * fj;
+            den += fj * fj;
+        }
+        if den <= 0.0 {
+            continue;
+        }
+        let col = num * num / den;
+        let take = if best_col == f64::NEG_INFINITY {
+            true
+        } else if (j as i32 - best_lag) < PITCH_MIN as i32 {
+            col > best_col
+        } else {
+            col > best_col * DB_1_25
+        };
+        if take {
+            best_col = col;
+            best_lag = j as i32;
+        }
+    }
+    best_lag
+}
+
+/// §2.11 harmonic-noise-shaping filter parameters
+/// `P_i(z) = 1 − β·z^{−L}` (eq. 13–17).
+#[derive(Copy, Clone)]
+struct HnsParams {
+    lag: i32,
+    beta: f32,
+}
+
+impl HnsParams {
+    /// The disabled filter (`β = 0`, eq. 17 second branch).
+    fn off() -> Self {
+        Self {
+            lag: PITCH_MIN as i32,
+            beta: 0.0,
+        }
+    }
+}
+
+/// §2.11: pick the optimal harmonic-noise-shaping lag `L` in
+/// `[L_OL − 3, L_OL + 3]` maximising eq. 14.2 (only positive
+/// correlations `N(j)` are considered), then gate the filter on the
+/// eq. 17 prediction-gain test `−10·log₁₀(1 − C_L/E) ≥ 2.0 dB` and
+/// compute `β = 0.3125·G_opt` with `G_opt` limited to `[0, 1]`.
+///
+/// `wbuf` is `[history (145) | weighted frame (240)]`, `off` the index
+/// of the subframe start within `wbuf`.
+fn harmonic_noise_shaping(wbuf: &[f32], off: usize, l_ol: i32) -> HnsParams {
+    let lo = (l_ol - 3).max(PITCH_MIN as i32);
+    let hi = (l_ol + 3).min(WSPEECH_HIST as i32);
+    let mut cl = f64::NEG_INFINITY; // best C_PW
+    let mut lag = 0i32;
+    let mut gopt = 0.0f64;
+    for j in lo..=hi {
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for n in 0..SUBFRAME_SIZE {
+            let fj = wbuf[off + n - j as usize] as f64;
+            num += wbuf[off + n] as f64 * fj;
+            den += fj * fj;
+        }
+        // eq. 14.2: only positive correlation values are considered.
+        if num <= 0.0 || den <= 0.0 {
+            continue;
+        }
+        let cpw = num * num / den;
+        if cpw > cl {
+            cl = cpw;
+            lag = j;
+            gopt = num / den;
+        }
+    }
+    if lag == 0 {
+        return HnsParams::off();
+    }
+    // eq. 16–17: energy gate. `C_L/E ≥ 1 − 10^(−0.2)` ⇔ the harmonic
+    // predictor removes at least 2.0 dB.
+    let mut e = 0.0f64;
+    for n in 0..SUBFRAME_SIZE {
+        e += (wbuf[off + n] as f64).powi(2);
+    }
+    if e <= 0.0 {
+        return HnsParams::off();
+    }
+    let ratio = (cl / e).min(1.0);
+    if -10.0 * (1.0 - ratio).log10() >= 2.0 {
+        HnsParams {
+            lag,
+            beta: 0.3125 * gopt.clamp(0.0, 1.0) as f32,
+        }
+    } else {
+        HnsParams::off()
+    }
+}
+
+/// Run one subframe of `input` through the §2.12 combined filter
+/// `S_i(z) = Ã_i(z)·W_i(z)·P_i(z)` (eq. 19), committing all stage
+/// memories in `mem`. Cascade order: `1/Ã_i(z)` synthesis → `A(z/γ₁)`
+/// FIR → `1/A(z/γ₂)` IIR → `P_i(z)` harmonic FIR.
+///
+/// Used three ways: the §2.12 impulse response (fresh zero memories,
+/// unit impulse input), the §2.13 zero-input response (clone of the
+/// committed memories, zero input), and the §2.19 memory update (the
+/// committed memories, reconstructed excitation input).
+fn run_combined(
+    mem: &mut CombinedMem,
+    input: &[f32; SUBFRAME_SIZE],
+    aq: &[f32; LPC_ORDER + 1],
+    wz: &[f32; LPC_ORDER],
+    wp: &[f32; LPC_ORDER],
+    hns: HnsParams,
+) -> [f32; SUBFRAME_SIZE] {
+    let mut out = [0.0f32; SUBFRAME_SIZE];
+    let mut p_in = [0.0f32; SUBFRAME_SIZE];
+    let l = hns.lag as usize;
+    for n in 0..SUBFRAME_SIZE {
+        // 1/Ã_i(z) synthesis stage.
+        let mut s = input[n];
+        for k in 0..LPC_ORDER {
+            s -= aq[k + 1] * mem.syn[k];
+        }
+        for k in (1..LPC_ORDER).rev() {
+            mem.syn[k] = mem.syn[k - 1];
+        }
+        mem.syn[0] = s;
+        // A(z/γ₁) FIR + 1/A(z/γ₂) IIR — the §2.8 weighting filter.
+        let mut f = s;
+        for k in 0..LPC_ORDER {
+            f += wz[k] * mem.wz[k] - wp[k] * mem.wp[k];
+        }
+        for k in (1..LPC_ORDER).rev() {
+            mem.wz[k] = mem.wz[k - 1];
+            mem.wp[k] = mem.wp[k - 1];
+        }
+        mem.wz[0] = s;
+        mem.wp[0] = f;
+        // P_i(z) = 1 − β·z^{−L} harmonic stage.
+        let past = if n >= l {
+            p_in[n - l]
+        } else {
+            mem.p_hist[WSPEECH_HIST - (l - n)]
+        };
+        p_in[n] = f;
+        out[n] = f - hns.beta * past;
+    }
+    mem.p_hist.copy_within(SUBFRAME_SIZE.., 0);
+    mem.p_hist[WSPEECH_HIST - SUBFRAME_SIZE..].copy_from_slice(&p_in);
+    out
+}
+
+/// §2.12: impulse response `h_i[0..59]` of the combined filter
+/// `S_i(z)` — the cascade run from rest on a unit impulse.
+fn combined_impulse_response(
+    aq: &[f32; LPC_ORDER + 1],
+    wz: &[f32; LPC_ORDER],
+    wp: &[f32; LPC_ORDER],
+    hns: HnsParams,
+) -> [f32; SUBFRAME_SIZE] {
+    let mut mem = CombinedMem::new();
+    let mut delta = [0.0f32; SUBFRAME_SIZE];
+    delta[0] = 1.0;
+    run_combined(&mut mem, &delta, aq, wz, wp, hns)
 }
 
 /// Formant-postfilter bandwidth expansion using the spec's *exact*
@@ -1509,25 +1874,6 @@ pub(crate) fn place_pulses(
 
 // ---------- filtering helpers ----------
 
-/// Impulse response of the 1/A_weighted(z) filter, length `n`.
-fn impulse_response(a_weighted: &[f32; LPC_ORDER + 1], n: usize) -> Vec<f32> {
-    let mut h = vec![0.0f32; n];
-    let mut mem = [0.0f32; LPC_ORDER];
-    for i in 0..n {
-        let e = if i == 0 { 1.0 } else { 0.0 };
-        let mut s = e;
-        for k in 0..LPC_ORDER {
-            s -= a_weighted[k + 1] * mem[k];
-        }
-        for k in (1..LPC_ORDER).rev() {
-            mem[k] = mem[k - 1];
-        }
-        mem[0] = s;
-        h[i] = s;
-    }
-    h
-}
-
 /// Causal convolution `y = x * h` truncated to length of x.
 fn conv_causal(x: &[f32; SUBFRAME_SIZE], h: &[f32]) -> [f32; SUBFRAME_SIZE] {
     let mut y = [0.0f32; SUBFRAME_SIZE];
@@ -1541,75 +1887,6 @@ fn conv_causal(x: &[f32; SUBFRAME_SIZE], h: &[f32]) -> [f32; SUBFRAME_SIZE] {
         y[n] = acc;
     }
     y
-}
-
-/// Advance the 1/A(z) synthesis filter memory with `exc` so cross-subframe
-/// state stays in sync with what the decoder will render.
-fn advance_syn_mem(
-    a: &[f32; LPC_ORDER + 1],
-    exc: &[f32; SUBFRAME_SIZE],
-    mem: &mut [f32; LPC_ORDER],
-) {
-    for i in 0..SUBFRAME_SIZE {
-        let mut s = exc[i];
-        for k in 0..LPC_ORDER {
-            s -= a[k + 1] * mem[k];
-        }
-        for k in (1..LPC_ORDER).rev() {
-            mem[k] = mem[k - 1];
-        }
-        mem[0] = s;
-    }
-}
-
-/// Zero-input response of the 1/A(z) synthesis filter over `n` samples
-/// starting from the given filter memory `mem` (input = zero).
-fn zero_input_response(a: &[f32; LPC_ORDER + 1], mem: &[f32; LPC_ORDER], n: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; n];
-    let mut m = *mem;
-    for i in 0..n {
-        let mut s = 0.0f32;
-        for k in 0..LPC_ORDER {
-            s -= a[k + 1] * m[k];
-        }
-        for k in (1..LPC_ORDER).rev() {
-            m[k] = m[k - 1];
-        }
-        m[0] = s;
-        out[i] = s;
-    }
-    out
-}
-
-/// Open-loop adaptive-codebook lag search. Given the current synthesis
-/// target (= input signal minus zero-input response) and the synthesis
-/// filter impulse response `h`, pick the integer lag `L ∈ [PITCH_MIN,
-/// PITCH_MAX]` whose ACB prediction convolved with `h` most closely
-/// matches the target in the least-squares sense (maximises `<target,
-/// h*acb>^2 / ||h*acb||^2`).
-fn open_loop_acb_lag(target: &[f32; SUBFRAME_SIZE], history: &[f32], h: &[f32]) -> i32 {
-    let mut best_score = -f32::INFINITY;
-    let mut best_lag = PITCH_MIN as i32;
-    let mut cand = [0.0f32; SUBFRAME_SIZE];
-    for lag in PITCH_MIN..=PITCH_MAX {
-        copy_adaptive(history, lag as i32, &mut cand);
-        let filtered = conv_causal(&cand, h);
-        let mut num = 0.0f32;
-        let mut den = 1e-6f32;
-        for n in 0..SUBFRAME_SIZE {
-            num += target[n] * filtered[n];
-            den += filtered[n] * filtered[n];
-        }
-        if den < 1e-6 {
-            continue;
-        }
-        let score = num * num / den;
-        if score > best_score {
-            best_score = score;
-            best_lag = lag as i32;
-        }
-    }
-    best_lag
 }
 
 // ---------- decoder ----------
@@ -2616,6 +2893,134 @@ mod tests {
             pts: Some(0),
             data: vec![bytes],
         })
+    }
+
+    /// §2.8 weighting-filter identity: with equal numerator and
+    /// denominator tap sets the cascade `A(z/γ)/A(z/γ)` is the identity
+    /// operator, whatever the underlying LPC — a structural check of
+    /// the FIR/IIR recursion and its memory handling.
+    #[test]
+    fn weighting_filter_equal_taps_is_identity() {
+        let mut lcg: u32 = 0xBEEF_0001;
+        let mut rnd = || {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((lcg >> 8) & 0xFFFF) as f32 / 65_536.0 - 0.5
+        };
+        let mut taps = [0.0f32; LPC_ORDER];
+        for t in taps.iter_mut() {
+            *t = rnd() * 0.3;
+        }
+        let mut x = [0.0f32; SUBFRAME_SIZE];
+        for v in x.iter_mut() {
+            *v = rnd();
+        }
+        let mut x_mem = [0.0f32; LPC_ORDER];
+        let mut f_mem = [0.0f32; LPC_ORDER];
+        let out = weight_subframe(&x, &taps, &taps, &mut x_mem, &mut f_mem);
+        for n in 0..SUBFRAME_SIZE {
+            assert!(
+                (out[n] - x[n]).abs() < 1.0e-4,
+                "sample {n}: {} vs {}",
+                out[n],
+                x[n]
+            );
+        }
+    }
+
+    /// §2.9 open-loop pitch on a strongly periodic signal must find the
+    /// fundamental period, not a multiple — the smaller-lag preference
+    /// rule (a far larger lag must win by 1.25 dB) exists exactly for
+    /// this.
+    #[test]
+    fn open_loop_pitch_finds_fundamental_not_multiple() {
+        const PERIOD: usize = 40;
+        let mut wbuf = [0.0f32; WSPEECH_HIST + FRAME_SIZE_SAMPLES];
+        for (n, v) in wbuf.iter_mut().enumerate() {
+            // Periodic pulse train with a decaying intra-period shape.
+            let ph = n % PERIOD;
+            *v = (-(ph as f32) / 6.0).exp() * if ph == 0 { 1.0 } else { 0.4 };
+        }
+        assert_eq!(open_loop_pitch(&wbuf, 0), PERIOD as i32);
+        assert_eq!(open_loop_pitch(&wbuf, 1), PERIOD as i32);
+    }
+
+    /// §2.11: a strongly periodic weighted subframe engages the
+    /// harmonic filter (β > 0, lag at the true period), while an
+    /// aperiodic one is gated off by the 2.0 dB prediction-gain test
+    /// (eq. 17 second branch) and a fully positive G_opt is scaled by
+    /// 0.3125 and capped at that value.
+    #[test]
+    fn harmonic_noise_shaping_gates_on_periodicity() {
+        const PERIOD: usize = 40;
+        let mut wbuf = [0.0f32; WSPEECH_HIST + FRAME_SIZE_SAMPLES];
+        for (n, v) in wbuf.iter_mut().enumerate() {
+            *v = (2.0 * std::f32::consts::PI * n as f32 / PERIOD as f32).sin();
+        }
+        let hns = harmonic_noise_shaping(&wbuf, WSPEECH_HIST, PERIOD as i32);
+        assert_eq!(hns.lag, PERIOD as i32, "must lock to the true period");
+        assert!(
+            (hns.beta - 0.3125).abs() < 1.0e-3,
+            "unit-gain periodicity ⇒ β = 0.3125·G_opt with G_opt ≈ 1, got {}",
+            hns.beta
+        );
+
+        // White-ish aperiodic input: gate must stay closed.
+        let mut lcg: u32 = 0x5EED_0002;
+        for v in wbuf.iter_mut() {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *v = ((lcg >> 8) & 0xFFFF) as f32 / 65_536.0 - 0.5;
+        }
+        let hns = harmonic_noise_shaping(&wbuf, WSPEECH_HIST, PERIOD as i32);
+        assert_eq!(hns.beta, 0.0, "aperiodic input must not engage P(z)");
+    }
+
+    /// §2.12/§2.13 linearity: the combined filter's response to an
+    /// input from a warmed-up state must decompose exactly into
+    /// zero-input response (ringing) + impulse-response convolution of
+    /// the input — the superposition identity the whole closed-loop
+    /// search relies on (`t = w − z`, `r′ = h ∗ v`).
+    #[test]
+    fn combined_filter_superposition_of_zir_and_impulse_response() {
+        let lsp = crate::tables::lsp_dc_cosines();
+        let aq = lsp_to_lpc(&lsp);
+        let (wz, wp) = weighting_taps(&aq);
+        let hns = HnsParams { lag: 25, beta: 0.2 };
+        let mut lcg: u32 = 0xABCD_0003;
+        let mut rnd = || {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((lcg >> 8) & 0xFFFF) as f32 / 65_536.0 - 0.5
+        };
+        // Warm the committed state up with a random subframe.
+        let mut warm = [0.0f32; SUBFRAME_SIZE];
+        for v in warm.iter_mut() {
+            *v = rnd();
+        }
+        let mut mem = CombinedMem::new();
+        let _ = run_combined(&mut mem, &warm, &aq, &wz, &wp, hns);
+        // Full response to a fresh random input from the warm state…
+        let mut input = [0.0f32; SUBFRAME_SIZE];
+        for v in input.iter_mut() {
+            *v = rnd();
+        }
+        let full = run_combined(&mut mem.clone(), &input, &aq, &wz, &wp, hns);
+        // …must equal ZIR + h ∗ input.
+        let zir = run_combined(&mut mem.clone(), &[0.0; SUBFRAME_SIZE], &aq, &wz, &wp, hns);
+        let h = combined_impulse_response(&aq, &wz, &wp, hns);
+        assert!(
+            (h[0] - 1.0).abs() < 1.0e-6,
+            "h[0] = {} (monic cascade)",
+            h[0]
+        );
+        let hv = conv_causal(&input, &h);
+        for n in 0..SUBFRAME_SIZE {
+            let want = zir[n] + hv[n];
+            assert!(
+                (full[n] - want).abs() < 1.0e-4,
+                "sample {n}: {} vs {}",
+                full[n],
+                want
+            );
+        }
     }
 
     /// LPC → LSP → LPC roundtrip: the Chebyshev root search must

@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **Weighted-domain analysis chain (§2.8–§2.13, §2.19) — the
+  encoder's closed-loop searches now run where the spec puts them
+  (r406)**: per-subframe §2.8 formant perceptual weighting
+  `W_i(z) = A(z/0.9)/A(z/0.5)` on the *unquantised* LPC (published
+  Q15 tap-weight tables); §2.9 two half-frame open-loop pitch
+  estimates on the weighted speech (eq. 12 cross-correlation with
+  the smaller-lag preference — a lag ≥ 18 above the incumbent must
+  win by 1.25 dB); §2.11 harmonic noise shaping
+  `P_i(z) = 1 − β·z^−L` searched in `[L_OL ± 3]` with the
+  positive-correlation restriction, `β = 0.3125·G_opt` gated by the
+  eq. 17 2.0 dB prediction-gain test; §2.12 impulse response of the
+  *combined* filter `S_i(z) = Ã_i(z)·W_i(z)·P_i(z)`; §2.13 ringing
+  subtraction of its zero-input response (`t[n] = w[n] − z[n]`); and
+  the §2.19 memory update passing the reconstructed excitation
+  through `S_i(z)` per subframe. The §2.14 closed-loop lag
+  candidates now come from the §2.9 open-loop estimates (±1 on
+  subframes 0/2) instead of a per-subframe ad-hoc filtered-history
+  search; the ACB/FCB searches are otherwise unchanged but operate
+  on the weighted target with the combined impulse response. New
+  structural tests: weighting-cascade identity, open-loop
+  fundamental-vs-multiple preference, HNS periodicity gating, and
+  the ZIR + h∗v superposition identity the search decomposition
+  relies on. Measured against the ITU encoder `.RCO` references,
+  exact ACL0/ACL2 agreement: OVERC63 25→65%, INEQC53 19→85%,
+  OVERC53H 9.5→81%, TAMEC63H 9.5→48%, CODEC63 11→19.5% (±1: 47%),
+  PATHC63H 5.6→16.7%, PATHC53 4.9→15.8%.
+
 - **§2.4/§2.5 encoder LPC analysis rebuilt on the spec windows
   (r406)**: four LPC sets per frame, each from the published Q15
   Hamming window over 180 samples *centered on its subframe* — which
