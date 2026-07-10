@@ -9,8 +9,9 @@
 //!
 //! Override the corpus location with `OXIDEAV_G7231_CONFORMANCE`.
 //!
-//! What is pinned here (r391 measured floors — float decoder with the
-//! corrected pitch-loop gain, plus the fixed-point `qdec` pipeline):
+//! What is pinned here (r406 measured floors — after the LSP
+//! band-order fix and the output-scale re-arbitration, both the float
+//! decoder and the fixed-point `qdec` pipeline):
 //!
 //! - **Wire format**: every frame of every main-body `.RCO`/`.TCO`
 //!   stream unpacks through the clause-4 Table 5/6 layout and repacks
@@ -25,8 +26,10 @@
 //!   territory (see the workspace round notes).
 //! - **Robustness**: full CRC-driven decodes (erasure concealment +
 //!   invalid-frame concealment) complete with the exact sample budget.
-//! - **Encoder self-validity**: `SpecEncoder` output on the encoder
-//!   test inputs is a legal clause-4 stream at both rates.
+//! - **Encoder parameter agreement**: `SpecEncoder` output on every
+//!   encoder test input is a legal clause-4 stream, and its LSP / lag /
+//!   fixed-gain decisions agree with the reference `.RCO` bitstreams at
+//!   pinned per-vector floors.
 
 use oxideav_g7231::encoder::{SpecEncoder, SynthesisState};
 use oxideav_g7231::linepack::{pack_frame, unpack_frame, PackedRate};
@@ -59,16 +62,6 @@ fn read_pcm(dir: &Path, name: &str) -> Vec<i16> {
     b.chunks_exact(2)
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect()
-}
-
-/// The §2.4 encoder lookahead for frame `i` of `pcm`: the next frame's
-/// first 60 samples, zero-padded at end of stream.
-fn lookahead_of(pcm: &[i16], i: usize) -> [i16; 60] {
-    let mut la = [0i16; 60];
-    let start = (i + 1) * FRAME_SAMPLES;
-    let n = pcm.len().saturating_sub(start).min(60);
-    la[..n].copy_from_slice(&pcm[start..start + n]);
-    la
 }
 
 /// Per-frame erasure flags from a `.CRC` companion (16-bit LE words,
@@ -220,16 +213,10 @@ fn itu_streams_unpack_and_repack_byte_identically() {
 /// OFF per the ITU test configuration).
 ///
 /// History of the floors: r388's float decoder measured whole-file
-/// corr 0.973 / SNR 7.3 dB — but that number certified an artifact.
-/// Its Q13 reading of the gain-vector rows made the pitch loop grow
-/// without bound (the r391 instrumentation shows the unclamped
-/// excitation reaching 2^36 by frame 7), and the fully-clipped output
-/// square wave sign-matched the reference's near-full-scale OVER
-/// waveform. The r391 vector-arbitrated loop (taps / 16384) keeps
-/// amplitudes honest: corr drops to 0.48 whole-file while every other
-/// stream in the corpus improves dramatically (PATHD63P −12.8 → +3.5
-/// dB). Floors pinned at the r391 measurements: whole-file corr
-/// 0.4823, mean per-frame corr 0.8923, SNR 0.26 dB.
+/// corr 0.973 / SNR 7.3 dB — a clipping artifact (see the r391 notes).
+/// r391's honest loop measured 0.48 / 0.26 dB. r406 (LSP band-order
+/// fix + unshifted output emission) measures corr 0.9977 / mean
+/// per-frame 0.9970 / SNR 20.9 dB — floors pinned just under.
 #[test]
 fn decoder_tracks_overd53_reference() {
     let Some(dir) = corpus_dir() else { return };
@@ -248,16 +235,16 @@ fn decoder_tracks_overd53_reference() {
     let mean_frame_corr = frame_corr_sum / n as f64;
     let snr = snr_db(&reference, &ours);
     eprintln!("OVERD53: corr {c:.4}, mean frame corr {mean_frame_corr:.4}, SNR {snr:.2} dB");
-    assert!(c >= 0.45, "whole-file corr regressed: {c:.4}");
+    assert!(c >= 0.99, "whole-file corr regressed: {c:.4}");
     assert!(
-        mean_frame_corr >= 0.85,
+        mean_frame_corr >= 0.99,
         "mean per-frame corr regressed: {mean_frame_corr:.4}"
     );
-    assert!(snr >= 0.0, "SNR regressed: {snr:.2} dB");
+    assert!(snr >= 15.0, "SNR regressed: {snr:.2} dB");
 }
 
 /// High-rate decoder cold-start tracking floors on OVERD63P
-/// (post-filter ON), r391 re-measured after the loop-gain correction.
+/// (post-filter ON) — r406 measured 0.9690 / 0.9993 / 0.9999 / 0.9997.
 #[test]
 fn decoder_tracks_overd63p_cold_start() {
     let Some(dir) = corpus_dir() else { return };
@@ -265,7 +252,7 @@ fn decoder_tracks_overd63p_cold_start() {
     let bs = std::fs::read(dir.join("OVERD63P.TCO")).unwrap();
     let mut st = SynthesisState::new();
     st.set_postfilter(true);
-    let floors = [0.5f64, 0.65, 0.0, 0.0];
+    let floors = [0.95f64, 0.99, 0.99, 0.99];
     for (i, floor) in floors.iter().enumerate() {
         let pcm = st.decode_mpmlq(&bs[i * 24..(i + 1) * 24]).unwrap();
         let c = corr(&reference[i * FRAME_SAMPLES..(i + 1) * FRAME_SAMPLES], &pcm);
@@ -274,9 +261,8 @@ fn decoder_tracks_overd63p_cold_start() {
     }
 }
 
-/// PATHD53 (post-filter OFF) cold-start floor — r391 measured frame 0
-/// corr 0.8347 (r388: 0.549; the eq. 41.1 contiguous-alignment fix and
-/// loop-gain correction lifted it).
+/// PATHD53 (post-filter OFF) cold-start floor — r406 measured frame 0
+/// corr 0.9999 (r388: 0.549, r391: 0.835).
 #[test]
 fn decoder_tracks_pathd53_cold_start() {
     let Some(dir) = corpus_dir() else { return };
@@ -287,7 +273,7 @@ fn decoder_tracks_pathd53_cold_start() {
     let pcm = st.decode_acelp(&bs[..20]).unwrap();
     let c = corr(&reference[..FRAME_SAMPLES], &pcm);
     eprintln!("PATHD53 frame 0: corr {c:.4}");
-    assert!(c >= 0.80, "frame 0 corr {c:.4} under floor");
+    assert!(c >= 0.995, "frame 0 corr {c:.4} under floor");
 }
 
 /// Every decoder-test stream must decode end-to-end (CRC-driven
@@ -387,14 +373,15 @@ fn exactness(reference: &[i16], ours: &[i16]) -> (f64, i32) {
 #[test]
 fn fixed_decoder_tracks_pf_off_vectors() {
     let Some(dir) = corpus_dir() else { return };
-    // r391 measured: PATHD53 0.5989 / +1.91 dB / 14.3% exact,
-    // OVERD53 0.4836 / +0.26 dB, INEQD53 0.8306 / +4.54 dB / 29.0%
-    // exact. (The float baseline before this round: 0.04 / −12.7 dB,
-    // 0.97 (clipping artifact) / 7.3 dB, −0.01 / −23.1 dB.)
+    // r406 measured (LSP band-order fix + output-scale
+    // re-arbitration): PATHD53 corr 1.0000 / 54.4 dB / 17.6% exact /
+    // max|Δ| 27, OVERD53 0.9993 / 28.1 dB, INEQD53 0.9811 / 12.5 dB /
+    // 50.8% exact / max|Δ| 19. (r391: 0.60 / 1.9 dB, 0.48 / 0.26 dB,
+    // 0.83 / 4.5 dB.)
     for (tco, rou, fb, corr_floor, snr_floor) in [
-        ("PATHD53.TCO", "PATHD53.ROU", 20usize, 0.55f64, 1.5f64),
-        ("OVERD53.TCO", "OVERD53.ROU", 20, 0.45, 0.0),
-        ("INEQD53.TCO", "INEQD53.ROU", 20, 0.80, 4.0),
+        ("PATHD53.TCO", "PATHD53.ROU", 20usize, 0.999f64, 45.0f64),
+        ("OVERD53.TCO", "OVERD53.ROU", 20, 0.995, 22.0),
+        ("INEQD53.TCO", "INEQD53.ROU", 20, 0.95, 9.0),
     ] {
         let reference = read_pcm(&dir, rou);
         let ours = decode_stream_fixed(&dir, tco, fb, false, None);
@@ -425,26 +412,28 @@ fn fixed_decoder_tracks_pf_off_vectors() {
 #[test]
 fn fixed_decoder_tracks_pf_on_vectors() {
     let Some(dir) = corpus_dir() else { return };
-    // r391 measured: PATHD63P 0.7743 / +3.51 dB, OVERD63P 0.3989 /
-    // +0.75 dB, TAMED63P 0.1086 / −2.19 dB. (Float baseline before
-    // this round: 0.02 / −12.8 dB, 0.01 / −3.8 dB, −0.00 / −1.1 dB.)
-    // The OVER/TAME whole-file numbers stay loose pending the
-    // reference's clause-5 overflow protocol.
+    // r406 measured (LSP band-order fix + output-scale
+    // re-arbitration): PATHD63P 0.9123 / 7.60 dB, OVERD63P 0.9715 /
+    // 12.51 dB, TAMED63P 0.9643 / 11.53 dB. (r391: 0.77 / 3.5 dB,
+    // 0.40 / 0.75 dB, 0.11 / −2.2 dB.) The remaining gap to
+    // bit-exactness on these post-filter-ON / saturation-torture
+    // classes is the reference's clause-5 per-stage rounding and
+    // overflow protocol.
     for (tco, rou, crc, corr_floor, snr_floor) in [
         (
             "PATHD63P.TCO",
             "PATHD63P.ROU",
             Some("PATHD63P.CRC"),
-            0.75f64,
-            3.0f64,
+            0.88f64,
+            6.0f64,
         ),
-        ("OVERD63P.TCO", "OVERD63P.ROU", None, 0.35, 0.5),
+        ("OVERD63P.TCO", "OVERD63P.ROU", None, 0.94, 10.0),
         (
             "TAMED63P.TCO",
             "TAMED63P.ROU",
             Some("TAMED63P.CRC"),
-            0.05,
-            -3.0,
+            0.92,
+            9.0,
         ),
     ] {
         let reference = read_pcm(&dir, rou);
@@ -468,34 +457,107 @@ fn fixed_decoder_tracks_pf_on_vectors() {
     }
 }
 
-/// The encoder must emit legal clause-4 streams on the ITU encoder-test
-/// inputs (HP OFF configurations, per TSTG7231 Table 1): every frame
-/// unpacks, carries the right rate flag, and repacks identically.
-/// Field-level agreement against the fixed-point reference `.RCO` is
-/// reported (not floored — parameter decisions of a floating-point
-/// analysis pipeline diverge from the bit-exact reference).
+/// Full-corpus encoder conformance: every frame the encoder emits on
+/// every ITU encoder-test input must be a legal clause-4 stream
+/// (unpack + repack identity, right rate flag), and the coded
+/// parameters must agree with the bit-exact reference `.RCO` streams
+/// at pinned floors (r406 measured, floors a few points under):
+///
+/// | vector    | LSP word | ACL0/2 ±1 | MG exact |
+/// |-----------|----------|-----------|----------|
+/// | CODEC63   | 77.0%    | 80.4%     | 64.9%    |
+/// | PATHC63H  | 90.8%    | 53.5%     | 55.7%    |
+/// | OVERC63   | 85.0%    | 97.5%     | 67.5%    |
+/// | TAMEC63H  | 29.0%    | 49.0%     |  9.0%    |
+/// | PATHC53   | 90.4%    | 65.7%     | 53.7%    |
+/// | INEQC53   | 22.2%    | 97.6%     |  7.5%    |
+/// | OVERC53H  | 90.5%    | 100.0%    | 81.0%    |
+///
+/// The TAME/INEQ classes are designed around the reference's exact
+/// fixed-point rounding (taming is clause-5-only), so their parameter
+/// floors stay loose; the remaining distance to 100% everywhere is the
+/// float-analysis vs bit-exact-fixed-point gap.
 #[test]
-fn encoder_emits_self_valid_streams_on_itu_inputs() {
+fn encoder_parameter_agreement_against_reference_bitstreams() {
     let Some(dir) = corpus_dir() else { return };
-    for (tin, rco, rate, fb, frames) in [
+    for (tin, rco, rate, hp, lsp_floor, lag1_floor, mg_floor) in [
         (
             "CODEC63.TIN",
             "CODEC63.RCO",
             PackedRate::High,
-            24usize,
-            40usize,
+            false,
+            70.0f64,
+            72.0f64,
+            55.0f64,
         ),
-        ("PATHC53.TIN", "PATHC53.RCO", PackedRate::Low, 20, 40),
+        (
+            "PATHC63H.TIN",
+            "PATHC63H.RCO",
+            PackedRate::High,
+            true,
+            85.0,
+            45.0,
+            48.0,
+        ),
+        (
+            "OVERC63.TIN",
+            "OVERC63.RCO",
+            PackedRate::High,
+            false,
+            75.0,
+            90.0,
+            55.0,
+        ),
+        (
+            "TAMEC63H.TIN",
+            "TAMEC63H.RCO",
+            PackedRate::High,
+            true,
+            20.0,
+            40.0,
+            4.0,
+        ),
+        (
+            "PATHC53.TIN",
+            "PATHC53.RCO",
+            PackedRate::Low,
+            false,
+            85.0,
+            58.0,
+            45.0,
+        ),
+        (
+            "INEQC53.TIN",
+            "INEQC53.RCO",
+            PackedRate::Low,
+            false,
+            15.0,
+            90.0,
+            4.0,
+        ),
+        (
+            "OVERC53H.TIN",
+            "OVERC53H.RCO",
+            PackedRate::Low,
+            true,
+            80.0,
+            92.0,
+            70.0,
+        ),
     ] {
         let pcm = read_pcm(&dir, tin);
         let refbs = std::fs::read(dir.join(rco)).unwrap();
+        let fb = if rate == PackedRate::High { 24 } else { 20 };
+        let frames = (pcm.len() / FRAME_SAMPLES).min(refbs.len() / fb);
         let mut enc = SpecEncoder::new(rate);
-        enc.set_highpass(false); // TSTG7231 Table 1: these run HP OFF
-        let mut lag_close = 0usize;
+        enc.set_highpass(hp); // TSTG7231 Table 1 configuration
+        let (mut lsp_eq, mut lag_1, mut mg_eq) = (0usize, 0usize, 0usize);
+        let mut n_lag = 0usize;
+        let mut n_sub = 0usize;
         for i in 0..frames {
             let mut frame_pcm = [0i16; FRAME_SAMPLES];
             frame_pcm.copy_from_slice(&pcm[i * FRAME_SAMPLES..(i + 1) * FRAME_SAMPLES]);
-            let bytes = enc.encode_frame(&frame_pcm, &lookahead_of(&pcm, i));
+            let bytes = enc.encode_frame(&frame_pcm);
             assert_eq!(bytes.len(), fb, "{tin} frame {i}: frame size");
             let p = unpack_frame(&bytes).unwrap_or_else(|e| {
                 panic!("{tin} frame {i}: our encoder emitted an invalid frame: {e}")
@@ -507,10 +569,40 @@ fn encoder_emits_self_valid_streams_on_itu_inputs() {
                 "{tin} frame {i}: repack identity"
             );
             let pr = unpack_frame(&refbs[i * fb..(i + 1) * fb]).unwrap();
-            if (p.acl[0] as i64 - pr.acl[0] as i64).abs() <= 2 {
-                lag_close += 1;
+            if p.lsp_index == pr.lsp_index {
+                lsp_eq += 1;
+            }
+            for s in [0usize, 2] {
+                n_lag += 1;
+                if (p.acl[s] as i64 - pr.acl[s] as i64).abs() <= 1 {
+                    lag_1 += 1;
+                }
+            }
+            for s in 0..4 {
+                n_sub += 1;
+                if p.gain[s] % 24 == pr.gain[s] % 24 {
+                    mg_eq += 1;
+                }
             }
         }
-        eprintln!("{tin}: {lag_close}/{frames} frames with ACL0 within ±2 of the reference");
+        let lsp_pct = 100.0 * lsp_eq as f64 / frames as f64;
+        let lag1_pct = 100.0 * lag_1 as f64 / n_lag as f64;
+        let mg_pct = 100.0 * mg_eq as f64 / n_sub as f64;
+        eprintln!(
+            "{tin}: LSP word {lsp_pct:.1}%, ACL0/2 ±1 {lag1_pct:.1}%, MG exact {mg_pct:.1}% \
+             over {frames} frames"
+        );
+        assert!(
+            lsp_pct >= lsp_floor,
+            "{tin}: LSP agreement {lsp_pct:.1}% under floor {lsp_floor}%"
+        );
+        assert!(
+            lag1_pct >= lag1_floor,
+            "{tin}: ACL agreement {lag1_pct:.1}% under floor {lag1_floor}%"
+        );
+        assert!(
+            mg_pct >= mg_floor,
+            "{tin}: MG agreement {mg_pct:.1}% under floor {mg_floor}%"
+        );
     }
 }

@@ -66,19 +66,26 @@ pub(crate) fn lsp_cosines_to_freq(cos: &[f32; LPC_ORDER]) -> [f32; LPC_ORDER] {
     out
 }
 
-/// Split the 24-bit `LPC` parameter into the three band indices
-/// (band 0 in the least-significant byte).
+/// Split the 24-bit `LPC` parameter into the three band indices —
+/// **band 0 lives in the most-significant byte**. The clause-4 tables
+/// treat the 24-bit LPC field as one opaque number, so the intra-word
+/// band order is a derivation choice; it is pinned by the ITU
+/// conformance vectors (r406): with band 0 in the low byte the
+/// low/high split-VQ bands of every reference `.RCO` stream decode
+/// through the *wrong* codebooks (band 1, whose position is
+/// symmetric, was unaffected — the tell that exposed the swap).
 pub(crate) fn split_lsp_index(lsp_index: u32) -> [u8; 3] {
     [
-        (lsp_index & 0xFF) as u8,
-        ((lsp_index >> 8) & 0xFF) as u8,
         ((lsp_index >> 16) & 0xFF) as u8,
+        ((lsp_index >> 8) & 0xFF) as u8,
+        (lsp_index & 0xFF) as u8,
     ]
 }
 
-/// Combine three band indices into the 24-bit `LPC` parameter.
+/// Combine three band indices into the 24-bit `LPC` parameter
+/// (band 0 in the most-significant byte — see [`split_lsp_index`]).
 pub(crate) fn combine_lsp_index(bands: [u8; 3]) -> u32 {
-    bands[0] as u32 | (bands[1] as u32) << 8 | (bands[2] as u32) << 16
+    (bands[0] as u32) << 16 | (bands[1] as u32) << 8 | bands[2] as u32
 }
 
 /// §2.6 LSP decode (steps 1–2): rebuild the decoded LSP vector

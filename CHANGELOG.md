@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **Three vector-arbitrated interop corrections (r406) — decoder
+  fidelity and encoder agreement transformed**:
+  1. **LSP band order in the 24-bit LPC word**: band 0 (lines 0–2)
+     lives in the *most*-significant byte, not the least. The
+     clause-4 tables treat the field as one opaque number, so the
+     intra-word order is a derivation choice — and every reference
+     stream decodes the two edge bands through the wrong codebooks
+     under the old reading (band 1, positionally symmetric, was
+     unaffected: the tell that exposed the swap).
+  2. **§2.2 framer alignment**: the encoder codes the input stream
+     *delayed by one subframe* — the frame built from input block k
+     covers stream samples `[k·240 − 60, k·240 + 180)`. This is how
+     the spec's 7.5 ms lookahead / 37.5 ms total delay is realised;
+     at this offset (and no other) the encoder's LSP decisions lock
+     to the reference. The r405-interim lookahead-parameter API is
+     gone again: `SpecEncoder::encode_frame(pcm)` and the registry
+     encoder are back to plain 240-sample blocks with the delay
+     handled internally.
+  3. **Output scale**: the synthesis output is emitted *unshifted*
+     and the excitation rail is plain Word16 — r391's halved-output
+     stage and ±65534 rail were compensating the band-swapped LSP
+     distortion (whole-file least-squares scale vs the reference was
+     exactly 2.0). Float path: fixed-codebook levels are the doubled
+     table amplitude (`2·q/32768`); fixed path: `SYN_OUT_SHIFT` 1→0,
+     `EXC_RAIL` 65534→32767.
+
+  Measured decoder tracking (fixed-point pipeline, whole-file
+  corr / SNR): PATHD53 0.60 / +1.9 dB → **1.0000 / +54.4 dB**
+  (max |Δ| = 27 LSB), OVERD53 0.48 / +0.3 → **0.9993 / +28.1**,
+  INEQD53 0.83 / +4.5 → **0.9811 / +12.5** (50.8% of samples exact),
+  PATHD63P 0.77 / +3.5 → **0.9123 / +7.6**, OVERD63P 0.40 / +0.8 →
+  **0.9715 / +12.5**, TAMED63P 0.11 / −2.2 → **0.9643 / +11.5**.
+  Encoder parameter agreement against the reference `.RCO` streams
+  (whole files): LSP word 0% → 77–90.8% on the PATH/OVER/CODE
+  classes, ACL0/2 within ±1 up to 100%, fixed-gain index up to 81%.
+  All conformance floors re-pinned at the new levels; a new
+  full-corpus encoder-agreement test replaces the old self-validity
+  spot check. Round-trip PSNR (2 s voiced, release): ACELP 23.9 →
+  25.2 dB, MP-MLQ 26.4 → 31.2 dB.
+
 - **Weighted-domain analysis chain (§2.8–§2.13, §2.19) — the
   encoder's closed-loop searches now run where the spec puts them
   (r406)**: per-subframe §2.8 formant perceptual weighting

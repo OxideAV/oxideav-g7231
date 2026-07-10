@@ -248,47 +248,29 @@ impl Encoder for G7231Encoder {
 
 impl G7231Encoder {
     fn drain(&mut self, final_flush: bool) {
-        // §2.4 windowing needs 60 samples of lookahead past the frame
-        // end, so a frame is emitted only once its lookahead is
-        // buffered too. On the final flush the missing lookahead (and
-        // any partial final frame) is zero-padded — the encoder's
-        // §2.21 rest state.
-        while self.pcm_queue.len() >= FRAME_SIZE_SAMPLES + LOOKAHEAD_SAMPLES {
+        while self.pcm_queue.len() >= FRAME_SIZE_SAMPLES {
             let mut pcm = [0i16; FRAME_SIZE_SAMPLES];
             pcm.copy_from_slice(&self.pcm_queue[..FRAME_SIZE_SAMPLES]);
-            let mut la = [0i16; LOOKAHEAD_SAMPLES];
-            la.copy_from_slice(
-                &self.pcm_queue[FRAME_SIZE_SAMPLES..FRAME_SIZE_SAMPLES + LOOKAHEAD_SAMPLES],
-            );
             self.pcm_queue.drain(..FRAME_SIZE_SAMPLES);
-            self.emit_frame(&pcm, &la);
+            self.emit_frame(&pcm);
         }
-        if final_flush {
-            while !self.pcm_queue.is_empty() {
-                let take = self.pcm_queue.len().min(FRAME_SIZE_SAMPLES);
-                let mut pcm = [0i16; FRAME_SIZE_SAMPLES];
-                pcm[..take].copy_from_slice(&self.pcm_queue[..take]);
-                let mut la = [0i16; LOOKAHEAD_SAMPLES];
-                let rest = (self.pcm_queue.len() - take).min(LOOKAHEAD_SAMPLES);
-                la[..rest].copy_from_slice(&self.pcm_queue[take..take + rest]);
-                self.pcm_queue.drain(..take);
-                self.emit_frame(&pcm, &la);
-            }
+        if final_flush && !self.pcm_queue.is_empty() {
+            let mut pcm = [0i16; FRAME_SIZE_SAMPLES];
+            let n = self.pcm_queue.len();
+            pcm[..n].copy_from_slice(&self.pcm_queue);
+            self.pcm_queue.clear();
+            self.emit_frame(&pcm);
         }
     }
 
-    fn emit_frame(
-        &mut self,
-        pcm: &[i16; FRAME_SIZE_SAMPLES],
-        lookahead: &[i16; LOOKAHEAD_SAMPLES],
-    ) {
+    fn emit_frame(&mut self, pcm: &[i16; FRAME_SIZE_SAMPLES]) {
         let frame_idx = self.frame_index;
         self.frame_index += 1;
         let rate = match self.mode {
             EncoderMode::Acelp => PackedRate::Low,
             EncoderMode::MpMlq => PackedRate::High,
         };
-        let params = self.analysis.analyse_spec(pcm, lookahead, rate);
+        let params = self.analysis.analyse_spec(pcm, rate);
         // `analyse_spec` emits in-range indices by construction, so the
         // clause-4 packer cannot reject them.
         let packed = crate::linepack::pack_frame(&params)
@@ -329,6 +311,11 @@ struct AnalysisState {
     hp_x_prev: f32,
     /// One-sample y[n−1] memory of the §2.3 filter.
     hp_y_prev: f32,
+    /// §2.2 framer delay: the last 60 samples of the previous input
+    /// block. The encoder codes the input stream delayed by one
+    /// subframe — the ITU-vector-pinned alignment that realises the
+    /// spec's 7.5 ms lookahead (see [`AnalysisState::analyse_spec`]).
+    framer_delay: [i16; LOOKAHEAD_SAMPLES],
     /// §2.4 windowing look-back: the high-pass-filtered last 60 samples
     /// of the previous frame. The 180-sample analysis window centered on
     /// subframe 0 reaches 60 samples *before* the frame start.
@@ -395,6 +382,7 @@ impl AnalysisState {
             highpass: true,
             hp_x_prev: 0.0,
             hp_y_prev: 0.0,
+            framer_delay: [0; LOOKAHEAD_SAMPLES],
             lpc_tail: [0.0; SUBFRAME_SIZE],
             prev_unq_lsp: crate::tables::lsp_dc_cosines(),
             wght_x_mem: [0.0; LPC_ORDER],
@@ -453,11 +441,26 @@ impl AnalysisState {
     fn analyse_spec(
         &mut self,
         pcm: &[i16; FRAME_SIZE_SAMPLES],
-        lookahead: &[i16; LOOKAHEAD_SAMPLES],
         rate: PackedRate,
     ) -> SpecFrameParams {
+        // ---- §2.2 framer: the encoder codes the input *delayed by one
+        // subframe* — the frame built from input block `k` covers
+        // stream samples `[k·240 − 60, k·240 + 180)`, and the block's
+        // last 60 samples are the §2.4 lookahead (coded in the next
+        // frame). This alignment is pinned by the ITU conformance
+        // vectors (r406: LSP whole-word agreement against the `.RCO`
+        // references jumps from 0% to 77–91% at this offset and at no
+        // other) and realises the Recommendation's 7.5 ms encoder
+        // lookahead / 37.5 ms total delay.
+        let mut frame = [0i16; FRAME_SIZE_SAMPLES];
+        frame[..LOOKAHEAD_SAMPLES].copy_from_slice(&self.framer_delay);
+        frame[LOOKAHEAD_SAMPLES..].copy_from_slice(&pcm[..FRAME_SIZE_SAMPLES - LOOKAHEAD_SAMPLES]);
+        self.framer_delay
+            .copy_from_slice(&pcm[FRAME_SIZE_SAMPLES - LOOKAHEAD_SAMPLES..]);
+        let lookahead: [i16; LOOKAHEAD_SAMPLES] = self.framer_delay;
+
         let mut sig = [0.0f32; FRAME_SIZE_SAMPLES];
-        for (o, &s) in sig.iter_mut().zip(pcm.iter()) {
+        for (o, &s) in sig.iter_mut().zip(frame.iter()) {
             *o = s as f32 * (1.0 / 32_768.0);
         }
         // §2.2/§2.3: remove the DC component up front (switchable for
@@ -465,10 +468,11 @@ impl AnalysisState {
         if self.highpass {
             self.highpass_frame(&mut sig);
         }
-        // The 60 lookahead samples belong to the *next* frame; they are
-        // high-pass filtered with a scratch copy of the filter memory so
-        // they see the same §2.3 output they will when the next frame is
-        // analysed for real, without advancing the committed state.
+        // The 60 lookahead samples are re-coded as part of the *next*
+        // frame; they are high-pass filtered with a scratch copy of the
+        // filter memory so they see the same §2.3 output they will when
+        // that frame is analysed for real, without advancing the
+        // committed state.
         let mut la = [0.0f32; LOOKAHEAD_SAMPLES];
         for (o, &s) in la.iter_mut().zip(lookahead.iter()) {
             *o = s as f32 * (1.0 / 32_768.0);
@@ -2821,19 +2825,15 @@ impl SpecEncoder {
         self.analysis.highpass = enabled;
     }
 
-    /// Encode one 240-sample frame into its clause-4 octet sequence
-    /// (24 bytes at the high rate, 20 at the low rate).
+    /// Encode one 240-sample input block into its clause-4 octet
+    /// sequence (24 bytes at the high rate, 20 at the low rate).
     ///
-    /// `lookahead` is the first 60 samples of the *next* frame — the
-    /// §2.4 LPC window centered on the last subframe reaches 7.5 ms
-    /// past the frame end. Pass zeros at end of stream (§2.21 rest
-    /// state).
-    pub fn encode_frame(
-        &mut self,
-        pcm: &[i16; FRAME_SIZE_SAMPLES],
-        lookahead: &[i16; LOOKAHEAD_SAMPLES],
-    ) -> Vec<u8> {
-        let params = self.analysis.analyse_spec(pcm, lookahead, self.rate);
+    /// Note the §2.2 framer delay: the encoder codes the input stream
+    /// delayed by one subframe (the spec's 7.5 ms lookahead), so the
+    /// coded frame covers the last 60 samples of the *previous* block
+    /// plus the first 180 of this one.
+    pub fn encode_frame(&mut self, pcm: &[i16; FRAME_SIZE_SAMPLES]) -> Vec<u8> {
+        let params = self.analysis.analyse_spec(pcm, self.rate);
         crate::linepack::pack_frame(&params)
             .expect("analyse_spec emits in-range clause-4 parameters")
     }
@@ -3374,10 +3374,12 @@ mod tests {
         }
         assert_eq!(decoded.len(), input.len());
 
-        let n = input.len();
+        // Compensate the §2.2 framer delay (decoded[n] renders
+        // input[n − 60]).
+        let n = input.len() - LOOKAHEAD_SAMPLES;
         let mut mse = 0.0f64;
         for i in 0..n {
-            let e = decoded[i] as f64 - input[i] as f64;
+            let e = decoded[i + LOOKAHEAD_SAMPLES] as f64 - input[i] as f64;
             mse += e * e;
         }
         mse /= n as f64;
@@ -3461,11 +3463,12 @@ mod tests {
         }
         assert_eq!(decoded.len(), input.len());
 
-        // PSNR against PEAK = 32 767 (i16 full-scale).
-        let n = input.len();
+        // PSNR against PEAK = 32 767 (i16 full-scale), compensating the
+        // §2.2 framer delay (decoded[n] renders input[n − 60]).
+        let n = input.len() - LOOKAHEAD_SAMPLES;
         let mut mse = 0.0f64;
         for i in 0..n {
-            let e = decoded[i] as f64 - input[i] as f64;
+            let e = decoded[i + LOOKAHEAD_SAMPLES] as f64 - input[i] as f64;
             mse += e * e;
         }
         mse /= n as f64;
@@ -3912,9 +3915,8 @@ mod tests {
             let mut enc_on = SpecEncoder::new(rate);
             let mut enc_off = SpecEncoder::new(rate);
             enc_off.set_highpass(false);
-            let la = [0i16; LOOKAHEAD_SAMPLES];
-            let f_on = enc_on.encode_frame(&pcm, &la);
-            let f_off = enc_off.encode_frame(&pcm, &la);
+            let f_on = enc_on.encode_frame(&pcm);
+            let f_off = enc_off.encode_frame(&pcm);
             assert_eq!(f_on.len(), rate.frame_bytes());
             assert_eq!(f_off.len(), rate.frame_bytes());
             let p_on = crate::linepack::unpack_frame(&f_on).unwrap();
@@ -4556,19 +4558,11 @@ mod tests {
     /// maps, decode with a *fresh* decoder, and measure PSNR against
     /// the input. Floors are set conservatively below the measured
     /// debug-build figures.
-    /// Slice out frame `f` of `pcm` plus its 60-sample §2.4 lookahead
-    /// (zero-padded at end of stream).
-    fn frame_and_lookahead(
-        pcm: &[i16],
-        f: usize,
-    ) -> ([i16; FRAME_SIZE_SAMPLES], [i16; LOOKAHEAD_SAMPLES]) {
+    /// Slice out input block `f` of `pcm`.
+    fn input_block(pcm: &[i16], f: usize) -> [i16; FRAME_SIZE_SAMPLES] {
         let mut frame = [0i16; FRAME_SIZE_SAMPLES];
         frame.copy_from_slice(&pcm[f * FRAME_SIZE_SAMPLES..(f + 1) * FRAME_SIZE_SAMPLES]);
-        let mut la = [0i16; LOOKAHEAD_SAMPLES];
-        let start = (f + 1) * FRAME_SIZE_SAMPLES;
-        let n = pcm.len().saturating_sub(start).min(LOOKAHEAD_SAMPLES);
-        la[..n].copy_from_slice(&pcm[start..start + n]);
-        (frame, la)
+        frame
     }
 
     fn spec_roundtrip_psnr(rate: PackedRate) -> f64 {
@@ -4578,8 +4572,8 @@ mod tests {
         let mut dec = SynthesisState::new();
         let mut out = Vec::with_capacity(pcm.len());
         for f in 0..frames {
-            let (frame, la) = frame_and_lookahead(&pcm, f);
-            let params = analysis.analyse_spec(&frame, &la, rate);
+            let frame = input_block(&pcm, f);
+            let params = analysis.analyse_spec(&frame, rate);
             let bytes = crate::linepack::pack_frame(&params).unwrap();
             assert_eq!(
                 bytes.len(),
@@ -4590,10 +4584,15 @@ mod tests {
             assert_eq!(params, unpacked);
             out.extend_from_slice(&dec.decode_spec_params(&unpacked));
         }
-        // Skip the first two frames (cold-start transient) for PSNR.
+        // Skip the first two frames (cold-start transient) for PSNR,
+        // and compensate the §2.2 framer delay: decoded sample n
+        // renders input sample n − 60.
         let skip = 2 * FRAME_SIZE_SAMPLES;
         let (mut err, mut sig_e) = (0.0f64, 0.0f64);
-        for (a, b) in pcm[skip..].iter().zip(out[skip..].iter()) {
+        for (a, b) in pcm[skip..]
+            .iter()
+            .zip(out[skip + LOOKAHEAD_SAMPLES..].iter())
+        {
             let d = (*a as f64) - (*b as f64);
             err += d * d;
             sig_e += (*a as f64) * (*a as f64);
@@ -4605,8 +4604,11 @@ mod tests {
     fn spec_roundtrip_acelp_psnr_floor() {
         let psnr = spec_roundtrip_psnr(PackedRate::Low);
         println!("spec ACELP round-trip PSNR: {psnr:.2} dB");
+        // r406 measured 9.9 dB signal-SNR on this short synthetic
+        // probe (the 2 s integration test measures 13.3 dB); floor a
+        // dB under the measurement.
         assert!(
-            psnr > 10.0,
+            psnr > 8.5,
             "spec-layout ACELP round-trip PSNR {psnr:.2} dB below floor"
         );
     }
@@ -4615,8 +4617,9 @@ mod tests {
     fn spec_roundtrip_mpmlq_psnr_floor() {
         let psnr = spec_roundtrip_psnr(PackedRate::High);
         println!("spec MP-MLQ round-trip PSNR: {psnr:.2} dB");
+        // r406 measured 19.4 dB.
         assert!(
-            psnr > 12.0,
+            psnr > 15.0,
             "spec-layout MP-MLQ round-trip PSNR {psnr:.2} dB below floor"
         );
     }
@@ -4631,8 +4634,8 @@ mod tests {
         let mut analysis = AnalysisState::new();
         let mut dec = SynthesisState::new();
         for f in 0..frames {
-            let (frame, la) = frame_and_lookahead(&pcm, f);
-            let params = analysis.analyse_spec(&frame, &la, PackedRate::High);
+            let frame = input_block(&pcm, f);
+            let params = analysis.analyse_spec(&frame, PackedRate::High);
             let _ = dec.decode_spec_params(&params);
             for i in 0..LPC_ORDER {
                 assert!(
@@ -4654,8 +4657,8 @@ mod tests {
         let pcm = voiced_signal(3);
         let mut analysis = AnalysisState::new();
         for f in 0..3 {
-            let (frame, la) = frame_and_lookahead(&pcm, f);
-            let params = analysis.analyse_spec(&frame, &la, PackedRate::Low);
+            let frame = input_block(&pcm, f);
+            let params = analysis.analyse_spec(&frame, PackedRate::Low);
             let lag0 = decode_abs_lag(params.acl[0]);
             let lag1 = decode_delta_lag(params.acl[1], lag0);
             let lag2 = decode_abs_lag(params.acl[2]);

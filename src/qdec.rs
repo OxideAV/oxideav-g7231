@@ -13,20 +13,24 @@
 //! - Excitation reconstruction (gain word, five-tap adaptive codebook,
 //!   MP-MLQ / ACELP fixed vectors) in the vector-arbitrated
 //!   doubled-pulse domain (see the constants below), saturated at the
-//!   Word16-in-table-scale rail.
+//!   Word16 rail.
 //! - §3.7 synthesis on a wide saturating accumulator with Word16
-//!   recursion memory and the halved-output stage.
+//!   recursion memory, emitted directly (no output shift — r406).
 //!
 //! All Q-format choices are stated inline; where the clause 1–4 prose
 //! leaves a rounding or scaling choice open, the choice is arbitrated
 //! against the ITU conformance vectors (documented per constant /
-//! function). Key r391 arbitration results, from least-squares
-//! decomposition of the Ã(z)-deconvolved `PATHD53.ROU` excitation
-//! against the ACB/FCB bases (both coefficients ≈ 1.0 under this
-//! model) and pulse-exact matches on the isolated-pulse subframes:
+//! function). Key arbitration results (r391, re-arbitrated r406 after
+//! the LSP band-order fix), from least-squares decomposition of the
+//! Ã(z)-deconvolved `PATHD53.ROU` excitation against the ACB/FCB bases
+//! and whole-file scale fits:
 //!
 //! - fixed-codebook pulses land at **twice** the published gain-table
-//!   amplitude, and the synthesis output is **halved** on emission;
+//!   amplitude and the synthesis output is emitted **unshifted** —
+//!   r391's halved-output stage was compensating the band-swapped LSP
+//!   distortion; with correct LSPs the optimal output scale against
+//!   the reference is 0.9995 with no shift (PATHD53 whole-file SNR
+//!   6.0 → 54.4 dB, max |Δ| = 27);
 //! - the gain-vector rows act at an effective **/16384** in the
 //!   doubled domain (a /8192 reading makes the pitch loop diverge
 //!   where the reference stays bounded — PATHD53 frame 1 rails at
@@ -355,18 +359,19 @@ pub(crate) const ACB_TAP_SHIFT: i64 = 14;
 /// ±6340 = 2 × the published level 3170 at MGIndex 21, matched
 /// sample-exact).
 pub(crate) const FCB_GAIN_SHIFT: i32 = 1;
-/// The synthesis output is halved on emission — the counterpart of the
-/// doubled-pulse excitation domain (raises exact-sample agreement on
-/// PATHD53 from 9.6% to 14.3%).
-pub(crate) const SYN_OUT_SHIFT: i32 = 1;
-/// The stored excitation saturates at the Word16 rail *of the
-/// table-scale domain* (= ±65534 in the doubled domain): the OVER
-/// class rejects a plain Word16 rail in the doubled domain (waveform
-/// collapse) and also rejects an unbounded loop (the reference stays
-/// bounded).
+/// The synthesis output is emitted **unshifted** (r406
+/// re-arbitration): the r391 halved-output reading compensated the
+/// LSP band-order swap; with correct LSPs the whole-file least-squares
+/// scale against the reference decoder is 0.9995 at shift 0 (PATHD53
+/// SNR 6.0 → 54.4 dB).
+pub(crate) const SYN_OUT_SHIFT: i32 = 0;
+/// The stored excitation saturates at the plain Word16 rail (r406
+/// re-arbitration; the r391 ±65534 rail belonged to the retired
+/// halved-output domain — at the Word16 rail TAMED63P whole-file SNR
+/// rises 7.9 → 11.5 dB and no stream regresses).
 pub(crate) const EXC_SAT16: bool = true;
 /// See [`EXC_SAT16`].
-pub(crate) const EXC_RAIL: i32 = 65534;
+pub(crate) const EXC_RAIL: i32 = 32767;
 
 /// High-rate MP-MLQ fixed-codebook vector (§2.15/§2.17): combinatorial
 /// position decode, grid placement, MSB-first negative-sign convention
@@ -1391,8 +1396,9 @@ mod tests {
                 assert_eq!(q.mgindex, f.mgindex);
                 assert_eq!(q.train, f.train);
                 // Fixed path: doubled table amplitude; float path:
-                // table / 32768 in the normalised domain.
-                assert!((q.fcb_gain as f32 / 65_536.0 - f.fcb_gain).abs() < 1e-6);
+                // table / 16384 in the normalised domain (the same
+                // doubled level — 2·q/32768).
+                assert!((q.fcb_gain as f32 / 32_768.0 - f.fcb_gain).abs() < 1e-6);
                 for t in 0..ACB_TAPS {
                     assert!((q.taps[t] as f32 / 16_384.0 - f.taps[t]).abs() < 1e-6);
                 }
@@ -1465,29 +1471,30 @@ mod tests {
         let mut mem = [0i32; LPC_ORDER];
         let mut out = [0i16; SUBFRAME_SIZE];
         synthesis_subframe(&a, &x, &mut mem, &mut out, true);
-        // Emitted PCM is the internal value halved (the doubled-FCB /
-        // halved-output domain, vector-arbitrated).
-        assert_eq!(out[0], 8_000);
-        assert_eq!(out[1], 4_000);
-        assert_eq!(out[2], 2_000);
+        // Emitted PCM is the internal synthesis value (no output
+        // shift — r406 vector re-arbitration).
+        assert_eq!(out[0], 16_000);
+        assert_eq!(out[1], 8_000);
+        assert_eq!(out[2], 4_000);
         // The rounded recursion rounds half up, so the internal decay
         // parks in the classic ±1 limit cycle (1 · 0.5 rounds back to
-        // 1); the halved output reads 0.
-        assert_eq!(out[20], 0);
+        // 1).
+        assert_eq!(out[20], 1);
         assert_eq!(mem[0], 1, "internal one-pole limit cycle");
         let x2 = [0i32; SUBFRAME_SIZE];
         let mut out2 = [0i16; SUBFRAME_SIZE];
         synthesis_subframe(&a, &x2, &mut mem, &mut out2, true);
-        assert_eq!(out2, [0i16; SUBFRAME_SIZE]);
+        assert_eq!(out2, [1i16; SUBFRAME_SIZE]);
         assert_eq!(mem[0], 1);
     }
 
     #[test]
     fn synthesis_output_saturates_at_word16() {
         // An unstable ã_1 = 1.25 on a large impulse: the wide-memory
-        // variant grows until the halved output pins at 32767; the
+        // variant grows until the emitted output pins at 32767; the
         // Word16-memory variant parks its recursion at the rail, so the
-        // halved output settles just above 32767/2 · 1.25 ≈ 20479.
+        // output settles at the saturated 32767 · 1.25 accumulator,
+        // clamped back to the Word16 rail on emission.
         for clamp_mem in [true, false] {
             let mut a = [0i16; LPC_ORDER];
             a[0] = 10_240;
@@ -1498,7 +1505,7 @@ mod tests {
             synthesis_subframe(&a, &x, &mut mem, &mut out, clamp_mem);
             if clamp_mem {
                 assert_eq!(mem[0], i16::MAX as i32, "memory parks at the rail");
-                assert_eq!(out[SUBFRAME_SIZE - 1], 20_479);
+                assert_eq!(out[SUBFRAME_SIZE - 1], i16::MAX);
             } else {
                 assert!(out[..12].contains(&i16::MAX));
                 assert!(mem[0] > i16::MAX as i32);

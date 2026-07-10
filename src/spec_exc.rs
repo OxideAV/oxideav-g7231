@@ -101,13 +101,13 @@ pub(crate) fn acb_taps(rate: PackedRate, lag_base: i32, pgindex: usize) -> [f32;
 /// Fixed-codebook gain level `G̃_j` in the normalised signal domain.
 pub(crate) fn fcb_gain_value(mgindex: usize) -> f32 {
     let idx = mgindex.min(FIXED_CODEBOOK_GAIN_Q15.len() - 1);
-    FIXED_CODEBOOK_GAIN_Q15[idx] as f32 / 32_768.0
+    FIXED_CODEBOOK_GAIN_Q15[idx] as f32 / 16_384.0
 }
 
 /// Nearest fixed-codebook gain index to `g` (normalised domain),
 /// minimising `|G − G̃_j|` (§2.16 last step / §2.15).
 pub(crate) fn nearest_fcb_gain(g: f32) -> usize {
-    let target = g.abs() * 32_768.0;
+    let target = g.abs() * 16_384.0;
     let mut best = 0usize;
     let mut best_d = f32::INFINITY;
     for (j, &q) in FIXED_CODEBOOK_GAIN_Q15.iter().enumerate() {
@@ -401,7 +401,9 @@ mod tests {
     fn fcb_gain_table_maps_to_normalised_domain_and_quantises_back() {
         for (j, &q) in FIXED_CODEBOOK_GAIN_Q15.iter().enumerate() {
             let g = fcb_gain_value(j);
-            assert!((g - q as f32 / 32_768.0).abs() < 1e-9);
+            // Doubled table amplitude (2·q/32768) — the r406
+            // vector-arbitrated excitation scale.
+            assert!((g - q as f32 / 16_384.0).abs() < 1e-9);
             assert_eq!(nearest_fcb_gain(g), j, "level {j} must be its own nearest");
         }
         // The quantiser uses |G| — a negative gain maps like its magnitude.

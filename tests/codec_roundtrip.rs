@@ -267,13 +267,17 @@ fn erasure_in_middle_of_stream_is_concealed() {
         "concealed frame is pure silence ({concealed_energy})"
     );
 
-    // And the overall decoded signal must remain coherent with the input.
+    // And the overall decoded signal must remain coherent with the
+    // input. The encoder codes the input delayed by one subframe (the
+    // spec's 7.5 ms framer lookahead), so decoded[n] renders
+    // input[n - 60].
+    let n = decoded.len() - 60;
     let mut mse = 0.0f64;
-    for i in 0..decoded.len() {
-        let e = decoded[i] as f64 - input[i] as f64;
+    for i in 0..n {
+        let e = decoded[i + 60] as f64 - input[i] as f64;
         mse += e * e;
     }
-    mse /= decoded.len() as f64;
+    mse /= n as f64;
     let psnr = 10.0 * (32_767.0f64.powi(2) / mse.max(1e-10)).log10();
     assert!(
         psnr > 10.0,
@@ -385,10 +389,13 @@ fn roundtrip_two_seconds_voiced_psnr_both_rates() {
         assert!(decoded.len() >= n, "{label}: got {} samples", decoded.len());
         let decoded = &decoded[..n];
 
-        // PSNR (vs i16 full-scale peak).
+        // PSNR (vs i16 full-scale peak). The encoder codes the input
+        // delayed by one subframe (the spec's 7.5 ms framer
+        // lookahead), so decoded[n] renders input[n - 60].
+        let n = n - 60;
         let mut mse = 0.0f64;
         for i in 0..n {
-            let e = decoded[i] as f64 - input[i] as f64;
+            let e = decoded[i + 60] as f64 - input[i] as f64;
             mse += e * e;
         }
         mse /= n as f64;
