@@ -69,6 +69,9 @@
 )]
 
 pub mod basicop;
+// Internal wire plumbing — kept `pub` for the fuzz harnesses, hidden from
+// rustdoc/semver (fleet rule 2026-09-01).
+#[doc(hidden)]
 pub mod bitreader;
 pub mod encoder;
 pub mod header;
@@ -77,6 +80,9 @@ pub mod qdec;
 pub mod spec_exc;
 pub mod spec_lsp;
 pub mod spec_tables;
+// Internal layout-constant storage (the advertised table surface is
+// `spec_tables`) — hidden from rustdoc/semver (fleet rule 2026-09-01).
+#[doc(hidden)]
 pub mod tables;
 
 use oxideav_core::{
