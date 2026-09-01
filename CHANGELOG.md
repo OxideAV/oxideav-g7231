@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- **Encoder wire-exactness campaign (r455) — §2.9 open-loop pitch
+  restricted to positive correlations**: eq. 12 squares the
+  cross-correlation, so an anti-phase lag could win the open-loop
+  search; the ITU `.RCO` closed-loop lag (which §2.14 confines to
+  `L_OL ± 1`) fell inside our window on only 57% of PATHC63H / 50% of
+  TAMEC63H subframe pairs under that reading and does on 91% / 99%
+  (100% on CODEC63 / OVERC63) with the positive-numerator restriction
+  §2.11 spells out for the same signal. Free-running ACL0/ACL2 ±1
+  agreement: PATHC63H 53.5 → 85.8%, TAMEC63H 49.0 → 99.0%, PATHC53
+  65.7 → 82.4%, CODEC63 80.4 → 87.1%. A hidden teacher-forcing hook
+  (`SpecEncoder::encode_frame_params(pcm, Some(&reference))` +
+  `SpecEncoder::diag()`) commits the reference's parameters into the
+  shadow state so every stage's per-decision agreement can be measured
+  from the reference's own state, free of drift.
+
 - **Fuzz hardening (r406)**: adversarial LSP indices can drive the MA
   predictor + codebook sum negative before the §2.6 ordering repair
   reaches line 0; the fixed-point cosine lookup now clamps to its

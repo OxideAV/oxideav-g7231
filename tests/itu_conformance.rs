@@ -533,7 +533,7 @@ fn encoder_parameter_agreement_against_reference_bitstreams() {
             false,
             15.0,
             90.0,
-            4.0,
+            2.0,
         ),
         (
             "OVERC53H.TIN",

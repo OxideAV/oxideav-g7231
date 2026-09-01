@@ -270,7 +270,7 @@ impl G7231Encoder {
             EncoderMode::Acelp => PackedRate::Low,
             EncoderMode::MpMlq => PackedRate::High,
         };
-        let params = self.analysis.analyse_spec(pcm, rate);
+        let params = self.analysis.analyse_spec(pcm, rate, None);
         // `analyse_spec` emits in-range indices by construction, so the
         // clause-4 packer cannot reject them.
         let packed = crate::linepack::pack_frame(&params)
@@ -339,6 +339,37 @@ struct AnalysisState {
     /// passing the reconstructed excitation through the filter, read by
     /// the zero-input-response computation of the next subframe.
     comb_mem: CombinedMem,
+    /// Conformance diagnostics: the last frame's unquantised LSP vector
+    /// (table units), the predictor state it was quantised against,
+    /// and the two §2.9 open-loop lags.
+    diag: EncoderDiag,
+}
+
+/// Per-frame analysis intermediates exposed for conformance
+/// diagnostics (see [`SpecEncoder::diag`]).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct EncoderDiag {
+    /// Unquantised LSP vector of the transmitted set, Q15 table units.
+    pub lsp_unq_freq: [f32; LPC_ORDER],
+    /// Previously decoded LSP vector the predictor ran on.
+    pub lsp_prev_freq: [f32; LPC_ORDER],
+    /// §2.9 open-loop lags for subframe pairs (0,1) and (2,3).
+    pub ol_lags: [i32; 2],
+    /// Weighted speech `[history (145) | frame (240)]` the §2.9 / §2.11
+    /// searches ran on.
+    pub wbuf: [f32; WSPEECH_HIST + FRAME_SIZE_SAMPLES],
+}
+
+impl Default for EncoderDiag {
+    fn default() -> Self {
+        Self {
+            lsp_unq_freq: [0.0; LPC_ORDER],
+            lsp_prev_freq: [0.0; LPC_ORDER],
+            ol_lags: [0; 2],
+            wbuf: [0.0; WSPEECH_HIST + FRAME_SIZE_SAMPLES],
+        }
+    }
 }
 
 /// Number of weighted-speech history samples the encoder keeps: the
@@ -389,6 +420,7 @@ impl AnalysisState {
             wght_f_mem: [0.0; LPC_ORDER],
             wspeech_hist: [0.0; WSPEECH_HIST],
             comb_mem: CombinedMem::new(),
+            diag: EncoderDiag::default(),
         }
     }
 
@@ -442,6 +474,7 @@ impl AnalysisState {
         &mut self,
         pcm: &[i16; FRAME_SIZE_SAMPLES],
         rate: PackedRate,
+        force: Option<&SpecFrameParams>,
     ) -> SpecFrameParams {
         // ---- §2.2 framer: the encoder codes the input *delayed by one
         // subframe* — the frame built from input block `k` covers
@@ -519,8 +552,19 @@ impl AnalysisState {
         let lsp_cur_cos = lpc_to_lsp(&a3_exp).unwrap_or(self.prev_unq_lsp);
         self.prev_unq_lsp = lsp_cur_cos;
         let lsp_cur_freq = spec_lsp::lsp_cosines_to_freq(&lsp_cur_cos);
-        let (lsp_index, decoded_freq) =
+        self.diag.lsp_unq_freq = lsp_cur_freq;
+        self.diag.lsp_prev_freq = self.decoder.prev_lsp_freq;
+        let (lsp_index, mut decoded_freq) =
             spec_lsp::quantise_lsp_freq(&lsp_cur_freq, &self.decoder.prev_lsp_freq);
+        // Teacher forcing (conformance diagnostics): the state the
+        // remaining stages and the shadow decoder see is rebuilt from
+        // the *forced* parameter set, while the returned decisions stay
+        // our own.
+        let mut committed = SpecFrameParams::zeroed(rate);
+        if let Some(f) = force {
+            committed.lsp_index = f.lsp_index;
+            decoded_freq = spec_lsp::decode_lsp_freq(f.lsp_index, &self.decoder.prev_lsp_freq);
+        }
         let cos_raw = spec_lsp::lsp_freq_to_cosines(&decoded_freq);
         let (mut lsp_q, converged) = enforce_lsp_stability(&cos_raw, LSP_STABILITY_DELTA_MIN_HZ);
         if !converged {
@@ -553,12 +597,18 @@ impl AnalysisState {
         // ---- §2.9: two open-loop pitch estimates per frame on the
         // weighted speech — one for subframes 0/1, one for 2/3.
         let ol_lags = [open_loop_pitch(&wbuf, 0), open_loop_pitch(&wbuf, 1)];
+        self.diag.ol_lags = ol_lags;
+        self.diag.wbuf = wbuf;
 
         let exc_snapshot = self.decoder.exc_history;
         let prev_lsp_snapshot = self.decoder.prev_lsp;
 
         let mut params = SpecFrameParams::zeroed(rate);
         params.lsp_index = lsp_index;
+        if force.is_none() {
+            committed.lsp_index = lsp_index;
+        }
+        // Committed (state-defining) lags — ours, or the forced set's.
         let mut lags = [0i32; SUBFRAMES_PER_FRAME];
         for s in 0..SUBFRAMES_PER_FRAME {
             let lsp_interp = interpolate_lsp(s, &prev_lsp_snapshot, &lsp_q);
@@ -662,12 +712,22 @@ impl AnalysisState {
                     }
                 }
             }
-            lags[s] = best_lag;
             params.acl[s] = if s % 2 == 0 {
                 encode_abs_lag(best_lag)
             } else {
                 encode_delta_lag(best_lag, lags[s - 1])
             };
+            if let Some(f) = force {
+                committed.acl[s] = f.acl[s];
+                lags[s] = if s % 2 == 0 {
+                    decode_abs_lag(f.acl[s])
+                } else {
+                    decode_delta_lag(f.acl[s], lags[s - 1])
+                };
+            } else {
+                committed.acl[s] = params.acl[s];
+                lags[s] = best_lag;
+            }
             let lag_base = if s < 2 { lags[0] } else { lags[2] };
 
             // Residual target for the fixed-codebook stage (eq. 20).
@@ -699,16 +759,28 @@ impl AnalysisState {
                 }
             };
 
-            // ---- Advance the shadow state exactly as the decoder will. ----
-            let ginfo = spec_exc::decode_gain_word(rate, lag_base, params.gain[s]);
-            let u = spec_exc::acb_contribution(&self.decoder.exc_history, best_lag, &ginfo.taps);
+            // ---- Advance the shadow state exactly as the decoder will
+            // (from the committed — ours or forced — parameters). ----
+            if let Some(f) = force {
+                committed.gain[s] = f.gain[s];
+                committed.pos[s] = f.pos[s];
+                committed.psig[s] = f.psig[s];
+                committed.grid[s] = f.grid[s];
+            } else {
+                committed.gain[s] = params.gain[s];
+                committed.pos[s] = params.pos[s];
+                committed.psig[s] = params.psig[s];
+                committed.grid[s] = params.grid[s];
+            }
+            let ginfo = spec_exc::decode_gain_word(rate, lag_base, committed.gain[s]);
+            let u = spec_exc::acb_contribution(&self.decoder.exc_history, lags[s], &ginfo.taps);
             let v = match rate {
                 PackedRate::High => {
                     let n_pulses = if s % 2 == 0 { 6 } else { 5 };
                     spec_exc::mpmlq_fixed_vector(
-                        params.pos[s],
-                        params.psig[s],
-                        params.grid[s],
+                        committed.pos[s],
+                        committed.psig[s],
+                        committed.grid[s],
                         n_pulses,
                         ginfo.fcb_gain,
                         ginfo.train,
@@ -717,12 +789,12 @@ impl AnalysisState {
                 }
                 PackedRate::Low => {
                     let mut v = spec_exc::acelp_fixed_vector(
-                        params.pos[s],
-                        params.psig[s],
-                        params.grid[s],
+                        committed.pos[s],
+                        committed.psig[s],
+                        committed.grid[s],
                         ginfo.fcb_gain,
                     );
-                    spec_exc::acelp_pitch_enhance(&mut v, best_lag, ginfo.pgindex);
+                    spec_exc::acelp_pitch_enhance(&mut v, lags[s], ginfo.pgindex);
                     v
                 }
             };
@@ -744,7 +816,7 @@ impl AnalysisState {
         // the shadow decoder state is bit-for-bit what a real decoder
         // holds after this frame.
         self.decoder.exc_history = exc_snapshot;
-        let _ = self.decoder.decode_spec_params(&params);
+        let _ = self.decoder.decode_spec_params(&committed);
         params
     }
 }
@@ -1087,6 +1159,17 @@ fn weight_subframe(
 /// preference rule — a candidate at least 18 lags above the incumbent
 /// must beat it by 1.25 dB, closer candidates only have to exceed it.
 ///
+/// Only lags whose correlation numerator is **positive** compete
+/// (r455, ITU-vector arbitrated): the printed eq. 12 squares the
+/// cross-correlation, but a negative-correlation lag is anti-phase
+/// with the signal and is not a pitch candidate — with the sign
+/// ignored, the reference `.RCO` closed-loop lag (which §2.14
+/// restricts to `L_OL ± 1`) lands inside our window on only 57% of
+/// PATHC63H / 50% of TAMEC63H subframe pairs; restricted to positive
+/// correlations it does on 91% / 99% (100% on CODEC63 / OVERC63).
+/// §2.11 states the same restriction for the harmonic-noise-shaping
+/// search on the same signal.
+///
 /// `wbuf` is `[history (145) | weighted frame (240)]`; `half` selects
 /// samples `0..120` or `120..240` of the frame part.
 fn open_loop_pitch(wbuf: &[f32], half: usize) -> i32 {
@@ -1104,7 +1187,7 @@ fn open_loop_pitch(wbuf: &[f32], half: usize) -> i32 {
             num += wbuf[o + n] as f64 * fj;
             den += fj * fj;
         }
-        if den <= 0.0 {
+        if num <= 0.0 || den <= 0.0 {
             continue;
         }
         let col = num * num / den;
@@ -2833,9 +2916,35 @@ impl SpecEncoder {
     /// coded frame covers the last 60 samples of the *previous* block
     /// plus the first 180 of this one.
     pub fn encode_frame(&mut self, pcm: &[i16; FRAME_SIZE_SAMPLES]) -> Vec<u8> {
-        let params = self.analysis.analyse_spec(pcm, self.rate);
+        let params = self.analysis.analyse_spec(pcm, self.rate, None);
         crate::linepack::pack_frame(&params)
             .expect("analyse_spec emits in-range clause-4 parameters")
+    }
+
+    /// Conformance-diagnostic variant of [`SpecEncoder::encode_frame`]
+    /// returning the clause-4 parameter set instead of octets.
+    ///
+    /// When `force` is given, every state-carrying decision (the LSP
+    /// word, each subframe's lag, gain word and fixed-codebook fields)
+    /// is *committed* from the forced set — the shadow decoder, the
+    /// §2.19 filter memories and the next subframes' search context are
+    /// rebuilt from it — while the returned parameters are still the
+    /// encoder's own choices. Teacher-forcing every frame with the
+    /// reference `.RCO` parameters measures each stage's per-decision
+    /// agreement from the reference's own state, free of drift.
+    /// Analysis intermediates of the last encoded frame.
+    #[doc(hidden)]
+    pub fn diag(&self) -> EncoderDiag {
+        self.analysis.diag
+    }
+
+    #[doc(hidden)]
+    pub fn encode_frame_params(
+        &mut self,
+        pcm: &[i16; FRAME_SIZE_SAMPLES],
+        force: Option<&SpecFrameParams>,
+    ) -> SpecFrameParams {
+        self.analysis.analyse_spec(pcm, self.rate, force)
     }
 }
 
@@ -4573,7 +4682,7 @@ mod tests {
         let mut out = Vec::with_capacity(pcm.len());
         for f in 0..frames {
             let frame = input_block(&pcm, f);
-            let params = analysis.analyse_spec(&frame, rate);
+            let params = analysis.analyse_spec(&frame, rate, None);
             let bytes = crate::linepack::pack_frame(&params).unwrap();
             assert_eq!(
                 bytes.len(),
@@ -4635,7 +4744,7 @@ mod tests {
         let mut dec = SynthesisState::new();
         for f in 0..frames {
             let frame = input_block(&pcm, f);
-            let params = analysis.analyse_spec(&frame, PackedRate::High);
+            let params = analysis.analyse_spec(&frame, PackedRate::High, None);
             let _ = dec.decode_spec_params(&params);
             for i in 0..LPC_ORDER {
                 assert!(
@@ -4658,7 +4767,7 @@ mod tests {
         let mut analysis = AnalysisState::new();
         for f in 0..3 {
             let frame = input_block(&pcm, f);
-            let params = analysis.analyse_spec(&frame, PackedRate::Low);
+            let params = analysis.analyse_spec(&frame, PackedRate::Low, None);
             let lag0 = decode_abs_lag(params.acl[0]);
             let lag1 = decode_delta_lag(params.acl[1], lag0);
             let lag2 = decode_abs_lag(params.acl[2]);
