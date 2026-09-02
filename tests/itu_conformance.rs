@@ -465,13 +465,13 @@ fn fixed_decoder_tracks_pf_on_vectors() {
 ///
 /// | vector    | LSP word | ACL0/2 ±1 | MG exact |
 /// |-----------|----------|-----------|----------|
-/// | CODEC63   | 77.0%    | 80.4%     | 64.9%    |
-/// | PATHC63H  | 90.8%    | 53.5%     | 55.7%    |
-/// | OVERC63   | 85.0%    | 97.5%     | 67.5%    |
-/// | TAMEC63H  | 29.0%    | 49.0%     |  9.0%    |
-/// | PATHC53   | 90.4%    | 65.7%     | 53.7%    |
-/// | INEQC53   | 22.2%    | 97.6%     |  7.5%    |
-/// | OVERC53H  | 90.5%    | 100.0%    | 81.0%    |
+/// | CODEC63  | 89.5%    | 95.2%        | 91.0%    | 55.6%              |
+/// | PATHC63H | 97.0%    | 73.3%        | 86.0%    | 57.2%              |
+/// | OVERC63  | 90.0%    | 87.5%        | 76.2%    | 52.5%              |
+/// | TAMEC63H | 53.0%    | 98.5%        | 56.8%    | 16.8%              |
+/// | PATHC53  | 93.9%    | 72.4%        | 78.4%    | 69.6%              |
+/// | INEQC53  | 46.0%    | 94.4%        | 25.8%    | 60.3%              |
+/// | OVERC53H | 95.2%    | 95.2%        | 81.0%    | 60.7%              |
 ///
 /// The TAME/INEQ classes are designed around the reference's exact
 /// fixed-point rounding (taming is clause-5-only), so their parameter
@@ -603,6 +603,170 @@ fn encoder_parameter_agreement_against_reference_bitstreams() {
         assert!(
             mg_pct >= mg_floor,
             "{tin}: MG agreement {mg_pct:.1}% under floor {mg_floor}%"
+        );
+    }
+}
+
+/// Per-stage encoder agreement with every prior decision
+/// **teacher-forced** from the reference bitstream: after each frame
+/// (and, inside a frame, after each subframe's adaptive-codebook
+/// decision) the shadow state is committed from the `.RCO` parameters,
+/// so each stage is scored on its own decision from the reference's
+/// exact context, free of drift. Floors are r455 measured values minus
+/// a small margin:
+///
+/// | vector   | LSP word | ACL0/2 exact | PG exact | FCB subframe exact |
+/// |----------|----------|--------------|----------|--------------------|
+/// | CODEC63  | 89.5%    | 95.2%        | 91.0%    | 50.8%              |
+/// | PATHC63H | 95.7%    | 73.3%        | 86.0%    | 46.3%              |
+/// | OVERC63  | 90.0%    | 87.5%        | 76.2%    | 46.2%              |
+/// | TAMEC63H | 53.0%    | 98.5%        | 56.8%    |  9.8%              |
+/// | PATHC53  | 93.9%    | 72.4%        | 78.4%    | 51.8%              |
+/// | INEQC53  | 46.0%    | 94.4%        | 25.8%    | 15.5%              |
+/// | OVERC53H | 95.2%    | 95.2%        | 81.0%    | 48.8%              |
+///
+/// "FCB subframe exact" = grid, positions, signs and fixed-codebook
+/// gain index all equal to the reference's for that subframe.
+#[test]
+fn encoder_teacher_forced_stage_agreement() {
+    let Some(dir) = corpus_dir() else { return };
+    for (tin, rco, rate, hp, lsp_floor, acl_floor, pg_floor, fcb_floor) in [
+        (
+            "CODEC63.TIN",
+            "CODEC63.RCO",
+            PackedRate::High,
+            false,
+            85.0f64,
+            90.0f64,
+            86.0f64,
+            50.0f64,
+        ),
+        (
+            "PATHC63H.TIN",
+            "PATHC63H.RCO",
+            PackedRate::High,
+            true,
+            94.0,
+            68.0,
+            81.0,
+            52.0,
+        ),
+        (
+            "OVERC63.TIN",
+            "OVERC63.RCO",
+            PackedRate::High,
+            false,
+            80.0,
+            80.0,
+            65.0,
+            40.0,
+        ),
+        (
+            "TAMEC63H.TIN",
+            "TAMEC63H.RCO",
+            PackedRate::High,
+            true,
+            45.0,
+            94.0,
+            45.0,
+            10.0,
+        ),
+        (
+            "PATHC53.TIN",
+            "PATHC53.RCO",
+            PackedRate::Low,
+            false,
+            90.0,
+            67.0,
+            73.0,
+            64.0,
+        ),
+        (
+            "INEQC53.TIN",
+            "INEQC53.RCO",
+            PackedRate::Low,
+            false,
+            38.0,
+            88.0,
+            18.0,
+            50.0,
+        ),
+        (
+            "OVERC53H.TIN",
+            "OVERC53H.RCO",
+            PackedRate::Low,
+            true,
+            85.0,
+            85.0,
+            70.0,
+            50.0,
+        ),
+    ] {
+        let pcm = read_pcm(&dir, tin);
+        let refbs = std::fs::read(dir.join(rco)).unwrap();
+        let fb = if rate == PackedRate::High { 24 } else { 20 };
+        let frames = (pcm.len() / FRAME_SAMPLES).min(refbs.len() / fb);
+        let mut enc = SpecEncoder::new(rate);
+        enc.set_highpass(hp);
+        let (mut lsp_eq, mut acl_eq, mut pg_eq, mut fcb_eq) = (0usize, 0usize, 0usize, 0usize);
+        for i in 0..frames {
+            let mut frame_pcm = [0i16; FRAME_SAMPLES];
+            frame_pcm.copy_from_slice(&pcm[i * FRAME_SAMPLES..(i + 1) * FRAME_SAMPLES]);
+            let pr = unpack_frame(&refbs[i * fb..(i + 1) * fb]).unwrap();
+            let p = enc.encode_frame_params(&frame_pcm, Some(&pr));
+            if p.lsp_index == pr.lsp_index {
+                lsp_eq += 1;
+            }
+            let lag0 = pr.acl[0] as i32 + 18;
+            let lag2 = pr.acl[2] as i32 + 18;
+            for s in 0..4 {
+                if s % 2 == 0 && p.acl[s] == pr.acl[s] {
+                    acl_eq += 1;
+                }
+                let lag_base = if s < 2 { lag0 } else { lag2 };
+                let short = rate == PackedRate::High && lag_base < 58;
+                let (go, gr) = if short {
+                    (p.gain[s] & 0x7FF, pr.gain[s] & 0x7FF)
+                } else {
+                    (p.gain[s], pr.gain[s])
+                };
+                if go / 24 == gr / 24 {
+                    pg_eq += 1;
+                }
+                let train_eq = !short || (p.gain[s] & 0x800) == (pr.gain[s] & 0x800);
+                if go % 24 == gr % 24
+                    && p.grid[s] == pr.grid[s]
+                    && p.pos[s] == pr.pos[s]
+                    && p.psig[s] == pr.psig[s]
+                    && train_eq
+                {
+                    fcb_eq += 1;
+                }
+            }
+        }
+        let lsp_pct = 100.0 * lsp_eq as f64 / frames as f64;
+        let acl_pct = 100.0 * acl_eq as f64 / (2 * frames) as f64;
+        let pg_pct = 100.0 * pg_eq as f64 / (4 * frames) as f64;
+        let fcb_pct = 100.0 * fcb_eq as f64 / (4 * frames) as f64;
+        eprintln!(
+            "{tin} (teacher-forced): LSP word {lsp_pct:.1}%, ACL0/2 exact {acl_pct:.1}%, \
+             PG exact {pg_pct:.1}%, FCB subframe exact {fcb_pct:.1}% over {frames} frames"
+        );
+        assert!(
+            lsp_pct >= lsp_floor,
+            "{tin}: LSP {lsp_pct:.1}% under floor {lsp_floor}%"
+        );
+        assert!(
+            acl_pct >= acl_floor,
+            "{tin}: ACL {acl_pct:.1}% under floor {acl_floor}%"
+        );
+        assert!(
+            pg_pct >= pg_floor,
+            "{tin}: PG {pg_pct:.1}% under floor {pg_floor}%"
+        );
+        assert!(
+            fcb_pct >= fcb_floor,
+            "{tin}: FCB {fcb_pct:.1}% under floor {fcb_floor}%"
         );
     }
 }

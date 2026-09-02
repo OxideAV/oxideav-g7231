@@ -46,6 +46,8 @@ use crate::spec_tables::{
 };
 use crate::tables::LPC_ORDER;
 
+/// §2.3 high-pass pole `127/128` in Q15 (eq. 1).
+pub(crate) const HP_POLE_Q15: i16 = 32_512;
 /// §2.6 normal-decode LSP predictor `b = 12/32` in Q15.
 const LSP_PREDICTOR_B_Q15: i16 = 12_288;
 /// §3.10.1 erasure predictor `b_e = 23/32` in Q15.
@@ -61,7 +63,8 @@ pub(crate) const LSP_DELTA_MIN_ERASURE_Q15: i16 = 512;
 /// `p̃_n = b·(p̃_{n−1} − p_DC) + p_DC + ẽ_n` from the 24-bit index and
 /// the previous decoded vector, everything in Q15 normalised-frequency
 /// table units with saturating arithmetic.
-pub(crate) fn lsp_decode(lsp_index: u32, prev: &[i16; LPC_ORDER]) -> [i16; LPC_ORDER] {
+#[doc(hidden)]
+pub fn lsp_decode(lsp_index: u32, prev: &[i16; LPC_ORDER]) -> [i16; LPC_ORDER] {
     lsp_predict_add(lsp_index, prev, LSP_PREDICTOR_B_Q15)
 }
 
@@ -98,7 +101,8 @@ fn lsp_predict_add(lsp_index: u32, prev: &[i16; LPC_ORDER], b_q15: i16) -> [i16;
 /// than `Δ_min` around its midpoint by `±Δ_min/2`; up to 10 sweeps.
 /// Returns `true` when the vector is ordered (converged) — on `false`
 /// the caller must fall back to the previous LSP vector per §2.6.
-pub(crate) fn lsp_stability(p: &mut [i16; LPC_ORDER], delta_min: i16) -> bool {
+#[doc(hidden)]
+pub fn lsp_stability(p: &mut [i16; LPC_ORDER], delta_min: i16) -> bool {
     let half = delta_min / 2;
     for _ in 0..crate::tables::LSP_STABILITY_MAX_ITERATIONS {
         let mut violated = false;

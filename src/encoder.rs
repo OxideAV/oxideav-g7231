@@ -310,10 +310,11 @@ struct AnalysisState {
     /// ON; the ITU encoder test configurations selectively disable it
     /// (`CODEC63`/`OVERC63`/`INEQC53`/`PATHC53` run HP OFF).
     highpass: bool,
-    /// One-sample x[n−1] memory of the §2.3 filter.
-    hp_x_prev: f32,
-    /// One-sample y[n−1] memory of the §2.3 filter.
-    hp_y_prev: f32,
+    /// §2.3 filter memories: the previous input sample `x[n−1]` and
+    /// the Word32 recursion state (the half-scale output in Q16 — see
+    /// [`hp_step`]).
+    hp_x_prev: i16,
+    hp_acc: i32,
     /// §2.2 framer delay: the last 60 samples of the previous input
     /// block. The encoder codes the input stream delayed by one
     /// subframe — the ITU-vector-pinned alignment that realises the
@@ -367,6 +368,13 @@ pub struct EncoderDiag {
     pub acb: [[AcbCandidateDiag; 4]; SUBFRAMES_PER_FRAME],
     /// Per subframe: the fixed-codebook stage inputs.
     pub fcb: [FcbDiag; SUBFRAMES_PER_FRAME],
+    /// §2.4 analysis buffer `[previous tail (60) | frame (240) |
+    /// lookahead (60)]` after the §2.3 high-pass, normalised.
+    pub abuf: [f32; SUBFRAME_SIZE + FRAME_SIZE_SAMPLES + LOOKAHEAD_SAMPLES],
+    /// The four unquantised LPC sets `[1, a_1..a_10]` (§2.4) and the
+    /// bandwidth-expanded transmitted set A3(z) (§2.5).
+    pub a_unq: [[f32; LPC_ORDER + 1]; SUBFRAMES_PER_FRAME],
+    pub a3_exp: [f32; LPC_ORDER + 1],
 }
 
 /// Inputs of one subframe's §2.15 / §2.16 fixed-codebook search.
@@ -414,6 +422,9 @@ impl Default for EncoderDiag {
             wbuf: [0.0; WSPEECH_HIST + FRAME_SIZE_SAMPLES],
             acb: [[AcbCandidateDiag::default(); 4]; SUBFRAMES_PER_FRAME],
             fcb: [FcbDiag::default(); SUBFRAMES_PER_FRAME],
+            abuf: [0.0; SUBFRAME_SIZE + FRAME_SIZE_SAMPLES + LOOKAHEAD_SAMPLES],
+            a_unq: [[0.0; LPC_ORDER + 1]; SUBFRAMES_PER_FRAME],
+            a3_exp: [0.0; LPC_ORDER + 1],
         }
     }
 }
@@ -457,8 +468,8 @@ impl AnalysisState {
         Self {
             decoder: SynthesisState::new(),
             highpass: true,
-            hp_x_prev: 0.0,
-            hp_y_prev: 0.0,
+            hp_x_prev: 0,
+            hp_acc: 0,
             framer_delay: [0; LOOKAHEAD_SAMPLES],
             lpc_tail: [0.0; SUBFRAME_SIZE],
             prev_unq_lsp: crate::tables::lsp_dc_cosines(),
@@ -473,17 +484,42 @@ impl AnalysisState {
     /// §2.3 high-pass filter over one frame, eq. 1:
     /// `H(z) = (1 − z⁻¹) / (1 − (127/128)·z⁻¹)`, i.e.
     /// `y[n] = x[n] − x[n−1] + (127/128)·y[n−1]`, with memories carried
-    /// across frames.
-    fn highpass_frame(&mut self, sig: &mut [f32; FRAME_SIZE_SAMPLES]) {
-        const POLE: f32 = 127.0 / 128.0;
-        for v in sig.iter_mut() {
-            let x = *v;
-            let y = x - self.hp_x_prev + POLE * self.hp_y_prev;
-            self.hp_x_prev = x;
-            self.hp_y_prev = y;
-            *v = y;
+    /// across frames — the fixed-point form of [`hp_step`]. `sig`
+    /// receives the output in the crate's normalised float domain.
+    fn highpass_frame(
+        &mut self,
+        frame: &[i16; FRAME_SIZE_SAMPLES],
+        sig: &mut [f32; FRAME_SIZE_SAMPLES],
+    ) {
+        for (v, &x) in sig.iter_mut().zip(frame.iter()) {
+            let yh = hp_step(&mut self.hp_x_prev, &mut self.hp_acc, x);
+            *v = yh as f32 * (1.0 / 16_384.0);
         }
     }
+}
+
+/// One step of the §2.3 filter in fixed point (r455): the recursion
+/// state is the **half-scale output `y[n]/2` in Q16 as a Word32**,
+/// `acc[n] = round((127/128)·acc[n−1]) + (x[n] − x[n−1])·2^15`,
+/// saturated; the emitted sample is `round16(acc)` — the half-scale
+/// output on the Word16 rail.
+///
+/// ITU-vector arbitrated. A unity-scale Word16 output saturates on the
+/// full-scale OVER class (OVERC53H LSP-word agreement 95 → 9.5%); a
+/// half-scale output with a *Word16* recursion state loses 2 points on
+/// PATHC63H (94.8 → 92.5%); the half-scale output with the recursion
+/// kept wide lifts PATHC63H to 97.0% (bands 99.0 / 98.6 / 98.7%) and
+/// moves no other vector. The three wide forms tried (exact state,
+/// `acc − (acc >> 7)`, rounded pole product) are indistinguishable on
+/// the corpus. The half-scale analysis domain is the one the decoder's
+/// doubled pulse amplitudes imply (r406).
+fn hp_step(x_prev: &mut i16, acc: &mut i32, x: i16) -> i16 {
+    let d = x as i64 - *x_prev as i64;
+    *x_prev = x;
+    let pole = (*acc as i64 * crate::qdec::HP_POLE_Q15 as i64 + (1 << 14)) >> 15;
+    let next = (pole + (d << 15)).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    *acc = next;
+    crate::basicop::round16(next)
 }
 
 // ---------- spec-layout encoder analysis ----------
@@ -545,7 +581,7 @@ impl AnalysisState {
         // §2.2/§2.3: remove the DC component up front (switchable for
         // the ITU test configurations).
         if self.highpass {
-            self.highpass_frame(&mut sig);
+            self.highpass_frame(&frame, &mut sig);
         }
         // The 60 lookahead samples are re-coded as part of the *next*
         // frame; they are high-pass filtered with a scratch copy of the
@@ -557,14 +593,9 @@ impl AnalysisState {
             *o = s as f32 * (1.0 / 32_768.0);
         }
         if self.highpass {
-            const POLE: f32 = 127.0 / 128.0;
-            let (mut xp, mut yp) = (self.hp_x_prev, self.hp_y_prev);
-            for v in la.iter_mut() {
-                let x = *v;
-                let y = x - xp + POLE * yp;
-                xp = x;
-                yp = y;
-                *v = y;
+            let (mut xp, mut acc) = (self.hp_x_prev, self.hp_acc);
+            for (v, &x) in la.iter_mut().zip(lookahead.iter()) {
+                *v = hp_step(&mut xp, &mut acc, x) as f32 * (1.0 / 16_384.0);
             }
         }
 
@@ -595,6 +626,9 @@ impl AnalysisState {
         {
             a3_exp[k + 1] *= *w as f32 / 32_768.0;
         }
+        self.diag.abuf = wind_buf;
+        self.diag.a_unq = a_unq;
+        self.diag.a3_exp = a3_exp;
         let lsp_cur_cos = lpc_to_lsp(&a3_exp).unwrap_or(self.prev_unq_lsp);
         self.prev_unq_lsp = lsp_cur_cos;
         let lsp_cur_freq = spec_lsp::lsp_cosines_to_freq(&lsp_cur_cos);
@@ -4037,8 +4071,9 @@ mod tests {
     #[test]
     fn highpass_removes_dc_and_passes_midband() {
         let mut st = AnalysisState::new();
-        let mut dc = [0.25f32; FRAME_SIZE_SAMPLES];
-        st.highpass_frame(&mut dc);
+        let dc_in = [8192i16; FRAME_SIZE_SAMPLES];
+        let mut dc = [0.0f32; FRAME_SIZE_SAMPLES];
+        st.highpass_frame(&dc_in, &mut dc);
         // After the first-sample transient the DC response decays
         // geometrically: (127/128)^239 ≈ 0.153, so the frame tail sits
         // at ≈ 0.25 · 0.153 ≈ 0.038 and keeps shrinking.
@@ -4054,13 +4089,15 @@ mod tests {
         );
 
         let mut st = AnalysisState::new();
-        let mut tone = [0.0f32; FRAME_SIZE_SAMPLES];
+        let mut tone_in = [0i16; FRAME_SIZE_SAMPLES];
+        let mut orig = [0.0f32; FRAME_SIZE_SAMPLES];
         let two_pi = 2.0f32 * std::f32::consts::PI;
-        for (n, v) in tone.iter_mut().enumerate() {
-            *v = (two_pi * n as f32 / 8.0).sin() * 0.25; // 1 kHz at 8 kHz
+        for (n, v) in tone_in.iter_mut().enumerate() {
+            *v = ((two_pi * n as f32 / 8.0).sin() * 8192.0) as i16; // 1 kHz at 8 kHz
+            orig[n] = *v as f32 / 32768.0;
         }
-        let orig = tone;
-        st.highpass_frame(&mut tone);
+        let mut tone = [0.0f32; FRAME_SIZE_SAMPLES];
+        st.highpass_frame(&tone_in, &mut tone);
         // Steady-state gain at 1 kHz is close to unity — compare tail
         // energies loosely.
         let e_in: f32 = orig[120..].iter().map(|v| v * v).sum();

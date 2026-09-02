@@ -39,6 +39,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact 0 → 13.9%; OVERC53H 10.7 → 21.4%. Free-running MG exact:
   PATHC53 53.8 → 70.2%, INEQC53 4.0 → 28.6%. Round-trip ACELP PSNR on
   the 2 s voiced probe 25.2 → 30.8 dB.
+- **§2.3 high-pass on the saturating fixed-point chain (r455)** — the
+  first analysis stage on `basicop` semantics: the recursion state is
+  the half-scale output in Q16 as a Word32 (`acc = round((127/128)·acc)
+  + (x[n] − x[n−1])·2^15`, saturated) and the emitted sample is
+  `round16(acc)`, i.e. `y[n]/2` on the Word16 rail. Vector-arbitrated:
+  a unity-scale Word16 output saturates on the full-scale OVER class
+  (OVERC53H LSP word 95 → 9.5%), a Word16 recursion state costs 2
+  points on PATHC63H, and the wide-state/half-scale form lifts
+  PATHC63H's teacher-forced LSP word 94.8 → **97.0%** (bands 99.0 /
+  98.6 / 98.7%; free-running 90.8 → 94.1%) while moving no other
+  vector — the half-scale analysis domain the decoder's doubled pulse
+  amplitudes already implied (r406).
+- **Teacher-forced per-stage conformance test** (`tests/itu_conformance.rs::
+  encoder_teacher_forced_stage_agreement`): LSP word, ACL0/2 exact,
+  PGIndex exact and fixed-codebook subframe-exact floors per vector,
+  scored from the reference's own state.
 - **§2.15 / §2.16 search details arbitrated against the vectors
   (r455)**, measured with every prior decision teacher-forced from the
   reference so the fixed-codebook stage is scored alone. ACELP: the
