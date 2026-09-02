@@ -89,6 +89,9 @@ use crate::tables::{
 const ACELP_PAYLOAD_BYTES: usize = LOW_RATE_BYTES;
 /// Total payload size for an MP-MLQ (6.3 kbit/s) frame.
 const MPMLQ_PAYLOAD_BYTES: usize = HIGH_RATE_BYTES;
+/// §2.16: "the number of times the last loop is entered (for the 4
+/// subframes) is not allowed to exceed 600".
+const ACELP_LOOP4_FRAME_BUDGET: u32 = 600;
 
 /// Which rate/mode a given encoder instance is locked to.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -359,6 +362,17 @@ pub struct EncoderDiag {
     /// Weighted speech `[history (145) | frame (240)]` the §2.9 / §2.11
     /// searches ran on.
     pub wbuf: [f32; WSPEECH_HIST + FRAME_SIZE_SAMPLES],
+    /// Per subframe: the §2.14 lag candidates searched (lag 0 = unused
+    /// slot) with their 20-term correlation vectors.
+    pub acb: [[AcbCandidateDiag; 4]; SUBFRAMES_PER_FRAME],
+}
+
+/// One §2.14 closed-loop lag candidate's correlation vector.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AcbCandidateDiag {
+    pub lag: i32,
+    pub corr: [f32; 20],
 }
 
 impl Default for EncoderDiag {
@@ -368,6 +382,7 @@ impl Default for EncoderDiag {
             lsp_prev_freq: [0.0; LPC_ORDER],
             ol_lags: [0; 2],
             wbuf: [0.0; WSPEECH_HIST + FRAME_SIZE_SAMPLES],
+            acb: [[AcbCandidateDiag::default(); 4]; SUBFRAMES_PER_FRAME],
         }
     }
 }
@@ -605,6 +620,9 @@ impl AnalysisState {
 
         let mut params = SpecFrameParams::zeroed(rate);
         params.lsp_index = lsp_index;
+        // §2.16: the ACELP search's fourth loop may be entered at most
+        // 600 times per frame across the four subframes.
+        let mut acelp_budget = ACELP_LOOP4_FRAME_BUDGET;
         if force.is_none() {
             committed.lsp_index = lsp_index;
         }
@@ -664,6 +682,7 @@ impl AnalysisState {
             let mut best_score = f32::NEG_INFINITY;
             let mut best_lag = *candidates.first().unwrap_or(&(PITCH_MIN as i32));
             let mut best_pg = 0usize;
+            self.diag.acb[s] = Default::default();
             for &cand in &candidates {
                 // §2.14: the 85-row rule keys off L0 / L2 — for the even
                 // subframes that is the candidate itself.
@@ -693,18 +712,37 @@ impl AnalysisState {
                         rmat[k][j] = acc;
                     }
                 }
-                for pg in 0..rows {
-                    let taps = spec_exc::acb_taps(rate, lag_base, pg);
-                    // Error reduction of this codeword:
-                    // 2·βᵀd − βᵀRβ (row 0 is all-zero taps ⇒ score 0, so
-                    // the best score is never negative).
-                    let mut score = 0.0f32;
-                    for j in 0..spec_exc::ACB_TAPS {
-                        score += 2.0 * taps[j] * d[j];
-                        for k in 0..spec_exc::ACB_TAPS {
-                            score -= taps[j] * taps[k] * rmat[j][k];
-                        }
+                // The 20-entry correlation vector the published gain
+                // rows are laid out against (see
+                // `spec_exc::acb_row_score`): `[d_0..d_4, R_00..R_44,
+                // 2R_01, 2R_02, 2R_12, 2R_03, 2R_13, 2R_23, 2R_04,
+                // 2R_14, 2R_24, 2R_34]` in the reference's own
+                // excitation units. This crate's basis vectors live in
+                // the doubled excitation domain (`y = 2·y_ref`, so
+                // `d = 2·d_ref`, `R = 4·R_ref`), which halves every
+                // quadratic term relative to the linear ones:
+                // `[d, R_ii/2, R_ij]`.
+                let mut corr = [0.0f32; spec_exc::ACB_ROW_TERMS];
+                corr[..spec_exc::ACB_TAPS].copy_from_slice(&d);
+                for j in 0..spec_exc::ACB_TAPS {
+                    corr[spec_exc::ACB_TAPS + j] = 0.5 * rmat[j][j];
+                }
+                let mut k = 2 * spec_exc::ACB_TAPS;
+                for j in 1..spec_exc::ACB_TAPS {
+                    for i in 0..j {
+                        corr[k] = rmat[i][j];
+                        k += 1;
                     }
+                }
+                if let Some(slot) = self.diag.acb[s].iter_mut().find(|c| c.lag == 0) {
+                    slot.lag = cand;
+                    slot.corr = corr;
+                }
+                for pg in 0..rows {
+                    // Error reduction of this codeword (row 0 is all
+                    // zero ⇒ score 0, so the best score is never
+                    // negative).
+                    let score = spec_exc::acb_row_score(rate, lag_base, pg, &corr);
                     if score > best_score {
                         best_score = score;
                         best_lag = cand;
@@ -751,7 +789,8 @@ impl AnalysisState {
                     params.gain[s] = spec_exc::encode_gain_word(rate, lag_base, best_pg, mg, train);
                 }
                 PackedRate::Low => {
-                    let (pos, psig, grid, mg) = acelp_spec_search(&target2, &h, best_lag, best_pg);
+                    let (pos, psig, grid, mg) =
+                        acelp_spec_search(&target2, &h, best_lag, best_pg, &mut acelp_budget);
                     params.pos[s] = pos;
                     params.psig[s] = psig;
                     params.grid[s] = grid;
@@ -957,41 +996,187 @@ fn mpmlq_spec_search(
     best
 }
 
-/// §2.16 ACELP fixed-codebook search at quantised gain levels: run the
-/// Table 1 coordinate-descent pulse search against the §2.16-modified
-/// (pitch-enhanced) impulse response, derive the optimal codeword gain
-/// by least squares, and quantise it per the §2.16 last step
-/// (`|G − G̃_j|` minimisation; a negative optimum flips every pulse sign
-/// since the transmitted gain is unsigned).
+/// §2.16 ACELP fixed-codebook search — the Recommendation's own
+/// procedure (eq. 26–35) rather than a generic pulse optimiser:
+///
+/// - `d[j]` (eq. 28) and the even-position covariance `Φ(i, j)`
+///   (eq. 29) of the pitch-enhanced impulse response `h′` (§2.16:
+///   "prior to the codebook search, the impulse response should be
+///   modified" when `L_i < 60`);
+/// - the eq. 32 sign folding: each even/odd position pair shares the
+///   sign of its larger correlation, `d′ = d·s`, `Φ′ = s·s·Φ`;
+/// - four nested loops over the Table 1 tracks (even bases 0/2/4/6,
+///   stride 8) accumulating `C` (eq. 33) and `ε` (eq. 34), the odd grid
+///   scored with the even-shifted energy (§2.16: "the energy of the
+///   equivalent even pulse position codevector");
+/// - the focused search: the fourth loop is entered only when the
+///   three-pulse absolute correlation exceeds
+///   `thr3 = av3 + (max3 − av3)/2` (eq. 35), and at most 600 times per
+///   frame across the four subframes (`loop4_budget`);
+/// - `argmax C²/ε` by cross-multiplication, first-found on ties;
+/// - the gain `G = ⟨r, Hv⟩/⟨Hv, Hv⟩` on the winning codeword, quantised
+///   by `min |G − G̃_j|` over the 24-level table (§2.16 last step); a
+///   negative optimum flips every pulse sign since the transmitted gain
+///   is unsigned.
 ///
 /// Returns `(pos, psig, grid, mgindex)` in the [`SpecFrameParams`]
-/// conventions (track `t` slot in `pos` bits `3t..3t+2`, sign bit `t`).
+/// conventions (track `t` slot in `pos` bits `3t..3t+2`, sign bit `t`
+/// set = positive).
 fn acelp_spec_search(
     target: &[f32; SUBFRAME_SIZE],
     h: &[f32],
     lag: i32,
     pgindex: usize,
+    loop4_budget: &mut u32,
 ) -> (u32, u32, u8, usize) {
+    const TRACKS: usize = 4;
+    const SLOTS: usize = 8;
+    // Positions 60..63 (Table 1 "(60)" / "(62)" and their odd shifts)
+    // are absent pulses: zero correlation, zero energy.
+    const POS_EXT: usize = SUBFRAME_SIZE + 4;
     let h_enh = spec_exc::acelp_enhanced_impulse_response(h, lag, pgindex);
-    let (positions, mut signs, grid) = acelp_4pulse_search(target, &h_enh);
 
+    // eq. 28.
+    let mut d = [0.0f32; POS_EXT];
+    for (j, dj) in d.iter_mut().enumerate().take(SUBFRAME_SIZE) {
+        let mut acc = 0.0f32;
+        for n in j..SUBFRAME_SIZE {
+            acc += target[n] * h_enh[n - j];
+        }
+        *dj = acc;
+    }
+    // eq. 32 sign folding per even/odd pair.
+    let mut sgn = [1.0f32; POS_EXT];
+    let mut dp = [0.0f32; POS_EXT];
+    for j in 0..SUBFRAME_SIZE / 2 {
+        let (a, b) = (d[2 * j], d[2 * j + 1]);
+        let pick = if a > b { a } else { b };
+        let s = if pick < 0.0 { -1.0f32 } else { 1.0 };
+        sgn[2 * j] = s;
+        sgn[2 * j + 1] = s;
+        dp[2 * j] = a * s;
+        dp[2 * j + 1] = b * s;
+    }
+    // eq. 29 / Φ′ on the even positions, indexed by position / 2; rows
+    // 30 and 31 (positions 60 / 62) stay zero.
+    const HALF: usize = SUBFRAME_SIZE / 2 + 2;
+    let mut phi = [[0.0f32; HALF]; HALF];
+    for a in 0..SUBFRAME_SIZE / 2 {
+        for b in a..SUBFRAME_SIZE / 2 {
+            let (i, j) = (2 * a, 2 * b);
+            let mut acc = 0.0f32;
+            for n in j..SUBFRAME_SIZE {
+                acc += h_enh[n - i] * h_enh[n - j];
+            }
+            let v = acc * sgn[i] * sgn[j];
+            phi[a][b] = v;
+            phi[b][a] = v;
+        }
+    }
+    // eq. 35 threshold from the first three tracks (both grids).
+    let mut max3 = 0.0f32;
+    let mut av3 = 0.0f32;
+    for t in 0..3 {
+        let mut mx = f32::NEG_INFINITY;
+        let mut sum = 0.0f32;
+        let mut cnt = 0usize;
+        for k in 0..SLOTS {
+            for g in 0..2 {
+                let p = 8 * k + 2 * t + g;
+                if p < SUBFRAME_SIZE {
+                    mx = mx.max(dp[p]);
+                    sum += dp[p];
+                    cnt += 1;
+                }
+            }
+        }
+        max3 += mx;
+        av3 += sum / cnt as f32;
+    }
+    let thr3 = av3 + (max3 - av3) * 0.5;
+
+    let mut best_c2 = 0.0f32;
+    let mut best_eps = 0.0f32;
+    let mut best_c = 0.0f32;
+    let mut best_slots = [0usize; TRACKS];
+    let mut best_grid = 0u8;
+    let mut found = false;
+    for k0 in 0..SLOTS {
+        let p0 = 8 * k0;
+        let e0 = phi[p0 / 2][p0 / 2];
+        for k1 in 0..SLOTS {
+            let p1 = 8 * k1 + 2;
+            let e1 = e0 + phi[p1 / 2][p1 / 2] + 2.0 * phi[p0 / 2][p1 / 2];
+            for k2 in 0..SLOTS {
+                let p2 = 8 * k2 + 4;
+                let e2 =
+                    e1 + phi[p2 / 2][p2 / 2] + 2.0 * (phi[p0 / 2][p2 / 2] + phi[p1 / 2][p2 / 2]);
+                for g in 0..2usize {
+                    let c3 = dp[p0 + g] + dp[p1 + g] + dp[p2 + g];
+                    if c3.abs() <= thr3 || *loop4_budget == 0 {
+                        continue;
+                    }
+                    *loop4_budget -= 1;
+                    for k3 in 0..SLOTS {
+                        let p3 = 8 * k3 + 6;
+                        let c = c3 + dp[p3 + g];
+                        let eps = e2
+                            + phi[p3 / 2][p3 / 2]
+                            + 2.0
+                                * (phi[p0 / 2][p3 / 2] + phi[p1 / 2][p3 / 2] + phi[p2 / 2][p3 / 2]);
+                        if eps <= 0.0 {
+                            continue;
+                        }
+                        let c2 = c * c;
+                        if !found || c2 * best_eps > best_c2 * eps {
+                            found = true;
+                            best_c2 = c2;
+                            best_eps = eps;
+                            best_c = c;
+                            best_slots = [k0, k1, k2, k3];
+                            best_grid = g as u8;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !found {
+        return (0, 0, 0, 0);
+    }
+
+    // Codeword signs from the folded sign map (flipped when the
+    // correlation optimum is negative — the gain is transmitted
+    // unsigned).
+    let flip = if best_c < 0.0 { -1.0f32 } else { 1.0 };
+    let mut signs = [1i32; TRACKS];
+    let mut positions = [0u32; TRACKS];
+    for t in 0..TRACKS {
+        positions[t] = best_slots[t] as u32;
+        let p = 8 * best_slots[t] + 2 * t + best_grid as usize;
+        let s = if p < SUBFRAME_SIZE {
+            sgn[p] * flip
+        } else {
+            1.0
+        };
+        signs[t] = if s < 0.0 { -1 } else { 1 };
+    }
     let mut v_unit = [0.0f32; SUBFRAME_SIZE];
-    place_pulses(&positions, signs, grid, &mut v_unit);
+    place_pulses(&positions, signs, best_grid, &mut v_unit);
     let y = conv_causal(&v_unit, &h_enh);
-    let (mut c_ty, mut e_yy, mut e_tt) = (0.0f32, 0.0f32, 0.0f32);
+    let (mut c_ty, mut e_yy) = (0.0f32, 0.0f32);
     for n in 0..SUBFRAME_SIZE {
         c_ty += target[n] * y[n];
         e_yy += y[n] * y[n];
-        e_tt += target[n] * target[n];
     }
     if c_ty < 0.0 {
-        // The transmitted gain is unsigned; flip every pulse sign.
         for sgn in signs.iter_mut() {
             *sgn = -*sgn;
         }
         c_ty = -c_ty;
     }
-    let (mg, _) = best_gain_level(c_ty, e_yy, e_tt);
+    let g_opt = if e_yy > 0.0 { c_ty / e_yy } else { 0.0 };
+    let mg = spec_exc::nearest_fcb_gain(g_opt);
 
     let pos = positions[0] | positions[1] << 3 | positions[2] << 6 | positions[3] << 9;
     // PSIG convention (vector-arbitrated, r388): bit t set = the track-t
@@ -1002,7 +1187,7 @@ fn acelp_spec_search(
             psig |= 1 << t;
         }
     }
-    (pos, psig, grid, mg)
+    (pos, psig, best_grid, mg)
 }
 
 /// Exact gain-index selection: given the target/pattern correlation
@@ -1767,180 +1952,8 @@ fn acelp_pos_of(track: usize, k: u32, grid: u8) -> Option<usize> {
     crate::spec_tables::acelp_track_position(t, k as usize, grid != 0)
 }
 
-/// Four-pulse ACELP fixed-codebook search. Each of the 4 pulses lives on
-/// its own track with stride-8 positions (8 candidate slots per track);
-/// the grid bit shifts the whole pulse set by +1 so both even and odd
-/// sample positions are reachable — the §2.16 Table 1 structure.
-///
-/// Track layout (grid 0, even positions):
-///
-/// ```text
-///   T0: 0,  8, 16, 24, 32, 40, 48, 56
-///   T1: 2, 10, 18, 26, 34, 42, 50, 58
-///   T2: 4, 12, 20, 28, 36, 44, 52, (60)
-///   T3: 6, 14, 22, 30, 38, 46, 54, (62)
-/// ```
-///
-/// Grid 1 shifts each position by +1 (odd positions). Slots whose
-/// position lands at or beyond 60 — track 2 / 3 at `k = 7` on the even
-/// grid — encode an *absent* pulse per the Table 1 note. The 3-bit
-/// position code + 1-bit sign per track, plus the 1-bit grid per
-/// subframe, give the 17-bit algebraic codebook; the search scans
-/// 2 × 4 × 8 = 64 candidates.
-///
-/// After the per-track greedy pick, the algorithm does two passes of
-/// coordinate-descent refinement: for each pulse in turn it re-optimises
-/// its (position, sign) given the other three fixed — so pulses that
-/// were sub-optimal because of correlation with another pulse on the
-/// grid get adjusted.
-fn acelp_4pulse_search(target: &[f32; SUBFRAME_SIZE], h: &[f32]) -> ([u32; 4], [i32; 4], u8) {
-    let d = compute_correlations(target, h);
-    let positions_per_track: usize = 8;
-
-    let mut best_grid = 0u8;
-    let mut best_err = f32::INFINITY;
-    let mut best_positions = [0u32; 4];
-    let mut best_signs = [1i32; 4];
-
-    for grid in 0..2u8 {
-        // Pass 1: per-track greedy pick (initial solution).
-        let mut positions = [0u32; 4];
-        let mut signs = [1i32; 4];
-        for track in 0..4usize {
-            let mut best_gain2 = 0.0f32;
-            let mut best_k = 0u32;
-            let mut best_sign = 1i32;
-            for k in 0..positions_per_track {
-                let pos = match acelp_pos_of(track, k as u32, grid) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                let ap = autocorr_at(h, pos);
-                if ap < 1e-8 {
-                    continue;
-                }
-                let dv = d[pos];
-                let score = dv * dv / ap;
-                if score > best_gain2 {
-                    best_gain2 = score;
-                    best_k = k as u32;
-                    best_sign = if dv >= 0.0 { 1 } else { -1 };
-                }
-            }
-            positions[track] = best_k;
-            signs[track] = best_sign;
-        }
-
-        // Pass 2-3: coordinate descent — for each track in turn, fix the
-        // others and pick the (k, sign) that minimises the residual
-        // between the target and the synthesised sum of pulses.
-        for _pass in 0..2 {
-            for track in 0..4usize {
-                let mut others = [0.0f32; SUBFRAME_SIZE];
-                for t2 in 0..4usize {
-                    if t2 == track {
-                        continue;
-                    }
-                    if let Some(pos) = acelp_pos_of(t2, positions[t2], grid) {
-                        let sgn = signs[t2] as f32;
-                        for n in pos..SUBFRAME_SIZE {
-                            others[n] += sgn * h[n - pos];
-                        }
-                    }
-                }
-                let mut resid = [0.0f32; SUBFRAME_SIZE];
-                for n in 0..SUBFRAME_SIZE {
-                    resid[n] = target[n] - others[n];
-                }
-                // Find best (k, sign) for this track against resid.
-                let mut best_err2 = f32::INFINITY;
-                let mut best_k = positions[track];
-                let mut best_sign = signs[track];
-                for k in 0..positions_per_track {
-                    let pos = match acelp_pos_of(track, k as u32, grid) {
-                        Some(p) => p,
-                        None => continue,
-                    };
-                    // Best sign at this position minimises |resid - sign*h_pos|^2.
-                    // sign* = sign(<resid, h_pos>); resulting err = |resid|^2 - <resid, h_pos>^2 / |h_pos|^2.
-                    let ap = autocorr_at(h, pos);
-                    if ap < 1e-8 {
-                        continue;
-                    }
-                    let mut corr = 0.0f32;
-                    for n in pos..SUBFRAME_SIZE {
-                        corr += resid[n] * h[n - pos];
-                    }
-                    let sign_v: i32 = if corr >= 0.0 { 1 } else { -1 };
-                    let gain = sign_v as f32 * corr.abs() / ap;
-                    let mut err = 0.0f32;
-                    for n in 0..SUBFRAME_SIZE {
-                        let h_at = if n >= pos { h[n - pos] } else { 0.0 };
-                        let e = resid[n] - gain * h_at;
-                        err += e * e;
-                    }
-                    if err < best_err2 {
-                        best_err2 = err;
-                        best_k = k as u32;
-                        best_sign = sign_v;
-                    }
-                }
-                positions[track] = best_k;
-                signs[track] = best_sign;
-            }
-        }
-
-        // Score this grid: compute reconstruction error.
-        let mut syn = [0.0f32; SUBFRAME_SIZE];
-        for track in 0..4usize {
-            if let Some(pos) = acelp_pos_of(track, positions[track], grid) {
-                let sgn = signs[track] as f32;
-                for n in pos..SUBFRAME_SIZE {
-                    syn[n] += sgn * h[n - pos];
-                }
-            }
-        }
-        let mut err = 0.0f32;
-        for n in 0..SUBFRAME_SIZE {
-            let e = target[n] - syn[n];
-            err += e * e;
-        }
-        if err < best_err {
-            best_err = err;
-            best_grid = grid;
-            best_positions = positions;
-            best_signs = signs;
-        }
-    }
-    (best_positions, best_signs, best_grid)
-}
-
-/// Compute d[n] = <target, h_n> for n in 0..SUBFRAME_SIZE.
-fn compute_correlations(target: &[f32; SUBFRAME_SIZE], h: &[f32]) -> [f32; SUBFRAME_SIZE] {
-    let mut d = [0.0f32; SUBFRAME_SIZE];
-    for i in 0..SUBFRAME_SIZE {
-        let mut acc = 0.0f32;
-        // h_i[n] = h[n - i] for n >= i
-        for n in i..SUBFRAME_SIZE {
-            acc += target[n] * h[n - i];
-        }
-        d[i] = acc;
-    }
-    d
-}
-
-fn autocorr_at(h: &[f32], i: usize) -> f32 {
-    // sum_{n=i..SUBFRAME_SIZE} h[n-i]^2 = sum_{m=0..SUBFRAME_SIZE-i} h[m]^2
-    let end = SUBFRAME_SIZE.saturating_sub(i);
-    let mut acc = 0.0f32;
-    for m in 0..end.min(h.len()) {
-        acc += h[m] * h[m];
-    }
-    acc
-}
-
 /// Place 4 pulses at positions specified by tracks + grid bit. Must
-/// mirror the §2.16 Table 1 layout used by [`acelp_4pulse_search`] (even
+/// mirror the §2.16 Table 1 layout used by [`acelp_spec_search`] (even
 /// bases 0, 2, 4, 6; stride 8; the grid bit is the global +1 odd shift).
 /// A 3-bit slot whose position lands at or beyond the subframe boundary
 /// (the Table 1 "(60)" / "(62)" entries) places no pulse — i.e. an

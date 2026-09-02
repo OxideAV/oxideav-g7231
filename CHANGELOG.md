@@ -23,6 +23,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SpecEncoder::diag()`) commits the reference's parameters into the
   shadow state so every stage's per-decision agreement can be measured
   from the reference's own state, free of drift.
+- **§2.16 ACELP fixed-codebook search rebuilt as the Recommendation's
+  own procedure (r455)**: eq. 28 `d[j]` and eq. 29 even-position
+  covariance of the pitch-enhanced impulse response, eq. 32 sign
+  folding (`d′ = d·s`, `Φ′ = s·s·Φ`), four nested Table 1 track loops
+  accumulating eq. 33/34 with the odd grid scored on the even-shifted
+  energy, the eq. 35 focused-search threshold
+  `thr3 = av3 + (max3 − av3)/2` gating the fourth loop with the
+  600-entries-per-frame budget, `argmax C²/ε`, and the last-step gain
+  `min |G − G̃_j|`. Replaces the generic coordinate-descent optimiser
+  (which found *better* MSE codewords than the reference — and
+  therefore different ones). Teacher-forced per-decision agreement on
+  PATHC53: POS 18.6 → 38.8%, PSIG 35.3 → 55.3%, MG 55.4 → 81.6%, GRID
+  73.6 → 83.0%, whole subframe exact 16.4 → 27.3%; INEQC53 subframe
+  exact 0 → 13.9%; OVERC53H 10.7 → 21.4%. Free-running MG exact:
+  PATHC53 53.8 → 70.2%, INEQC53 4.0 → 28.6%. Round-trip ACELP PSNR on
+  the 2 s voiced probe 25.2 → 30.8 dB.
+- **§2.14 closed-loop gain-vector search on the published rows
+  verbatim (r455)**: each 20-entry row of the 85/170-row codebooks is
+  `[β_0..β_4, −β_i²/2 (i = 0..4), −β_iβ_j/2 ((0,1), (0,2), (1,2),
+  (0,3), (1,3), (2,3), (0,4), (1,4), (2,4), (3,4))]` in Q13 (verified
+  against the taps to within the table's rounding), i.e. the error
+  reduction `βᵀd − ½βᵀRβ` is one dot product with the row against
+  `[d, R_ii, 2R_ij]` — the search now uses the rows' *published*
+  (rounded) energy terms rather than products recomputed from the
+  taps. Few decisions move (4 of ~1 250 subframes on CODEC63) but they
+  move toward the reference (TAMEC63H PG 54.8 → 56.8% forced).
 
 - **Fuzz hardening (r406)**: adversarial LSP indices can drive the MA
   predictor + codebook sum negative before the §2.6 ordering repair

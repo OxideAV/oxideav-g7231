@@ -98,6 +98,44 @@ pub(crate) fn acb_taps(rate: PackedRate, lag_base: i32, pgindex: usize) -> [f32;
     taps
 }
 
+/// Number of entries per gain-vector codebook row that the closed-loop
+/// search consumes: the five taps plus the fifteen precomputed energy
+/// terms.
+pub(crate) const ACB_ROW_TERMS: usize = ADAPTIVE_CODEBOOK_ROW_DIM;
+
+/// §2.14 closed-loop error reduction of one gain-vector row against a
+/// 20-term correlation vector `[d_0..d_4, R_00..R_44, 2R_01, 2R_02,
+/// 2R_12, 2R_03, 2R_13, 2R_23, 2R_04, 2R_14, 2R_24, 2R_34]`
+/// (`d_j = ⟨t, y_j⟩`, `R_ij = ⟨y_i, y_j⟩` over the filtered eq. 41
+/// basis vectors; the symmetric cross terms enter doubled).
+///
+/// Each published row is `[β_0..β_4, −β_0²/2..−β_4²/2, −β_0β_1/2,
+/// −β_0β_2/2, −β_1β_2/2, −β_0β_3/2, −β_1β_3/2, −β_2β_3/2, −β_0β_4/2,
+/// −β_1β_4/2, −β_2β_4/2, −β_3β_4/2]`, all in Q13 (r455: verified
+/// numerically against the taps to within the table's own rounding),
+/// so the dot product is `βᵀd − ½βᵀRβ` — evaluated with the rows'
+/// *published* energy terms, which is what the reference's decisions
+/// are made with.
+#[doc(hidden)]
+pub fn acb_row_score(
+    rate: PackedRate,
+    lag_base: i32,
+    pgindex: usize,
+    corr: &[f32; ACB_ROW_TERMS],
+) -> f32 {
+    let (table, rows): (&[i16], usize) = if uses_short_lag_gain(rate, lag_base) {
+        (&ADAPTIVE_CODEBOOK_GAIN_5P3, GAIN_ROWS_85)
+    } else {
+        (&ADAPTIVE_CODEBOOK_GAIN_6P3, GAIN_ROWS_170)
+    };
+    let row = pgindex.min(rows - 1) * ADAPTIVE_CODEBOOK_ROW_DIM;
+    let mut score = 0.0f32;
+    for (&q, &c) in table[row..row + ACB_ROW_TERMS].iter().zip(corr.iter()) {
+        score += q as f32 * c;
+    }
+    score
+}
+
 /// Fixed-codebook gain level `G̃_j` in the normalised signal domain.
 pub(crate) fn fcb_gain_value(mgindex: usize) -> f32 {
     let idx = mgindex.min(FIXED_CODEBOOK_GAIN_Q15.len() - 1);
