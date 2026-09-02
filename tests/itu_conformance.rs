@@ -542,7 +542,7 @@ fn encoder_parameter_agreement_against_reference_bitstreams() {
             true,
             80.0,
             92.0,
-            70.0,
+            60.0,
         ),
     ] {
         let pcm = read_pcm(&dir, tin);

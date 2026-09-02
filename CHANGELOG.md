@@ -39,6 +39,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact 0 → 13.9%; OVERC53H 10.7 → 21.4%. Free-running MG exact:
   PATHC53 53.8 → 70.2%, INEQC53 4.0 → 28.6%. Round-trip ACELP PSNR on
   the 2 s voiced probe 25.2 → 30.8 dB.
+- **§2.15 / §2.16 search details arbitrated against the vectors
+  (r455)**, measured with every prior decision teacher-forced from the
+  reference so the fixed-codebook stage is scored alone. ACELP: the
+  eq. 32 pair sign follows the larger-*magnitude* correlation (the
+  literal signed comparison costs 17 points), the eq. 35 threshold is
+  built from the even-grid positions, one 600-budget entry covers both
+  grids of a three-pulse prefix, and an all-zero subframe emits slot 0
+  / positive signs. PATHC53 whole-subframe exact 27.3 → 56.0%
+  (POS 71.9%, PSIG 83.5%, GRID 91.1%, MG 85.0%), INEQC53 13.9 → 59.5%,
+  OVERC53H 21.4 → 57.1%. The per-frame 600-entry cap is kept as
+  printed although the vectors currently prefer no cap (PATHC53 −2.4,
+  OVERC53H −13 points): our float `thr3` admits ~94 triples per
+  subframe on PATHC53 but the full-scale OVER input pushes ~190 —
+  where the reference's saturated Word16 correlations tie at the top
+  and never exceed it — so the discrepancy belongs to the precision
+  gap, not the rule. MP-MLQ: each gain/grid/train candidate is scored
+  at its own level with no 24-level re-pick, and the searched gain
+  neighbourhood is the five levels `j0 − 3 ..= j0 + 1` around the
+  nearest level to the eq. 25 estimate in this crate's doubled
+  excitation domain (the printed `[Ĝ − 3.2, Ĝ + 6.4]` dB window
+  around an estimate formed in the table's own half-amplitude units,
+  straddled by one level; that literal halved reading scores 2 points
+  lower): whole-subframe exact CODEC63 42.8 → 55.6%, PATHC63H 41.2 →
+  57.1%, OVERC63 43.8 → 52.5%. Remaining fixed-codebook mismatches
+  split roughly 1:2 between search misses (the reference's codeword
+  scores *better* under our own target — 36% on CODEC63) and
+  input/precision differences.
 - **§2.14 closed-loop gain-vector search on the published rows
   verbatim (r455)**: each 20-entry row of the 85/170-row codebooks is
   `[β_0..β_4, −β_i²/2 (i = 0..4), −β_iβ_j/2 ((0,1), (0,2), (1,2),

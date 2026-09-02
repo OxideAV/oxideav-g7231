@@ -137,14 +137,16 @@ pub fn acb_row_score(
 }
 
 /// Fixed-codebook gain level `G̃_j` in the normalised signal domain.
-pub(crate) fn fcb_gain_value(mgindex: usize) -> f32 {
+#[doc(hidden)]
+pub fn fcb_gain_value(mgindex: usize) -> f32 {
     let idx = mgindex.min(FIXED_CODEBOOK_GAIN_Q15.len() - 1);
     FIXED_CODEBOOK_GAIN_Q15[idx] as f32 / 16_384.0
 }
 
 /// Nearest fixed-codebook gain index to `g` (normalised domain),
 /// minimising `|G − G̃_j|` (§2.16 last step / §2.15).
-pub(crate) fn nearest_fcb_gain(g: f32) -> usize {
+#[doc(hidden)]
+pub fn nearest_fcb_gain(g: f32) -> usize {
     let target = g.abs() * 16_384.0;
     let mut best = 0usize;
     let mut best_d = f32::INFINITY;
@@ -259,7 +261,8 @@ pub(crate) fn acb_contribution(
 /// impulse response should be modified" prior to the codebook search).
 /// Returns `h` unchanged when the enhancement is inactive (long lag,
 /// zero-β row, non-positive delay).
-pub(crate) fn acelp_enhanced_impulse_response(h: &[f32], lag: i32, pgindex: usize) -> Vec<f32> {
+#[doc(hidden)]
+pub fn acelp_enhanced_impulse_response(h: &[f32], lag: i32, pgindex: usize) -> Vec<f32> {
     let mut out = h.to_vec();
     if lag >= SUBFRAME_SIZE as i32 {
         return out;

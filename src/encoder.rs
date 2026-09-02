@@ -365,6 +365,36 @@ pub struct EncoderDiag {
     /// Per subframe: the §2.14 lag candidates searched (lag 0 = unused
     /// slot) with their 20-term correlation vectors.
     pub acb: [[AcbCandidateDiag; 4]; SUBFRAMES_PER_FRAME],
+    /// Per subframe: the fixed-codebook stage inputs.
+    pub fcb: [FcbDiag; SUBFRAMES_PER_FRAME],
+}
+
+/// Inputs of one subframe's §2.15 / §2.16 fixed-codebook search.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct FcbDiag {
+    /// Residual target `r[n]` (eq. 20).
+    pub target: [f32; SUBFRAME_SIZE],
+    /// Combined-filter impulse response `h[n]` (§2.12, before the
+    /// §2.16 pitch enhancement).
+    pub h: [f32; SUBFRAME_SIZE],
+    /// Decoded lag `L_i` and the subframe pair's reference lag.
+    pub lag: i32,
+    pub lag_base: i32,
+    /// `PGIndex_i`.
+    pub pgindex: usize,
+}
+
+impl Default for FcbDiag {
+    fn default() -> Self {
+        Self {
+            target: [0.0; SUBFRAME_SIZE],
+            h: [0.0; SUBFRAME_SIZE],
+            lag: 0,
+            lag_base: 0,
+            pgindex: 0,
+        }
+    }
 }
 
 /// One §2.14 closed-loop lag candidate's correlation vector.
@@ -383,6 +413,7 @@ impl Default for EncoderDiag {
             ol_lags: [0; 2],
             wbuf: [0.0; WSPEECH_HIST + FRAME_SIZE_SAMPLES],
             acb: [[AcbCandidateDiag::default(); 4]; SUBFRAMES_PER_FRAME],
+            fcb: [FcbDiag::default(); SUBFRAMES_PER_FRAME],
         }
     }
 }
@@ -767,6 +798,14 @@ impl AnalysisState {
                 lags[s] = best_lag;
             }
             let lag_base = if s < 2 { lags[0] } else { lags[2] };
+            let own_pg = best_pg;
+            if let Some(f) = force {
+                // Teacher forcing: the fixed-codebook stage runs from
+                // the reference's adaptive-codebook decision; the
+                // returned gain word still carries our own PGIndex.
+                best_lag = lags[s];
+                best_pg = spec_exc::decode_gain_word(rate, lag_base, f.gain[s]).pgindex;
+            }
 
             // Residual target for the fixed-codebook stage (eq. 20).
             let taps = spec_exc::acb_taps(rate, lag_base, best_pg);
@@ -777,6 +816,14 @@ impl AnalysisState {
                 target2[n] = target[n] - u_filt[n];
             }
 
+            self.diag.fcb[s] = FcbDiag {
+                target: target2,
+                h,
+                lag: best_lag,
+                lag_base,
+                pgindex: best_pg,
+            };
+
             // ---- Fixed codebook (§2.15 / §2.16) + gain word. ----
             match rate {
                 PackedRate::High => {
@@ -786,7 +833,7 @@ impl AnalysisState {
                     params.pos[s] = pos;
                     params.psig[s] = psig;
                     params.grid[s] = grid;
-                    params.gain[s] = spec_exc::encode_gain_word(rate, lag_base, best_pg, mg, train);
+                    params.gain[s] = spec_exc::encode_gain_word(rate, lag_base, own_pg, mg, train);
                 }
                 PackedRate::Low => {
                     let (pos, psig, grid, mg) =
@@ -794,7 +841,7 @@ impl AnalysisState {
                     params.pos[s] = pos;
                     params.psig[s] = psig;
                     params.grid[s] = grid;
-                    params.gain[s] = spec_exc::encode_gain_word(rate, lag_base, best_pg, mg, false);
+                    params.gain[s] = spec_exc::encode_gain_word(rate, lag_base, own_pg, mg, false);
                 }
             };
 
@@ -864,12 +911,13 @@ impl AnalysisState {
 ///
 /// Estimates `G_max` from the eq. 24 cross-correlation and the eq. 25
 /// normalisation, quantises it on the 24-step logarithmic table, then
-/// searches the gain neighbourhood `[Ĝ_max − 3.2 dB, Ĝ_max + 6.4 dB]`
-/// (one step down, two up) × both grids × (single pulses | Dirac trains
-/// when the reference lag is short), placing `M` pulses sequentially —
-/// each pulse takes the position/sign maximising the correlation of the
-/// running residual with the (train-extended) impulse response. The
-/// configuration with the least residual energy wins.
+/// searches the vector-arbitrated five-level gain neighbourhood
+/// (three steps down, one up — see the body) × both grids × (single
+/// pulses | Dirac trains when the reference lag is short), placing `M`
+/// pulses sequentially — each pulse takes the position/sign maximising
+/// the correlation of the running residual with the (train-extended)
+/// impulse response. The configuration with the least residual energy
+/// at its own gain level wins.
 ///
 /// Returns `(pos_code, psig, grid, mgindex, train)` in the
 /// [`SpecFrameParams`] conventions.
@@ -897,6 +945,19 @@ fn mpmlq_spec_search(
     } else {
         0.0
     };
+    // §2.15: "the estimated gain G_max is quantized by a logarithmic
+    // quantizer. Around this quantized value, additional gain values
+    // are selected within the range [G̃_max − 3.2, G̃_max + 6.4]" dB.
+    // ITU-vector arbitrated (r455, fixed-codebook stage scored alone
+    // with every prior decision teacher-forced): the neighbourhood
+    // that reproduces the reference is the five levels `j0 − 3 ..=
+    // j0 + 1` around the nearest level to eq. 25's estimate in this
+    // crate's doubled excitation domain — i.e. the printed window
+    // around an estimate formed in the table's own (half) amplitude
+    // units, straddled by one level. PATHC63H whole-subframe
+    // agreement: 47.5% (`j0 − 1 ..= j0 + 2`) → 57.1%; CODEC63 53.4 →
+    // 55.6%; the halved-estimate + printed window reading scores 55.0
+    // / 55.5.
     let j0 = spec_exc::nearest_fcb_gain(gmax);
 
     // Dirac-train variant of the impulse response (§2.15): the response
@@ -922,7 +983,7 @@ fn mpmlq_spec_search(
     for &train in train_opts {
         let hh: &[f32] = if train { &h_train } else { h };
         for grid in 0..2u8 {
-            for mg in j0.saturating_sub(1)..=(j0 + 2).min(23) {
+            for mg in j0.saturating_sub(3)..=(j0 + 1).min(23) {
                 let g = spec_exc::fcb_gain_value(mg);
                 let mut res = *target;
                 let mut used = [false; 30];
@@ -954,24 +1015,14 @@ fn mpmlq_spec_search(
                 }
                 // §2.15: "the combination of the quantised parameters
                 // that yields the minimum mean square err[n] is
-                // selected" — with the pulse pattern fixed, re-optimise
-                // the gain index exactly over all 24 levels against the
-                // unit-pattern response.
-                let mut y_pat = [0.0f32; SUBFRAME_SIZE];
-                for &(slot, neg) in chosen.iter() {
-                    let m = 2 * slot + grid as usize;
-                    let sgn = if neg { -1.0f32 } else { 1.0 };
-                    for n in m..SUBFRAME_SIZE {
-                        y_pat[n] += sgn * hh[n - m];
-                    }
+                // selected" — the residual energy at this candidate's
+                // own gain level (r455, vector-arbitrated: a 24-level
+                // gain re-pick per pattern scores lower).
+                let mut err = 0.0f32;
+                for &r in res.iter() {
+                    err += r * r;
                 }
-                let (mut c_ty, mut e_yy, mut e_tt) = (0.0f32, 0.0f32, 0.0f32);
-                for n in 0..SUBFRAME_SIZE {
-                    c_ty += target[n] * y_pat[n];
-                    e_yy += y_pat[n] * y_pat[n];
-                    e_tt += target[n] * target[n];
-                }
-                let (best_mg, err) = best_gain_level(c_ty, e_yy, e_tt);
+                let best_mg = mg;
                 if err < best_err {
                     chosen.sort_unstable_by_key(|&(slot, _)| slot);
                     let slots: Vec<usize> = chosen.iter().map(|&(slot, _)| slot).collect();
@@ -1045,12 +1096,16 @@ fn acelp_spec_search(
         }
         *dj = acc;
     }
-    // eq. 32 sign folding per even/odd pair.
+    // eq. 32 sign folding per even/odd pair: the pair takes the sign of
+    // its larger-*magnitude* correlation (ITU-vector arbitrated, r455:
+    // the literal signed comparison `d[2j] > d[2j+1]` gives a
+    // negative-side pair the positive member's sign and scores 17
+    // points lower on PATHC53 whole-subframe agreement).
     let mut sgn = [1.0f32; POS_EXT];
     let mut dp = [0.0f32; POS_EXT];
     for j in 0..SUBFRAME_SIZE / 2 {
         let (a, b) = (d[2 * j], d[2 * j + 1]);
-        let pick = if a > b { a } else { b };
+        let pick = if a.abs() > b.abs() { a } else { b };
         let s = if pick < 0.0 { -1.0f32 } else { 1.0 };
         sgn[2 * j] = s;
         sgn[2 * j + 1] = s;
@@ -1073,7 +1128,9 @@ fn acelp_spec_search(
             phi[b][a] = v;
         }
     }
-    // eq. 35 threshold from the first three tracks (both grids).
+    // eq. 35 threshold from the first three tracks on the even grid
+    // (vector-arbitrated: folding the odd-grid correlations into
+    // `max3`/`av3` lowers PATHC53 agreement by ~2 points).
     let mut max3 = 0.0f32;
     let mut av3 = 0.0f32;
     for t in 0..3 {
@@ -1081,13 +1138,11 @@ fn acelp_spec_search(
         let mut sum = 0.0f32;
         let mut cnt = 0usize;
         for k in 0..SLOTS {
-            for g in 0..2 {
-                let p = 8 * k + 2 * t + g;
-                if p < SUBFRAME_SIZE {
-                    mx = mx.max(dp[p]);
-                    sum += dp[p];
-                    cnt += 1;
-                }
+            let p = 8 * k + 2 * t;
+            if p < SUBFRAME_SIZE {
+                mx = mx.max(dp[p]);
+                sum += dp[p];
+                cnt += 1;
             }
         }
         max3 += mx;
@@ -1111,12 +1166,21 @@ fn acelp_spec_search(
                 let p2 = 8 * k2 + 4;
                 let e2 =
                     e1 + phi[p2 / 2][p2 / 2] + 2.0 * (phi[p0 / 2][p2 / 2] + phi[p1 / 2][p2 / 2]);
+                // One "entry" of the last loop covers both grids of a
+                // three-pulse prefix.
+                let mut charged = false;
                 for g in 0..2usize {
                     let c3 = dp[p0 + g] + dp[p1 + g] + dp[p2 + g];
-                    if c3.abs() <= thr3 || *loop4_budget == 0 {
+                    if c3.abs() <= thr3 {
                         continue;
                     }
-                    *loop4_budget -= 1;
+                    if !charged {
+                        if *loop4_budget == 0 {
+                            break;
+                        }
+                        *loop4_budget -= 1;
+                        charged = true;
+                    }
                     for k3 in 0..SLOTS {
                         let p3 = 8 * k3 + 6;
                         let c = c3 + dp[p3 + g];
@@ -1142,7 +1206,11 @@ fn acelp_spec_search(
         }
     }
     if !found {
-        return (0, 0, 0, 0);
+        // Degenerate (all-zero correlation) subframe: nothing exceeds
+        // the threshold; the reference emits slot 0 on every track with
+        // positive signs (ITU-vector arbitrated on the silent frames of
+        // PATHC53).
+        return (0, 0b1111, 0, 0);
     }
 
     // Codeword signs from the folded sign map (flipped when the
@@ -1188,24 +1256,6 @@ fn acelp_spec_search(
         }
     }
     (pos, psig, best_grid, mg)
-}
-
-/// Exact gain-index selection: given the target/pattern correlation
-/// `c_ty`, the pattern energy `e_yy`, and the target energy `e_tt`,
-/// return the 24-level gain index minimising
-/// `‖target − G̃_j·y‖² = e_tt − 2·G̃_j·c_ty + G̃_j²·e_yy` and that
-/// minimum (§2.15 / §2.16 gain quantisation as an MMSE pick over the
-/// published table).
-fn best_gain_level(c_ty: f32, e_yy: f32, e_tt: f32) -> (usize, f32) {
-    let mut best = (0usize, f32::INFINITY);
-    for j in 0..24usize {
-        let g = spec_exc::fcb_gain_value(j);
-        let err = e_tt - 2.0 * g * c_ty + g * g * e_yy;
-        if err < best.1 {
-            best = (j, err);
-        }
-    }
-    best
 }
 
 // ---------- LPC analysis ----------
