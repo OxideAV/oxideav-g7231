@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-g7231/compare/v0.0.8...v0.0.9) - 2026-09-02
+
+### Other
+
+- drop the stray libFuzzer job log and ignore fuzz-*.log
+- Annex A silence compression (A.2 VAD, A.4 COD-CNG decision, SID gain quantiser, Table A.1 packing, CNG excitation) + DTX conformance test + dtx fuzz target
+- SS2.3 high-pass on the fixed-point chain (Word32 state, half-scale Word16 output) + teacher-forced per-stage conformance test
+- SS2.15/SS2.16 fixed-codebook search details arbitrated against the ITU vectors (sign folding, threshold, gain window, no re-pick)
+- SS2.16 ACELP focused nested-loop search per the Recommendation + SS2.14 gain search on the published rows verbatim
+- SS2.9 open-loop pitch restricted to positive correlations (ITU-vector arbitrated) + teacher-forcing diagnostics hook
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+- CHANGELOG wording fix (the interim lookahead API was this round's)
+- clamp cos_q14 to its table domain on adversarial LSP indices
+- README for the r406 encoder analysis chain + interop re-arbitration
+- three ITU-vector-arbitrated interop corrections - LSP band order, framer alignment, output scale
+- SS2.8-2.13 weighted-domain analysis chain + SS2.19 memory update
+- SS2.4 per-subframe windowed LPC + SS2.5 bandwidth expansion + 7.5 ms lookahead; fix two silent LPC-to-LSP root-search bugs
+- post-filter + concealment invariants and registry bit-equivalence
+- README + CHANGELOG for the r391 fixed-point decode rebuild
+- fixed-point SS3.6-3.9 post-filter chain + SS3.10 concealment; ship the fixed decoder
+- fixed-point excitation + synthesis, three vector-arbitrated derivations
+- fixed-point LSP chain (decode, stability, interpolation, LSP->LPC Q13)
+- saturating Word16/Word32 fixed-point operator layer
+- add CI / crates.io / docs.rs / MIT-license badges
+- README + CHANGELOG for the r388 ITU conformance round
+- appease clippy ptr_arg in the conformance harness (&Path, not &PathBuf)
+- rustfmt the conformance harness (follow-up to dc8d8d8)
+- ITU conformance-vector harness with measured r388 floors
+- §2.3 input high-pass filter + public SpecEncoder device-under-test handle
+- §3.1 chain restructure + ITU-vector-arbitrated PSIG conventions + postfilter switch
+- appease clippy needless-loop lint in the robustness battery
+- clause-4 decoder robustness battery + mid-stream rate switching
+- describe the clause-4 spec-layout wire format throughout
+- prune the retired interim wire format (-1100 LOC)
+- flip wire format to the ITU-T clause-4 spec layout at both rates
+- §2 spec-layout analysis — joint lag/gain-VQ pitch search + §2.15/§2.16 FCB at quantised gains
+- full §3.1 spec-layout decode kernel on the published tables
+- eq. 36/39/40 gain word + eq. 41 five-tap ACB + rate-specific FCB reconstruction
+- §2.5/§2.6 predictive split-VQ LSP codec on the spec tables
+- clause-4 Table 5/6 spec-layout frame pack/unpack + 13-bit MSBPOS
+- tighten clean-room note wording in fuzz/README
+- document the params fuzz target + seed corpus
+- add params target — factory parameter validation + erasure decay
+- untrack fuzz/Cargo.lock + add version-controlled seed corpus + README
+- document MP-MLQ combinatorial position codec + MSBPOS gap boundary
+- pin MP-MLQ combinatorial codec structural + monotonicity invariants
+- spec-faithful MP-MLQ combinatorial position codec (Fcbk_Pack/Fcbk_Unpk)
+- formant postfilter uses spec Q15 PostFilt tables (§3.8 / §2.18)
+- §3.6 pitch postfilter forward LTP reach spans the whole frame
+- refresh to current status, drop per-round changelog cruft
+
 ### Other
 
 - **Encoder wire-exactness campaign (r455) — §2.9 open-loop pitch
