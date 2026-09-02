@@ -15,6 +15,7 @@ tests' and bench harness's job — the fuzzers only assert *return*.
 | `roundtrip` | Closed-loop `Encoder` (adversarial 16-bit PCM) → `Decoder` on the encoder's self-produced bitstreams.         |
 | `bitstream` | Field-targeted corruption + boundary truncation of structurally near-legal frames, below the trait surface.   |
 | `params`    | `make_encoder` / `make_decoder` parameter-validation surface + sustained SID/erasure-concealment decay.       |
+| `dtx`       | Annex A: `SpecEncoder` with the VAD on + per-frame rate switching, every active / SID / untransmitted packet back through the decoder. |
 
 Each target's per-byte input layout is documented at the top of its
 `fuzz_targets/<name>.rs`.

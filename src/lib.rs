@@ -68,6 +68,7 @@
     clippy::doc_overindented_list_items
 )]
 
+pub mod annex_a;
 pub mod basicop;
 // Internal wire plumbing — kept `pub` for the fuzz harnesses, hidden from
 // rustdoc/semver (fleet rule 2026-09-01).

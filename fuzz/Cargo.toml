@@ -108,3 +108,17 @@ name = "params"
 path = "fuzz_targets/params.rs"
 test = false
 doc = false
+
+# Target 5 — `dtx`. Annex A silence-compression fuzzer (round 455):
+# attacker PCM through `SpecEncoder` with the VAD enabled and a
+# fuzzer-driven per-frame rate schedule, so the A.2 inverse filter /
+# noise-level adaptation, the A.4.2 Durbin + Itakura decision on
+# degenerate autocorrelations, the A.4.3 SID gain quantiser bounds and
+# the A.4.5 comfort-noise gain fit are all reached; every emitted
+# packet (active / SID / untransmitted) is fed back through the
+# fixed-point decoder.
+[[bin]]
+name = "dtx"
+path = "fuzz_targets/dtx.rs"
+test = false
+doc = false

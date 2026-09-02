@@ -39,6 +39,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact 0 → 13.9%; OVERC53H 10.7 → 21.4%. Free-running MG exact:
   PATHC53 53.8 → 70.2%, INEQC53 4.0 → 28.6%. Round-trip ACELP PSNR on
   the 2 s voiced probe 25.2 → 30.8 dB.
+- **Annex A silence compression — encoder side (r455)**: new
+  `annex_a` module with the A.2 VAD (adaptation-enable flag from the
+  open-loop lags and the `k[2] ≥ 0.95` sine detector, inverse-filtered
+  energy, slow-attack / fast-decay noise level, the A-5 logarithmic
+  threshold, 6-frame hangover), the A.4 COD-CNG frame-type decision
+  (Itakura distance `thr1 = 1.2136`, gain-index distance `thr2 = 3`),
+  the A.4.4 SID filter (current vs. three-frame past-average LPC
+  through the §2.5 quantiser), the A.4.3 6-bit pseudo-log SID gain
+  quantiser (the staged `bit-allocation-segment-*` tables turn out to
+  be its segment bases `{0, 32, 96}` and squared decision boundaries),
+  Table A.1 SID packing plus the single untransmitted octet, and the
+  A.4.5 comfort-noise excitation feeding the local decoder.
+  `SpecEncoder::set_vad` / `set_rate` / `last_frame_type` expose the
+  ITU DTX test configuration (per-frame rate schedule for `DTXMIX`).
+  Vector-arbitrated details: the A-2 energy takes the framer output
+  at half scale, the cumulated autocorrelation enters the SID gain at
+  a further ×1/4, and the first three frames are active whatever the
+  input (both DTX references open that way; the text is silent).
+  Frame-type agreement with the reference streams: DTX63 94.4%
+  (active/inactive 95.6%), DTX53 93.3%, DTXMIX 93.3%; coded SID gain
+  within ±1 on 96–100% of common SID frames; SID LSP word ~20% exact
+  (the §2.5 near-tie wall). The annex does not define its random
+  generator (`rseed = 12345`) so the comfort noise — and the active
+  frames after a silence — cannot be bit-exact; the crate uses its own
+  documented LCG. The registry encoder keeps the VAD off; the decoder
+  still conceals SID / untransmitted frames per §3.10 (DEC-CNG is a
+  follow-up). New `dtx` fuzz target (VAD on, rate switching, packets
+  back through the decoder) with three seeds.
 - **§2.3 high-pass on the saturating fixed-point chain (r455)** — the
   first analysis stage on `basicop` semantics: the recursion state is
   the half-scale output in Q16 as a Word32 (`acc = round((127/128)·acc)

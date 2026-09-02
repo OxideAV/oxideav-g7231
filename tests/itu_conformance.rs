@@ -31,6 +31,7 @@
 //!   fixed-gain decisions agree with the reference `.RCO` bitstreams at
 //!   pinned per-vector floors.
 
+use oxideav_g7231::annex_a::{unpack_sid, FrameType};
 use oxideav_g7231::encoder::{SpecEncoder, SynthesisState};
 use oxideav_g7231::linepack::{pack_frame, unpack_frame, PackedRate};
 use oxideav_g7231::qdec::QSynthesis;
@@ -767,6 +768,139 @@ fn encoder_teacher_forced_stage_agreement() {
         assert!(
             fcb_pct >= fcb_floor,
             "{tin}: FCB {fcb_pct:.1}% under floor {fcb_floor}%"
+        );
+    }
+}
+
+/// Parse a mixed DTX reference stream into per-frame types and SID
+/// contents (`0` / `1` active, `2` SID, `3` untransmitted).
+fn parse_dtx_stream(bs: &[u8]) -> (Vec<u8>, Vec<Option<(u32, u8)>>) {
+    let mut types = Vec::new();
+    let mut sids = Vec::new();
+    let mut i = 0usize;
+    while i < bs.len() {
+        let t = bs[i] & 0b11;
+        let size = [24usize, 20, 4, 1][t as usize];
+        types.push(t);
+        sids.push(if t == 2 {
+            unpack_sid(&bs[i..i + 4])
+        } else {
+            None
+        });
+        i += size;
+    }
+    (types, sids)
+}
+
+/// Annex A encoder conformance on the DTX vectors: with the VAD on
+/// (high-pass on, the annex's own configuration), the frame-type
+/// sequence — active / SID / untransmitted — must agree with the
+/// reference stream at pinned floors, every SID frame must carry the
+/// Table A.1 layout, and on frames both sides declare SID the coded
+/// gain index must sit within ±1 of the reference's at a pinned rate.
+/// `DTXMIX` follows the `.RAT` per-frame rate schedule.
+///
+/// r455 measured: DTX63 frame type 94.4% (active/inactive 95.6%), SID
+/// gain 83.7% exact / 95.9% ±1; DTX53MIX 93.3% / 96.7%; DTXMIX 93.3%.
+/// The comfort-noise excitation itself uses this crate's own random
+/// generator (the annex does not define `random_number()`), so active
+/// frames following a silence are not compared here.
+#[test]
+fn encoder_annex_a_frame_types_track_dtx_vectors() {
+    let Some(dir) = corpus_dir() else { return };
+    for (tin, rco, rat, base_rate, ft_floor, gain1_floor) in [
+        (
+            "DTX63.TIN",
+            "DTX63.RCO",
+            None,
+            PackedRate::High,
+            92.0f64,
+            90.0f64,
+        ),
+        (
+            "DTX53MIX.TIN",
+            "DTX53.RCO",
+            None,
+            PackedRate::Low,
+            90.0,
+            80.0,
+        ),
+        (
+            "DTX53MIX.TIN",
+            "DTXMIX.RCO",
+            Some("DTXMIX.RAT"),
+            PackedRate::High,
+            90.0,
+            80.0,
+        ),
+    ] {
+        let pcm = read_pcm(&dir, tin);
+        let refbs = std::fs::read(dir.join(rco)).unwrap();
+        let (rtypes, rsids) = parse_dtx_stream(&refbs);
+        let frames = pcm.len() / FRAME_SAMPLES;
+        assert_eq!(rtypes.len(), frames, "{rco}: frame count");
+        let rates: Vec<PackedRate> = match rat {
+            Some(r) => std::fs::read(dir.join(r))
+                .unwrap()
+                .iter()
+                .map(|&b| {
+                    if b == 0 {
+                        PackedRate::High
+                    } else {
+                        PackedRate::Low
+                    }
+                })
+                .collect(),
+            None => vec![base_rate; frames],
+        };
+        let mut enc = SpecEncoder::new(base_rate);
+        enc.set_highpass(true);
+        enc.set_vad(true);
+        let (mut ft_eq, mut n_sid, mut gain1) = (0usize, 0usize, 0usize);
+        for f in 0..frames {
+            enc.set_rate(rates[f]);
+            let mut fr = [0i16; FRAME_SAMPLES];
+            fr.copy_from_slice(&pcm[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES]);
+            let bytes = enc.encode_frame(&fr);
+            let t = bytes[0] & 0b11;
+            match enc.last_frame_type() {
+                FrameType::Active => assert_eq!(bytes.len(), rates[f].frame_bytes()),
+                FrameType::Sid => {
+                    assert_eq!(bytes.len(), 4);
+                    assert!(unpack_sid(&bytes).is_some());
+                }
+                FrameType::Untransmitted => assert_eq!(bytes.len(), 1),
+            }
+            if t == rtypes[f] {
+                ft_eq += 1;
+            }
+            if t == 2 && rtypes[f] == 2 {
+                n_sid += 1;
+                let (_, g) = unpack_sid(&bytes).unwrap();
+                let (_, rg) = rsids[f].unwrap();
+                if (g as i32 - rg as i32).abs() <= 1 {
+                    gain1 += 1;
+                }
+            }
+        }
+        let ft_pct = 100.0 * ft_eq as f64 / frames as f64;
+        let g1_pct = if n_sid > 0 {
+            100.0 * gain1 as f64 / n_sid as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "{rco}: frame type exact {ft_pct:.1}% over {frames} frames; SID gain within ±1 \
+             {g1_pct:.1}% over {n_sid} common SID frames"
+        );
+        assert!(
+            ft_pct >= ft_floor,
+            "{rco}: frame type {ft_pct:.1}% under floor {ft_floor}%"
+        );
+        assert!(n_sid > 0, "{rco}: no common SID frames");
+        assert!(
+            g1_pct >= gain1_floor,
+            "{rco}: SID gain ±1 {g1_pct:.1}% under floor {gain1_floor}%"
         );
     }
 }

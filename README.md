@@ -39,23 +39,30 @@ maps carrying the published quantiser indices.
 The full clause-2 analysis pipeline on the published tables, packed
 into the clause-4 octet layout: §2.2 framer (the input is coded
 delayed by one subframe — the spec's 7.5 ms lookahead, 37.5 ms total
-delay) → §2.3 high-pass → §2.4 per-subframe windowed LPC → §2.5 LSP
-quantisation → §2.8 formant weighting → §2.9 open-loop pitch →
-§2.11 harmonic noise shaping → §2.12/§2.13 combined-filter target →
-§2.14 closed-loop adaptive codebook → §2.15/§2.16 fixed codebook →
-eq. 36/39/40 gain words → §2.19 memory update.
-Default rate (no `bit_rate` hint) is 6.3 kbit/s MP-MLQ; request
-`Some(5300)` for ACELP. The §2.3 DC-removal filter (eq. 1) defaults ON
-per §2.2; `encoder::SpecEncoder` exposes the rate + high-pass switches
-the ITU encoder-test configurations require.
+delay) → §2.3 high-pass (fixed point, r455) → §2.4 per-subframe
+windowed LPC → §2.5 LSP quantisation → §2.8 formant weighting → §2.9
+open-loop pitch → §2.11 harmonic noise shaping → §2.12/§2.13
+combined-filter target → §2.14 closed-loop adaptive codebook →
+§2.15/§2.16 fixed codebook → eq. 36/39/40 gain words → §2.19 memory
+update — plus the **Annex A** silence compression (VAD + SID frames)
+on request. Default rate (no `bit_rate` hint) is 6.3 kbit/s MP-MLQ;
+request `Some(5300)` for ACELP. The §2.3 DC-removal filter (eq. 1)
+defaults ON per §2.2; `encoder::SpecEncoder` exposes the rate,
+high-pass and VAD switches the ITU encoder-test configurations
+require (`set_rate` may change the rate at any frame boundary).
 
 - **Analysis by synthesis**: the encoder carries a shadow
   `SynthesisState` committed through the *exact* decode kernel, so
   analysis always targets what the decoder will actually produce.
+- **§2.3 high-pass** (r455, first stage on the saturating fixed-point
+  chain): Word32 recursion state holding the half-scale output in Q16,
+  emitted as `round16` on the Word16 rail — the half-scale analysis
+  domain the decoder's doubled pulse amplitudes already implied.
 - **LPC analysis** (§2.4): four LPC sets per frame, each from the
   published Q15 Hamming window over 180 samples centered on its
   subframe, `1025/1024` white-noise correction, published binomial
-  lag window, Levinson-Durbin.
+  lag window, Levinson-Durbin (also yielding `k[2]` for the Annex A
+  sine detector and the corrected autocorrelation for COD-CNG).
 - **LSP quantisation** (§2.5): the 7.5 Hz bandwidth-expanded A3(z)
   through a predictive 3+3+4 split VQ over the published 256-entry
   band codebooks, MA predictor `b = 12/32`, DC removal, and the eq. 5
@@ -63,31 +70,52 @@ the ITU encoder-test configurations require.
 - **Weighted-domain targets** (§2.8–§2.13): per-subframe formant
   weighting `W(z) = A(z/0.9)/A(z/0.5)` on the unquantised LPC
   (published Q15 tap weights); two half-frame open-loop pitch
-  estimates on the weighted speech (eq. 12 with the smaller-lag
-  1.25 dB preference); harmonic noise shaping `P(z) = 1 − β·z^−L`
-  gated by the eq. 17 2.0 dB prediction-gain test; and ringing
-  subtraction of the combined filter `S(z) = Ã(z)·W(z)·P(z)` — every
-  closed-loop search below runs against this target and impulse
-  response.
+  estimates on the weighted speech (eq. 12 over the **positive**
+  correlations only, with the smaller-lag 1.25 dB preference — r455,
+  vector-arbitrated); harmonic noise shaping `P(z) = 1 − β·z^−L` gated
+  by the eq. 17 2.0 dB prediction-gain test; and ringing subtraction
+  of the combined filter `S(z) = Ã(z)·W(z)·P(z)`.
 - **Closed-loop pitch** (§2.14): lag candidates around the §2.9
   open-loop estimate (±1 on subframes 0/2, the −1..+2 delta window on
-  1/3) jointly searched with the published 85-/170-row 5-tap
-  gain-vector codebook by maximising the error reduction
-  `2·βᵀd − βᵀRβ` over the filtered eq. 41 basis vectors.
+  1/3) jointly searched with the published 85-/170-row gain-vector
+  codebook — each 20-entry row `[β_i, −β_i²/2, −β_iβ_j/2]` (Q13) is
+  applied *verbatim* as one dot product against the filtered-basis
+  correlations (r455).
 - **MP-MLQ fixed-codebook search** (§2.15): eq. 24/25 `G_max`
-  estimate, the `[Ĝ − 3.2 dB, Ĝ + 6.4 dB]` quantised-gain
-  neighbourhood × both grids × the short-lag Dirac-train mode, greedy
-  sequential pulse placement, and an exact 24-level MMSE gain re-pick;
-  positions transmitted as `C(30,M)` combinatorial codes with the
-  13-bit `MSBPOS` word.
-- **ACELP fixed-codebook search** (§2.16): the Table 1 4-pulse
-  stride-8 track geometry with coordinate-descent refinement, run
-  against the pitch-enhanced impulse response
-  (`h′[n] = h[n] + β·h′[n − L − ε]`), least-squares gain folded into
-  the pulse signs and quantised on the 24-level table.
+  estimate on the 24-level table, the vector-arbitrated five-level
+  gain neighbourhood × both grids × the short-lag Dirac-train mode,
+  greedy sequential pulse placement, each candidate scored at its own
+  level; positions transmitted as `C(30,M)` combinatorial codes with
+  the 13-bit `MSBPOS` word.
+- **ACELP fixed-codebook search** (§2.16): the Recommendation's own
+  procedure (r455) — eq. 28 `d[j]` and eq. 29 even-position
+  covariance of the pitch-enhanced impulse response, eq. 32 sign
+  folding (on magnitudes), four nested Table 1 track loops with the
+  odd grid on the even-shifted energy, the eq. 35 focused-search
+  threshold with the 600-entries-per-frame cap, `argmax C²/ε`, and the
+  last-step gain `min |G − G̃_j|`.
 - **Gain words** (eq. 36/39/40): combined 12-bit
   `PGIndex·24 + MGIndex` words, with the high-rate short-lag (L < 58)
   85-row layout carrying the impulse-train bit in the MSB.
+- **Annex A silence compression** (r455, `SpecEncoder::set_vad`):
+  the A.2 VAD (adaptation-enable flag from the open-loop lags and the
+  `k[2] ≥ 0.95` sine detector, noise-inverse-filtered energy,
+  slow-attack / fast-decay noise level in `[128, 131071]`, the A-5
+  logarithmic threshold, 6-frame hangover after bursts ≥ 2 frames),
+  the A.4 COD-CNG decision (first inactive frame → SID; otherwise SID
+  when the Itakura distance to the SID filter exceeds `thr1 = 1.2136`
+  or the coded energy moves by more than `thr2 = 3` levels), the
+  A.4.4 SID filter (current vs. three-frame past-average LPC) through
+  the §2.5 quantiser, the A.4.3 6-bit pseudo-log gain quantiser
+  (segment bases `{0, 32, 96}` and squared boundaries from the staged
+  tables), Table A.1 packing (4-octet SID, 1-octet untransmitted),
+  and the A.4.5 comfort-noise excitation feeding the local decoder.
+  The annex does not define its random generator (`rseed = 12345`),
+  so this crate uses its own documented LCG: the comfort noise, and
+  hence the active frames following a silence, are not bit-exact.
+  The registry encoder keeps the VAD off (every frame coded as
+  speech); the decoder conceals SID / untransmitted frames per §3.10
+  rather than synthesising Annex A comfort noise (follow-up).
 
 ### Decoder (stateful, full-synthesis, fixed-point)
 
@@ -132,8 +160,8 @@ peak-referenced PSNR):
 
 |    rate | frame size | PSNR      | signal SNR |
 | ------: | ---------: | :-------- | :--------- |
-| 5.3 k/s |   20 bytes | ≈ 25.2 dB | ≈ 13.3 dB  |
-| 6.3 k/s |   24 bytes | ≈ 31.2 dB | ≈ 19.3 dB  |
+| 5.3 k/s |   20 bytes | ≈ 30.8 dB | ≈ 18.8 dB  |
+| 6.3 k/s |   24 bytes | ≈ 31.1 dB | ≈ 19.1 dB  |
 
 See `tests/codec_roundtrip.rs` for the integration tests. For a
 playable subjective sample:
@@ -191,15 +219,40 @@ post-filter-ON and OVER/TAME saturation-torture classes), which the
 Recommendation specifies only in the clause-5 C.
 
 Encoder parameter agreement against the reference `.RCO` bitstreams
-(whole files, float analysis vs the bit-exact fixed-point reference):
-LSP word 77–90.8% exact on the PATH/OVER/CODE classes, ACL0/ACL2
-within ±1 on 53–100% of subframes (OVERC53H 100%), fixed-gain index
-up to 81% exact. The TAME/INEQ classes are built around the
-reference's exact fixed-point rounding (taming is clause-5-only), so
-their parameter floors stay loose. Every encoder-emitted frame on the
-ITU test inputs is a legal clause-4 stream; see
-[`tests/itu_conformance.rs`](tests/itu_conformance.rs) for all pinned
-floors.
+(r455; the teacher-forced columns score each stage from the
+reference's own state, the free-running column the whole stream):
+
+| vector   | LSP word (forced / free) | ACL0/2 exact (forced) | PGIndex (forced) | FCB subframe exact (forced) | MG exact (free) |
+|----------|--------------------------|-----------------------|------------------|-----------------------------|-----------------|
+| CODEC63  | 89.5 / 77.0%             | 95.2%                 | 91.0%            | 55.6%                       | 65.3%           |
+| PATHC63H | 97.0 / 94.1%             | 73.3%                 | 86.0%            | 57.2%                       | 63.6%           |
+| OVERC63  | 90.0 / 85.0%             | 87.5%                 | 76.2%            | 52.5%                       | 68.8%           |
+| TAMEC63H | 53.0 / 29.0%             | 98.5%                 | 56.8%            | 16.8%                       | 29.5%           |
+| PATHC53  | 93.9 / 90.4%             | 72.4%                 | 78.4%            | 69.6%                       | 73.3%           |
+| INEQC53  | 46.0 / 22.2%             | 94.4%                 | 25.8%            | 60.3%                       | 29.0%           |
+| OVERC53H | 95.2 / 90.5%             | 95.2%                 | 81.0%            | 60.7%                       | 69.0%           |
+
+Free-running ACL0/ACL2 within ±1: 84–100% on every vector (PATHC63H
+53.5 → 85.8%, TAMEC63H 49 → 99% in r455). What the r455 campaign
+established, with every decision arbitrated against the vectors: the
+§2.9 search counts positive correlations only; the §2.16 ACELP search
+must be the printed focused nested-loop procedure with magnitude sign
+folding (whole-subframe agreement on PATHC53 27 → 70%); the §2.15
+gain neighbourhood is five levels around the nearest level to the
+estimate in this crate's doubled excitation domain; the §2.14 rows
+act verbatim; and the §2.3 output lives on a half-scale Word16 rail
+with a wide recursion state. What remains is precision-level: the
+LSP-word mismatches are near-ties (the reference's index is our
+second-best at a 4–10% error margin, and the INEQ / TAME / sine
+segments cycle through rows the exact fixed-point form of the eq. 4.5
+weighted error decides), the remaining lag / gain-vector mismatches
+are rank-1 near-ties, and TAME's gain vectors follow the encoder
+taming procedure the Recommendation text does not describe. The
+Annex A frame-type sequence tracks the DTX vectors at 94.4% (DTX63),
+93.3% (DTX53) and 93.3% (DTXMIX, per-frame rate schedule), with the
+coded SID gain within ±1 of the reference's on 96–100% of common SID
+frames. See [`tests/itu_conformance.rs`](tests/itu_conformance.rs)
+for all pinned floors.
 
 ### Spec-table data in tree
 
@@ -278,7 +331,8 @@ bit_rate = anything else -> Error::Unsupported
 
 The output `CodecParameters` returned by the encoder always has
 `bit_rate` set to the exact quantised rate it is operating at. The
-encoder has no VAD / CNG — every frame is coded as speech. Per §2.2
+registry encoder codes every frame as speech; Annex A silence
+compression is available on `encoder::SpecEncoder::set_vad`. Per §2.2
 the coded signal is the input delayed by one subframe (7.5 ms — the
 spec's lookahead), so decoded sample `n` renders input sample
 `n − 60`.
@@ -303,7 +357,7 @@ frame encoding, ~5 µs / frame decoding).
 
 ## Fuzzing
 
-Four `cargo-fuzz` targets live under `fuzz/fuzz_targets/`, each an
+Five `cargo-fuzz` targets live under `fuzz/fuzz_targets/`, each an
 ASan-instrumented panic-freedom fuzzer:
 
 - **`decode`** — attacker-supplied byte packets through
@@ -320,12 +374,15 @@ ASan-instrumented panic-freedom fuzzer:
   validation surface (rejected sample rates / channel counts / sample
   formats, 5.3 / 6.3 kbit/s band edges) plus a sustained SID /
   untransmitted erasure-concealment decay→recovery→reset drive.
+- **`dtx`** — Annex A: arbitrary PCM through `SpecEncoder` with the
+  VAD on and a fuzzer-driven per-frame rate schedule, every active /
+  SID / untransmitted packet back through the fixed-point decoder.
 
 A version-controlled seed corpus shaped to each target's input layout
 lives under `fuzz/seeds/<target>/`; see `fuzz/README.md`.
 
 ```bash
-cargo fuzz run {decode,roundtrip,bitstream,params}   # nightly toolchain
+cargo fuzz run {decode,roundtrip,bitstream,params,dtx}   # nightly toolchain
 ```
 
 ## License

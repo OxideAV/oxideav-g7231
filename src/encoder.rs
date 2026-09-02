@@ -347,6 +347,21 @@ struct AnalysisState {
     /// (table units), the predictor state it was quantised against,
     /// and the two §2.9 open-loop lags.
     diag: EncoderDiag,
+    /// Annex A silence compression (VAD + COD-CNG); off by default.
+    vad_enabled: bool,
+    vad: crate::annex_a::Vad,
+    cng: crate::annex_a::CodCng,
+}
+
+/// Result of analysing one frame with Annex A enabled.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FrameResult {
+    /// `Ftyp_t`.
+    pub ftype: crate::annex_a::FrameType,
+    /// The active-frame parameter set (meaningful for `Active`).
+    pub params: SpecFrameParams,
+    /// SID contents `(LPC index, gain index)` for `Sid` frames.
+    pub sid: (u32, u8),
 }
 
 /// Per-frame analysis intermediates exposed for conformance
@@ -478,6 +493,9 @@ impl AnalysisState {
             wspeech_hist: [0.0; WSPEECH_HIST],
             comb_mem: CombinedMem::new(),
             diag: EncoderDiag::default(),
+            vad_enabled: false,
+            vad: crate::annex_a::Vad::new(),
+            cng: crate::annex_a::CodCng::new(),
         }
     }
 
@@ -558,6 +576,21 @@ impl AnalysisState {
         rate: PackedRate,
         force: Option<&SpecFrameParams>,
     ) -> SpecFrameParams {
+        self.analyse_frame(pcm, rate, force).params
+    }
+
+    /// [`analyse_spec`](Self::analyse_spec) with the Annex A frame-type
+    /// decision: when the VAD is enabled and the frame is inactive, the
+    /// SID parameters are computed (A.4.4), the local decoder is fed the
+    /// comfort-noise excitation (A.4.5) and the LSP state follows
+    /// `p̃_sid` (A.4.6); the returned `params` are then unused.
+    fn analyse_frame(
+        &mut self,
+        pcm: &[i16; FRAME_SIZE_SAMPLES],
+        rate: PackedRate,
+        force: Option<&SpecFrameParams>,
+    ) -> FrameResult {
+        use crate::annex_a::FrameType;
         // ---- §2.2 framer: the encoder codes the input *delayed by one
         // subframe* — the frame built from input block `k` covers
         // stream samples `[k·240 − 60, k·240 + 180)`, and the block's
@@ -611,44 +644,17 @@ impl AnalysisState {
         self.lpc_tail
             .copy_from_slice(&sig[FRAME_SIZE_SAMPLES - SUBFRAME_SIZE..]);
         let mut a_unq = [[0.0f32; LPC_ORDER + 1]; SUBFRAMES_PER_FRAME];
-        for (s, a_s) in a_unq.iter_mut().enumerate() {
-            *a_s = lpc_analysis(&wind_buf[s * SUBFRAME_SIZE..s * SUBFRAME_SIZE + LPC_WINDOW]);
-        }
-
-        // ---- §2.5: bandwidth-expand A3(z) by 7.5 Hz (the published
-        // Q15 per-tap weights), then quantise it with the predictive
-        // split VQ (§2.5–2.6). Only the last subframe's LPC set is
-        // transmitted.
-        let mut a3_exp = a_unq[SUBFRAMES_PER_FRAME - 1];
-        for (k, w) in crate::spec_tables::LPC_BANDWIDTH_EXPANSION_Q15
-            .iter()
-            .enumerate()
-        {
-            a3_exp[k + 1] *= *w as f32 / 32_768.0;
-        }
-        self.diag.abuf = wind_buf;
-        self.diag.a_unq = a_unq;
-        self.diag.a3_exp = a3_exp;
-        let lsp_cur_cos = lpc_to_lsp(&a3_exp).unwrap_or(self.prev_unq_lsp);
-        self.prev_unq_lsp = lsp_cur_cos;
-        let lsp_cur_freq = spec_lsp::lsp_cosines_to_freq(&lsp_cur_cos);
-        self.diag.lsp_unq_freq = lsp_cur_freq;
-        self.diag.lsp_prev_freq = self.decoder.prev_lsp_freq;
-        let (lsp_index, mut decoded_freq) =
-            spec_lsp::quantise_lsp_freq(&lsp_cur_freq, &self.decoder.prev_lsp_freq);
-        // Teacher forcing (conformance diagnostics): the state the
-        // remaining stages and the shadow decoder see is rebuilt from
-        // the *forced* parameter set, while the returned decisions stay
-        // our own.
-        let mut committed = SpecFrameParams::zeroed(rate);
-        if let Some(f) = force {
-            committed.lsp_index = f.lsp_index;
-            decoded_freq = spec_lsp::decode_lsp_freq(f.lsp_index, &self.decoder.prev_lsp_freq);
-        }
-        let cos_raw = spec_lsp::lsp_freq_to_cosines(&decoded_freq);
-        let (mut lsp_q, converged) = enforce_lsp_stability(&cos_raw, LSP_STABILITY_DELTA_MIN_HZ);
-        if !converged {
-            lsp_q = self.decoder.prev_lsp;
+        let mut k2 = [0.0f32; SUBFRAMES_PER_FRAME];
+        // Annex A.4.1 eq. A-8: cumulated frame autocorrelation, in the
+        // reference's half-scale Word16² units.
+        let mut r_t = [0.0f64; LPC_ORDER + 1];
+        for s in 0..SUBFRAMES_PER_FRAME {
+            let set = lpc_analysis(&wind_buf[s * SUBFRAME_SIZE..s * SUBFRAME_SIZE + LPC_WINDOW]);
+            a_unq[s] = set.a;
+            k2[s] = set.k2;
+            for j in 0..=LPC_ORDER {
+                r_t[j] += set.r[j] * (16_384.0 * 16_384.0);
+            }
         }
 
         // ---- §2.8: perceptually weighted speech f[n], per subframe on
@@ -680,6 +686,71 @@ impl AnalysisState {
         self.diag.ol_lags = ol_lags;
         self.diag.wbuf = wbuf;
 
+        // ---- Annex A: VAD (A.2) and COD-CNG frame type (A.4). ----
+        let vad_prev = self.vad.vad_prev;
+        let (ftype, sid_params) = if self.vad_enabled {
+            let vad = self.vad.decide(&frame, ol_lags, k2);
+            self.cng.frame_type(&r_t, vad, vad_prev, &mut self.vad)
+        } else {
+            (FrameType::Active, None)
+        };
+        let inactive = ftype != FrameType::Active;
+        // Teacher forcing only applies to active frames.
+        let force = if inactive { None } else { force };
+        let cng_gain = if inactive {
+            self.cng.target_gain(vad_prev)
+        } else {
+            0.0
+        };
+
+        // ---- §2.5: bandwidth-expand A3(z) by 7.5 Hz (the published
+        // Q15 per-tap weights), then quantise it with the predictive
+        // split VQ (§2.5–2.6). Only the last subframe's LPC set is
+        // transmitted.
+        // The transmitted set: A3(z), or the Annex A SID filter A_sid(z)
+        // on a SID frame (A.4.4: "LSP converted and quantised using the
+        // encoder LSP 24-bit quantization procedure (see 2.5)").
+        let mut a3_exp = match sid_params {
+            Some(sp) => {
+                let mut a = [0.0f32; LPC_ORDER + 1];
+                for (o, &v) in a.iter_mut().zip(sp.a_sid.iter()) {
+                    *o = v as f32;
+                }
+                a
+            }
+            None => a_unq[SUBFRAMES_PER_FRAME - 1],
+        };
+        for (k, w) in crate::spec_tables::LPC_BANDWIDTH_EXPANSION_Q15
+            .iter()
+            .enumerate()
+        {
+            a3_exp[k + 1] *= *w as f32 / 32_768.0;
+        }
+        self.diag.abuf = wind_buf;
+        self.diag.a_unq = a_unq;
+        self.diag.a3_exp = a3_exp;
+        let lsp_cur_cos = lpc_to_lsp(&a3_exp).unwrap_or(self.prev_unq_lsp);
+        self.prev_unq_lsp = lsp_cur_cos;
+        let lsp_cur_freq = spec_lsp::lsp_cosines_to_freq(&lsp_cur_cos);
+        self.diag.lsp_unq_freq = lsp_cur_freq;
+        self.diag.lsp_prev_freq = self.decoder.prev_lsp_freq;
+        let (lsp_index, mut decoded_freq) =
+            spec_lsp::quantise_lsp_freq(&lsp_cur_freq, &self.decoder.prev_lsp_freq);
+        // Teacher forcing (conformance diagnostics): the state the
+        // remaining stages and the shadow decoder see is rebuilt from
+        // the *forced* parameter set, while the returned decisions stay
+        // our own.
+        let mut committed = SpecFrameParams::zeroed(rate);
+        if let Some(f) = force {
+            committed.lsp_index = f.lsp_index;
+            decoded_freq = spec_lsp::decode_lsp_freq(f.lsp_index, &self.decoder.prev_lsp_freq);
+        }
+        let cos_raw = spec_lsp::lsp_freq_to_cosines(&decoded_freq);
+        let (mut lsp_q, converged) = enforce_lsp_stability(&cos_raw, LSP_STABILITY_DELTA_MIN_HZ);
+        if !converged {
+            lsp_q = self.decoder.prev_lsp;
+        }
+
         let exc_snapshot = self.decoder.exc_history;
         let prev_lsp_snapshot = self.decoder.prev_lsp;
 
@@ -693,6 +764,7 @@ impl AnalysisState {
         }
         // Committed (state-defining) lags — ours, or the forced set's.
         let mut lags = [0i32; SUBFRAMES_PER_FRAME];
+        let mut cng_block = [0.0f32; 2 * SUBFRAME_SIZE];
         for s in 0..SUBFRAMES_PER_FRAME {
             let lsp_interp = interpolate_lsp(s, &prev_lsp_snapshot, &lsp_q);
             let a_sub = lsp_to_lpc(&lsp_interp);
@@ -727,6 +799,27 @@ impl AnalysisState {
             let mut target = [0.0f32; SUBFRAME_SIZE];
             for n in 0..SUBFRAME_SIZE {
                 target[n] = w_target[n] - zir[n];
+            }
+
+            if inactive {
+                // Annex A.4.5: comfort-noise excitation for this
+                // 120-sample block, generated on the local decoder's
+                // history at the block start; §2.19 memory update as
+                // for an active subframe.
+                if s % 2 == 0 {
+                    cng_block =
+                        self.cng
+                            .block_excitation(&self.decoder.exc_history, s / 2, cng_gain);
+                }
+                let mut exc = [0.0f32; SUBFRAME_SIZE];
+                exc.copy_from_slice(
+                    &cng_block[(s % 2) * SUBFRAME_SIZE..(s % 2 + 1) * SUBFRAME_SIZE],
+                );
+                self.decoder.exc_history.rotate_left(SUBFRAME_SIZE);
+                let tail = self.decoder.exc_history.len() - SUBFRAME_SIZE;
+                self.decoder.exc_history[tail..].copy_from_slice(&exc);
+                let _ = run_combined(&mut self.comb_mem, &exc, &a_sub, &wz, &wp, hns);
+                continue;
             }
 
             // ---- Closed-loop pitch + gain-vector search (§2.14):
@@ -935,9 +1028,23 @@ impl AnalysisState {
         // Roll back and commit through the canonical decode kernel so
         // the shadow decoder state is bit-for-bit what a real decoder
         // holds after this frame.
+        if inactive {
+            // A.4.6: the LSP state follows p̃_sid; the excitation history
+            // already holds the comfort-noise excitation.
+            self.decoder.set_prev_lsp(&lsp_q);
+            return FrameResult {
+                ftype,
+                params,
+                sid: (lsp_index, sid_params.map(|sp| sp.gain_index).unwrap_or(0)),
+            };
+        }
         self.decoder.exc_history = exc_snapshot;
         let _ = self.decoder.decode_spec_params(&committed);
-        params
+        FrameResult {
+            ftype,
+            params,
+            sid: (0, 0),
+        }
     }
 }
 
@@ -1301,7 +1408,17 @@ fn acelp_spec_search(
 /// correction and `R[1..=10]` are shaped by the published Q15 binomial
 /// lag window, then the conventional Levinson-Durbin recursion produces
 /// `[1, a_1..a_10]` in direct form.
-fn lpc_analysis(window: &[f32]) -> [f32; LPC_ORDER + 1] {
+/// One §2.4 LPC analysis result: the direct-form set, the corrected
+/// autocorrelation it was solved from (normalised units) and the
+/// second reflection coefficient (the Annex A.2.1 sine detector).
+#[derive(Clone, Copy, Debug)]
+struct LpcSet {
+    a: [f32; LPC_ORDER + 1],
+    r: [f64; LPC_ORDER + 1],
+    k2: f32,
+}
+
+fn lpc_analysis(window: &[f32]) -> LpcSet {
     debug_assert_eq!(window.len(), LPC_WINDOW);
     let mut windowed = [0.0f32; LPC_WINDOW];
     for (i, o) in windowed.iter_mut().enumerate() {
@@ -1335,8 +1452,13 @@ fn lpc_analysis(window: &[f32]) -> [f32; LPC_ORDER + 1] {
     a[0] = 1.0;
     a_prev[0] = 1.0;
     let mut e = r[0];
+    let mut k2 = 0.0f32;
     if e <= 0.0 {
-        return default_a();
+        return LpcSet {
+            a: default_a(),
+            r,
+            k2,
+        };
     }
     for i in 1..=LPC_ORDER {
         // Reflection coefficient.
@@ -1347,6 +1469,9 @@ fn lpc_analysis(window: &[f32]) -> [f32; LPC_ORDER + 1] {
         let k = -acc / e;
         if !k.is_finite() || k.abs() >= 1.0 {
             break;
+        }
+        if i == 2 {
+            k2 = k as f32;
         }
         a[i] = k;
         for j in 1..i {
@@ -1362,7 +1487,7 @@ fn lpc_analysis(window: &[f32]) -> [f32; LPC_ORDER + 1] {
     for i in 0..=LPC_ORDER {
         out[i] = a_prev[i] as f32;
     }
-    out
+    LpcSet { a: out, r, k2 }
 }
 
 fn default_a() -> [f32; LPC_ORDER + 1] {
@@ -2180,6 +2305,13 @@ impl SynthesisState {
         }
     }
 
+    /// Overwrite the previous-LSP predictor state (cosine domain) —
+    /// Annex A.4.6 `p̃_t = p̃_sid` on inactive frames.
+    pub(crate) fn set_prev_lsp(&mut self, lsp_cos: &[f32; LPC_ORDER]) {
+        self.prev_lsp = *lsp_cos;
+        self.prev_lsp_freq = spec_lsp::lsp_cosines_to_freq(lsp_cos);
+    }
+
     /// Reset to the silent-LSP boot state. The post-filter switch is a
     /// configuration bit, not decoder state — it survives the reset.
     pub fn reset(&mut self) {
@@ -2988,6 +3120,7 @@ pub fn decode_mpmlq_local(payload: &[u8]) -> Result<Vec<i16>> {
 pub struct SpecEncoder {
     analysis: AnalysisState,
     rate: PackedRate,
+    last_ftype: crate::annex_a::FrameType,
 }
 
 impl SpecEncoder {
@@ -2997,6 +3130,7 @@ impl SpecEncoder {
         Self {
             analysis: AnalysisState::new(),
             rate,
+            last_ftype: crate::annex_a::FrameType::Active,
         }
     }
 
@@ -3005,17 +3139,48 @@ impl SpecEncoder {
         self.analysis.highpass = enabled;
     }
 
+    /// Enable / disable Annex A silence compression (VAD + comfort-noise
+    /// SID frames). Off by default: every frame is coded as speech.
+    pub fn set_vad(&mut self, enabled: bool) {
+        self.analysis.vad_enabled = enabled;
+    }
+
+    /// Switch the operating rate for the frames that follow (§1.2: the
+    /// rate may change at any frame boundary — the ITU "rate command").
+    pub fn set_rate(&mut self, rate: PackedRate) {
+        self.rate = rate;
+    }
+
+    /// Current operating rate.
+    pub fn rate(&self) -> PackedRate {
+        self.rate
+    }
+
+    /// Frame type of the last encoded frame (`Active` unless the VAD is
+    /// enabled and declared the frame inactive).
+    pub fn last_frame_type(&self) -> crate::annex_a::FrameType {
+        self.last_ftype
+    }
+
     /// Encode one 240-sample input block into its clause-4 octet
-    /// sequence (24 bytes at the high rate, 20 at the low rate).
+    /// sequence: 24 bytes at the high rate, 20 at the low rate, and —
+    /// with Annex A enabled — 4 bytes for a SID frame (Table A.1) or the
+    /// single untransmitted octet.
     ///
     /// Note the §2.2 framer delay: the encoder codes the input stream
     /// delayed by one subframe (the spec's 7.5 ms lookahead), so the
     /// coded frame covers the last 60 samples of the *previous* block
     /// plus the first 180 of this one.
     pub fn encode_frame(&mut self, pcm: &[i16; FRAME_SIZE_SAMPLES]) -> Vec<u8> {
-        let params = self.analysis.analyse_spec(pcm, self.rate, None);
-        crate::linepack::pack_frame(&params)
-            .expect("analyse_spec emits in-range clause-4 parameters")
+        use crate::annex_a::FrameType;
+        let r = self.analysis.analyse_frame(pcm, self.rate, None);
+        self.last_ftype = r.ftype;
+        match r.ftype {
+            FrameType::Active => crate::linepack::pack_frame(&r.params)
+                .expect("analyse_spec emits in-range clause-4 parameters"),
+            FrameType::Sid => crate::annex_a::pack_sid(r.sid.0, r.sid.1).to_vec(),
+            FrameType::Untransmitted => vec![crate::annex_a::UNTRANSMITTED_OCTET],
+        }
     }
 
     /// Conformance-diagnostic variant of [`SpecEncoder::encode_frame`]
@@ -3029,6 +3194,26 @@ impl SpecEncoder {
     /// encoder's own choices. Teacher-forcing every frame with the
     /// reference `.RCO` parameters measures each stage's per-decision
     /// agreement from the reference's own state, free of drift.
+    /// Conformance diagnostics: overwrite the previous-LSP predictor
+    /// state with the decode of `lsp_index` against the current state
+    /// (the §2.6 chain, stability included).
+    #[doc(hidden)]
+    pub fn force_prev_lsp_index(&mut self, lsp_index: u32) {
+        let dec = &mut self.analysis.decoder;
+        let freq = spec_lsp::decode_lsp_freq(lsp_index, &dec.prev_lsp_freq);
+        let cos_raw = spec_lsp::lsp_freq_to_cosines(&freq);
+        let (lsp_q, converged) = enforce_lsp_stability(&cos_raw, LSP_STABILITY_DELTA_MIN_HZ);
+        if converged {
+            dec.set_prev_lsp(&lsp_q);
+        }
+    }
+
+    /// Annex A state (conformance arbitration access).
+    #[doc(hidden)]
+    pub fn annex_a_mut(&mut self) -> (&mut crate::annex_a::Vad, &mut crate::annex_a::CodCng) {
+        (&mut self.analysis.vad, &mut self.analysis.cng)
+    }
+
     /// Analysis intermediates of the last encoded frame.
     #[doc(hidden)]
     pub fn diag(&self) -> EncoderDiag {
@@ -4107,6 +4292,81 @@ mod tests {
             (0.7..1.3).contains(&ratio),
             "mid-band gain should be ≈1, got {ratio}"
         );
+    }
+
+    /// Annex A end to end: silence → tone → silence through
+    /// `SpecEncoder` with the VAD on produces SID / untransmitted frames
+    /// during the silences and active frames on the tone, every packet
+    /// is accepted by the registry decoder, and the decoded output has
+    /// energy on the tone and little during the silences.
+    #[test]
+    fn annex_a_vad_round_trip_emits_sid_and_decodes() {
+        use crate::annex_a::FrameType;
+        const FRAMES: usize = 60;
+        let mut pcm = vec![0i16; FRAMES * FRAME_SIZE_SAMPLES];
+        let mut seed = 7u32;
+        for (n, v) in pcm.iter_mut().enumerate() {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let noise = ((seed >> 16) & 0x3F) as i16 - 32;
+            let f = n / FRAME_SIZE_SAMPLES;
+            let tone = if (20..40).contains(&f) {
+                ((n as f32 * 0.14).sin() * 6000.0) as i16
+            } else {
+                0
+            };
+            *v = tone + noise;
+        }
+        let mut enc = SpecEncoder::new(PackedRate::High);
+        enc.set_vad(true);
+        let mut types = Vec::new();
+        let mut packets = Vec::new();
+        for f in 0..FRAMES {
+            let mut fr = [0i16; FRAME_SIZE_SAMPLES];
+            fr.copy_from_slice(&pcm[f * FRAME_SIZE_SAMPLES..(f + 1) * FRAME_SIZE_SAMPLES]);
+            let bytes = enc.encode_frame(&fr);
+            let t = enc.last_frame_type();
+            match t {
+                FrameType::Active => assert_eq!(bytes.len(), 24),
+                FrameType::Sid => {
+                    assert_eq!(bytes.len(), 4);
+                    assert_eq!(bytes[0] & 0b11, 0b10);
+                }
+                FrameType::Untransmitted => assert_eq!(bytes, vec![0b11]),
+            }
+            types.push(t);
+            packets.push(bytes);
+        }
+        let inactive_lead = types[..20]
+            .iter()
+            .filter(|&&t| t != FrameType::Active)
+            .count();
+        let active_tone = types[22..40]
+            .iter()
+            .filter(|&&t| t == FrameType::Active)
+            .count();
+        assert!(
+            inactive_lead >= 10,
+            "leading silence must go inactive: {types:?}"
+        );
+        assert!(active_tone == 18, "the tone must stay active: {types:?}");
+        assert!(
+            types.contains(&FrameType::Sid),
+            "an inactive stretch must open with a SID frame"
+        );
+
+        let mut dec = crate::qdec::QSynthesis::new();
+        let mut energy = vec![0f64; FRAMES];
+        for (f, p) in packets.iter().enumerate() {
+            let out = match p[0] & 0b11 {
+                0b00 => dec.decode_mpmlq(p).unwrap(),
+                0b01 => dec.decode_acelp(p).unwrap(),
+                _ => dec.decode_erased(),
+            };
+            energy[f] = out.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / out.len() as f64;
+        }
+        let tone: f64 = energy[24..38].iter().sum::<f64>() / 14.0;
+        let tail: f64 = energy[50..].iter().sum::<f64>() / 10.0;
+        assert!(tone > 100.0 * tail.max(1.0), "tone {tone} vs tail {tail}");
     }
 
     /// The public SpecEncoder handle emits clause-4 frames at both
