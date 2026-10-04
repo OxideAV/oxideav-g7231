@@ -281,7 +281,7 @@ codec**:
 
 ```rust
 use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Frame, RuntimeContext, SampleFormat, TimeBase,
+    AudioFrame, CodecId, CodecParameters, Frame, RuntimeContext, SampleFormat,
 };
 
 let mut ctx = RuntimeContext::new();
@@ -293,7 +293,7 @@ params.channels = Some(1);
 params.sample_format = Some(SampleFormat::S16);
 params.bit_rate = Some(6_300); // or Some(5_300) for ACELP
 
-let mut enc = ctx.codecs.make_encoder(&params)?;
+let mut enc = ctx.codecs.first_encoder(&params)?;
 
 // 240 S16 samples = one 30 ms frame.
 let pcm = vec![0i16; 240];
@@ -301,13 +301,10 @@ let mut bytes = Vec::with_capacity(pcm.len() * 2);
 for s in &pcm {
     bytes.extend_from_slice(&s.to_le_bytes());
 }
+// Format / channels / rate travel in `params`, not in the frame.
 let frame = Frame::Audio(AudioFrame {
-    format: SampleFormat::S16,
-    channels: 1,
-    sample_rate: 8_000,
     samples: pcm.len() as u32,
     pts: Some(0),
-    time_base: TimeBase::new(1, 8_000),
     data: vec![bytes],
 });
 enc.send_frame(&frame)?;
