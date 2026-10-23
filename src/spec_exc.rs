@@ -30,8 +30,8 @@
 
 use crate::linepack::PackedRate;
 use crate::spec_tables::{
-    fcbk_unpk_positions, pitch_1tap_ltp, ADAPTIVE_CODEBOOK_GAIN_5P3, ADAPTIVE_CODEBOOK_GAIN_6P3,
-    ADAPTIVE_CODEBOOK_ROW_DIM, FIXED_CODEBOOK_GAIN_Q15, GAIN_TABLE_SIZE,
+    ADAPTIVE_CODEBOOK_GAIN_5P3, ADAPTIVE_CODEBOOK_GAIN_6P3, ADAPTIVE_CODEBOOK_ROW_DIM,
+    FIXED_CODEBOOK_GAIN_Q15, GAIN_TABLE_SIZE, fcbk_unpk_positions, pitch_1tap_ltp,
 };
 use crate::tables::{PITCH_MAX, PITCH_MIN, SUBFRAME_SIZE};
 

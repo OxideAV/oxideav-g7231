@@ -1299,7 +1299,7 @@ mod tests {
         let lengths = [LSP_BAND_INFO[1], LSP_BAND_INFO[3], LSP_BAND_INFO[5]];
         let total: i16 = lengths.iter().sum();
         assert_eq!(total, 10); // LpcOrder
-                               // Bands are contiguous: starts run 0, len0, len0+len1.
+        // Bands are contiguous: starts run 0, len0, len0+len1.
         assert_eq!(LSP_BAND_INFO[0], 0);
         assert_eq!(LSP_BAND_INFO[2], LSP_BAND_INFO[0] + LSP_BAND_INFO[1]);
         assert_eq!(LSP_BAND_INFO[4], LSP_BAND_INFO[2] + LSP_BAND_INFO[3]);

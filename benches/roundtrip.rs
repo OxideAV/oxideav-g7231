@@ -25,7 +25,7 @@
 //! Run with:
 //!     cargo bench -p oxideav-g7231 --bench roundtrip
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, SampleFormat};
 use oxideav_core::{CodecRegistry, Decoder, Encoder};

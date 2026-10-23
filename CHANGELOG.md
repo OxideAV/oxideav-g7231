@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- edition 2024, MSRV 1.95
+
+### Fixed
+
+- teacher-forced encoding (`encode_frame_params(.., Some(..))`) no longer trips the gain-word row-space `debug_assert` when the reference commits a short L0/L2 lag (85 rows) while the free search picked from the 170-row table: the gain row is re-scored inside the committed row space (`tests/itu_conformance.rs::encoder_teacher_forced_stage_agreement` passes again with the staged vectors)
+
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-g7231/compare/v0.0.8...v0.0.9) - 2026-10-04
 
 ### Other

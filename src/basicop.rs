@@ -65,11 +65,7 @@ pub const fn abs_s(a: i16) -> i16 {
 /// Saturating negation (`negate(-32768) = 32767`).
 #[inline]
 pub const fn negate(a: i16) -> i16 {
-    if a == i16::MIN {
-        i16::MAX
-    } else {
-        -a
-    }
+    if a == i16::MIN { i16::MAX } else { -a }
 }
 
 /// Fractional Q15 multiply: `(a · b) >> 15`, saturated. The only
@@ -146,11 +142,7 @@ pub const fn l_abs(a: i32) -> i32 {
 #[inline]
 pub const fn l_mult(a: i16, b: i16) -> i32 {
     let p = a as i32 * b as i32;
-    if p == 0x4000_0000 {
-        i32::MAX
-    } else {
-        p << 1
-    }
+    if p == 0x4000_0000 { i32::MAX } else { p << 1 }
 }
 
 /// Multiply–accumulate: `acc + 2·a·b`, saturated at each step.

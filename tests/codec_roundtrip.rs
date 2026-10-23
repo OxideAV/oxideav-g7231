@@ -19,8 +19,8 @@ use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Frame, Packet, Rational, Result, SampleFormat, TimeBase,
 };
 use oxideav_core::{CodecRegistry, Decoder, Encoder};
-use oxideav_g7231::encoder::{decode_acelp_local, decode_mpmlq_local};
 use oxideav_g7231::CODEC_ID_STR;
+use oxideav_g7231::encoder::{decode_acelp_local, decode_mpmlq_local};
 
 const SAMPLE_RATE: u32 = 8_000;
 const FRAME_SAMPLES: usize = 240;
@@ -242,7 +242,7 @@ fn erasure_in_middle_of_stream_is_concealed() {
             let Frame::Audio(af) = dec.receive_frame().unwrap() else {
                 panic!("expected audio frame");
             };
-            for chunk in af.data[0].chunks_exact(2) {
+            for chunk in af.data[0].as_chunks::<2>().0 {
                 let s = i16::from_le_bytes([chunk[0], chunk[1]]) as f64;
                 concealed_energy += s * s;
                 decoded.push(s as i16);
@@ -253,7 +253,7 @@ fn erasure_in_middle_of_stream_is_concealed() {
         let Frame::Audio(af) = dec.receive_frame().unwrap() else {
             panic!("expected audio frame");
         };
-        for chunk in af.data[0].chunks_exact(2) {
+        for chunk in af.data[0].as_chunks::<2>().0 {
             decoded.push(i16::from_le_bytes([chunk[0], chunk[1]]));
         }
     }
@@ -309,7 +309,7 @@ fn sustained_erasure_run_decays_to_silence() {
             panic!("expected audio frame");
         };
         let mut e = 0.0f64;
-        for chunk in af.data[0].chunks_exact(2) {
+        for chunk in af.data[0].as_chunks::<2>().0 {
             let s = i16::from_le_bytes([chunk[0], chunk[1]]) as f64;
             e += s * s;
         }
@@ -378,7 +378,7 @@ fn roundtrip_two_seconds_voiced_psnr_both_rates() {
                 panic!("expected audio frame");
             };
             assert_eq!(af.samples, FRAME_SAMPLES as u32);
-            for chunk in af.data[0].chunks_exact(2) {
+            for chunk in af.data[0].as_chunks::<2>().0 {
                 decoded.push(i16::from_le_bytes([chunk[0], chunk[1]]));
             }
         }
@@ -462,7 +462,7 @@ fn roundtrip_writes_sample_raw() {
 /// nightly.
 #[test]
 fn spec_decoder_survives_random_valid_frames() {
-    use oxideav_g7231::linepack::{pack_frame, PackedRate, SpecFrameParams};
+    use oxideav_g7231::linepack::{PackedRate, SpecFrameParams, pack_frame};
 
     // Deterministic LCG.
     let mut state = 0x0123_4567_89ab_cdefu64;

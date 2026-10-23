@@ -25,7 +25,7 @@
 //! excitation domain).
 
 use crate::spec_tables::{
-    fcbk_unpk_positions, BIT_ALLOCATION_SEGMENT_BASE, BIT_ALLOCATION_SEGMENT_BOUNDARIES,
+    BIT_ALLOCATION_SEGMENT_BASE, BIT_ALLOCATION_SEGMENT_BOUNDARIES, fcbk_unpk_positions,
 };
 use crate::tables::{FRAME_SIZE_SAMPLES, LPC_ORDER, SUBFRAME_SIZE};
 
@@ -587,11 +587,7 @@ impl CodCng {
                 let s = disc.sqrt();
                 let r1 = (-b + s) / a;
                 let r2 = (-b - s) / a;
-                if r1.abs() < r2.abs() {
-                    r1
-                } else {
-                    r2
-                }
+                if r1.abs() < r2.abs() { r1 } else { r2 }
             }
         };
         let gf = gf.clamp(-CNG_GF_MAX, CNG_GF_MAX);

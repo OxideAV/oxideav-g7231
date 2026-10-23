@@ -34,7 +34,7 @@
 //! Run with:
 //!     cargo bench -p oxideav-g7231 --bench decode
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use oxideav_core::packet::PacketFlags;
 use oxideav_core::{

@@ -91,7 +91,7 @@ use oxideav_core::{
 };
 use oxideav_core::{CodecInfo, CodecRegistry, Decoder};
 
-use crate::header::{parse_frame_type, FrameType};
+use crate::header::{FrameType, parse_frame_type};
 use crate::tables::{FRAME_SIZE_SAMPLES, SAMPLE_RATE_HZ};
 
 pub const CODEC_ID_STR: &str = "g723_1";
@@ -386,7 +386,9 @@ mod tests {
             };
             let expect = qs.decode_mpmlq(&payload).unwrap();
             let got: Vec<i16> = af.data[0]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                 .collect();
             assert_eq!(got.as_slice(), &expect[..], "frame {i}");

@@ -42,7 +42,7 @@
 use crate::basicop::*;
 use crate::linepack::{PackedRate, SpecFrameParams};
 use crate::spec_tables::{
-    lsp_codebook_entry, LspBand, LSP_COSINE_LOOKUP_Q15, LSP_DC_PREDICTED_FREQ_Q15,
+    LSP_COSINE_LOOKUP_Q15, LSP_DC_PREDICTED_FREQ_Q15, LspBand, lsp_codebook_entry,
 };
 use crate::tables::LPC_ORDER;
 
@@ -599,11 +599,7 @@ fn pitch_postfilter(
             frame[gidx as usize] as i64
         } else {
             let k = (-gidx) as usize;
-            if k <= hlen {
-                hist[hlen - k] as i64
-            } else {
-                0
-            }
+            if k <= hlen { hist[hlen - k] as i64 } else { 0 }
         }
     };
 
@@ -622,7 +618,7 @@ fn pitch_postfilter(
             d += x * x;
         }
         let better = |best: &Option<(usize, i64, i64)>| {
-            best.map_or(true, |(_, bc, bd)| {
+            best.is_none_or(|(_, bc, bd)| {
                 (c as i128 * c as i128) * bd as i128 > (bc as i128 * bc as i128) * d as i128
             })
         };
@@ -642,7 +638,7 @@ fn pitch_postfilter(
             d += x * x;
         }
         let better = |best: &Option<(usize, i64, i64)>| {
-            best.map_or(true, |(_, bc, bd)| {
+            best.is_none_or(|(_, bc, bd)| {
                 (c as i128 * c as i128) * bd as i128 > (bc as i128 * bc as i128) * d as i128
             })
         };
@@ -830,7 +826,7 @@ impl PostfilterState {
 // Frame-level fixed-point decoder
 // ---------------------------------------------------------------------
 
-use crate::tables::{FRAME_SIZE_SAMPLES, SUBFRAMES_PER_FRAME, SUBFRAME_SIZE};
+use crate::tables::{FRAME_SIZE_SAMPLES, SUBFRAME_SIZE, SUBFRAMES_PER_FRAME};
 
 /// Stateful fixed-point G.723.1 decoder (§3.1 pipeline on saturating
 /// Word16/Word32 arithmetic).
@@ -1579,7 +1575,7 @@ mod tests {
         assert!(e_out <= e_in + SUBFRAME_SIZE as i64);
         // The pitch pulses stay in place.
         for n in 0..SUBFRAME_SIZE {
-            if (sub * SUBFRAME_SIZE + n) % 40 == 0 {
+            if (sub * SUBFRAME_SIZE + n).is_multiple_of(40) {
                 assert!(out[n] > 4000, "pulse at {n} vanished: {}", out[n]);
             }
         }

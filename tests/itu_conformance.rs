@@ -31,9 +31,9 @@
 //!   fixed-gain decisions agree with the reference `.RCO` bitstreams at
 //!   pinned per-vector floors.
 
-use oxideav_g7231::annex_a::{unpack_sid, FrameType};
+use oxideav_g7231::annex_a::{FrameType, unpack_sid};
 use oxideav_g7231::encoder::{SpecEncoder, SynthesisState};
-use oxideav_g7231::linepack::{pack_frame, unpack_frame, PackedRate};
+use oxideav_g7231::linepack::{PackedRate, pack_frame, unpack_frame};
 use oxideav_g7231::qdec::QSynthesis;
 
 use std::path::{Path, PathBuf};
@@ -60,7 +60,9 @@ fn corpus_dir() -> Option<PathBuf> {
 
 fn read_pcm(dir: &Path, name: &str) -> Vec<i16> {
     let b = std::fs::read(dir.join(name)).unwrap();
-    b.chunks_exact(2)
+    b.as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect()
 }
@@ -69,7 +71,9 @@ fn read_pcm(dir: &Path, name: &str) -> Vec<i16> {
 /// 1 = the frame is to be treated as erased).
 fn read_crc(dir: &Path, name: &str) -> Vec<bool> {
     let b = std::fs::read(dir.join(name)).unwrap();
-    b.chunks_exact(2)
+    b.as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]) != 0)
         .collect()
 }

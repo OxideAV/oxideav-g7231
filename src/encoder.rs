@@ -82,7 +82,7 @@ use crate::tables::{
     LSP_STABILITY_MAX_ITERATIONS, PITCH_MAX, PITCH_MIN, POSTFILTER_AGC_ALPHA,
     POSTFILTER_AGC_INIT_GAIN, POSTFILTER_LTP_GAMMA_HIGH, POSTFILTER_LTP_GAMMA_LOW,
     POSTFILTER_LTP_PRED_GAIN_DB_MIN, POSTFILTER_LTP_SEARCH_RADIUS, POSTFILTER_TILT_BASE,
-    POSTFILTER_TILT_SMOOTH_ALPHA, SAMPLE_RATE_HZ, SUBFRAMES_PER_FRAME, SUBFRAME_SIZE,
+    POSTFILTER_TILT_SMOOTH_ALPHA, SAMPLE_RATE_HZ, SUBFRAME_SIZE, SUBFRAMES_PER_FRAME,
 };
 
 /// Total payload size for an ACELP (5.3 kbit/s) frame.
@@ -228,7 +228,7 @@ impl Encoder for G7231Encoder {
         if bytes.len() % 2 != 0 {
             return Err(Error::invalid("G.723.1 encoder: odd byte count"));
         }
-        for chunk in bytes.chunks_exact(2) {
+        for chunk in bytes.as_chunks::<2>().0 {
             self.pcm_queue
                 .push(i16::from_le_bytes([chunk[0], chunk[1]]));
         }
@@ -850,48 +850,7 @@ impl AnalysisState {
                     lags[s - 1] // lags[0] for s = 1, lags[2] for s = 3
                 };
                 let rows = spec_exc::gain_vq_rows(rate, lag_base);
-                let basis = spec_exc::acb_basis(&self.decoder.exc_history, cand);
-                let mut y = [[0.0f32; SUBFRAME_SIZE]; spec_exc::ACB_TAPS];
-                for (yj, bj) in y.iter_mut().zip(basis.iter()) {
-                    *yj = conv_causal(bj, &h);
-                }
-                let mut d = [0.0f32; spec_exc::ACB_TAPS];
-                let mut rmat = [[0.0f32; spec_exc::ACB_TAPS]; spec_exc::ACB_TAPS];
-                for j in 0..spec_exc::ACB_TAPS {
-                    for n in 0..SUBFRAME_SIZE {
-                        d[j] += target[n] * y[j][n];
-                    }
-                    for k in j..spec_exc::ACB_TAPS {
-                        let mut acc = 0.0f32;
-                        for n in 0..SUBFRAME_SIZE {
-                            acc += y[j][n] * y[k][n];
-                        }
-                        rmat[j][k] = acc;
-                        rmat[k][j] = acc;
-                    }
-                }
-                // The 20-entry correlation vector the published gain
-                // rows are laid out against (see
-                // `spec_exc::acb_row_score`): `[d_0..d_4, R_00..R_44,
-                // 2R_01, 2R_02, 2R_12, 2R_03, 2R_13, 2R_23, 2R_04,
-                // 2R_14, 2R_24, 2R_34]` in the reference's own
-                // excitation units. This crate's basis vectors live in
-                // the doubled excitation domain (`y = 2·y_ref`, so
-                // `d = 2·d_ref`, `R = 4·R_ref`), which halves every
-                // quadratic term relative to the linear ones:
-                // `[d, R_ii/2, R_ij]`.
-                let mut corr = [0.0f32; spec_exc::ACB_ROW_TERMS];
-                corr[..spec_exc::ACB_TAPS].copy_from_slice(&d);
-                for j in 0..spec_exc::ACB_TAPS {
-                    corr[spec_exc::ACB_TAPS + j] = 0.5 * rmat[j][j];
-                }
-                let mut k = 2 * spec_exc::ACB_TAPS;
-                for j in 1..spec_exc::ACB_TAPS {
-                    for i in 0..j {
-                        corr[k] = rmat[i][j];
-                        k += 1;
-                    }
-                }
+                let corr = acb_corr(&self.decoder.exc_history, cand, &h, &target);
                 if let Some(slot) = self.diag.acb[s].iter_mut().find(|c| c.lag == 0) {
                     slot.lag = cand;
                     slot.corr = corr;
@@ -933,6 +892,25 @@ impl AnalysisState {
                 best_lag = lags[s];
                 best_pg = spec_exc::decode_gain_word(rate, lag_base, f.gain[s]).pgindex;
             }
+            let own_pg = if force.is_some() && own_pg >= spec_exc::gain_vq_rows(rate, lag_base) {
+                // The free search ran on its own L0/L2 candidate with the
+                // 170-row table while the reference committed a short
+                // lag (85 rows): our pick does not exist in the
+                // committed row space, so re-score the rows the
+                // committed lag allows.
+                let corr = acb_corr(&self.decoder.exc_history, lags[s], &h, &target);
+                let rows = spec_exc::gain_vq_rows(rate, lag_base);
+                let mut best = (0.0f32, 0usize);
+                for pg in 0..rows {
+                    let score = spec_exc::acb_row_score(rate, lag_base, pg, &corr);
+                    if score > best.0 {
+                        best = (score, pg);
+                    }
+                }
+                best.1
+            } else {
+                own_pg
+            };
 
             // Residual target for the fixed-codebook stage (eq. 20).
             let taps = spec_exc::acb_taps(rate, lag_base, best_pg);
@@ -2183,6 +2161,60 @@ pub(crate) fn place_pulses(
 
 // ---------- filtering helpers ----------
 
+/// Section 2.14 gain-vector correlation terms for pitch candidate `cand`
+/// on the current excitation history: the 20-entry vector the
+/// published gain rows are scored against (see `spec_exc::acb_row_score`).
+fn acb_corr(
+    exc_history: &[f32],
+    cand: i32,
+    h: &[f32],
+    target: &[f32; SUBFRAME_SIZE],
+) -> [f32; spec_exc::ACB_ROW_TERMS] {
+    let basis = spec_exc::acb_basis(exc_history, cand);
+    let mut y = [[0.0f32; SUBFRAME_SIZE]; spec_exc::ACB_TAPS];
+    for (yj, bj) in y.iter_mut().zip(basis.iter()) {
+        *yj = conv_causal(bj, h);
+    }
+    let mut d = [0.0f32; spec_exc::ACB_TAPS];
+    let mut rmat = [[0.0f32; spec_exc::ACB_TAPS]; spec_exc::ACB_TAPS];
+    for j in 0..spec_exc::ACB_TAPS {
+        for n in 0..SUBFRAME_SIZE {
+            d[j] += target[n] * y[j][n];
+        }
+        for k in j..spec_exc::ACB_TAPS {
+            let mut acc = 0.0f32;
+            for n in 0..SUBFRAME_SIZE {
+                acc += y[j][n] * y[k][n];
+            }
+            rmat[j][k] = acc;
+            rmat[k][j] = acc;
+        }
+    }
+    // The 20-entry correlation vector the published gain
+    // rows are laid out against (see
+    // `spec_exc::acb_row_score`): `[d_0..d_4, R_00..R_44,
+    // 2R_01, 2R_02, 2R_12, 2R_03, 2R_13, 2R_23, 2R_04,
+    // 2R_14, 2R_24, 2R_34]` in the reference's own
+    // excitation units. This crate's basis vectors live in
+    // the doubled excitation domain (`y = 2·y_ref`, so
+    // `d = 2·d_ref`, `R = 4·R_ref`), which halves every
+    // quadratic term relative to the linear ones:
+    // `[d, R_ii/2, R_ij]`.
+    let mut corr = [0.0f32; spec_exc::ACB_ROW_TERMS];
+    corr[..spec_exc::ACB_TAPS].copy_from_slice(&d);
+    for j in 0..spec_exc::ACB_TAPS {
+        corr[spec_exc::ACB_TAPS + j] = 0.5 * rmat[j][j];
+    }
+    let mut k = 2 * spec_exc::ACB_TAPS;
+    for j in 1..spec_exc::ACB_TAPS {
+        for i in 0..j {
+            corr[k] = rmat[i][j];
+            k += 1;
+        }
+    }
+    corr
+}
+
 /// Causal convolution `y = x * h` truncated to length of x.
 fn conv_causal(x: &[f32; SUBFRAME_SIZE], h: &[f32]) -> [f32; SUBFRAME_SIZE] {
     let mut y = [0.0f32; SUBFRAME_SIZE];
@@ -2407,8 +2439,7 @@ impl SynthesisState {
             } else {
                 -1.0
             };
-            if metric >= 0.0 && best_f.map_or(true, |(_, bc, bd)| metric > bc * bc / bd.max(1e-12))
-            {
+            if metric >= 0.0 && best_f.is_none_or(|(_, bc, bd)| metric > bc * bc / bd.max(1e-12)) {
                 best_f = Some((mu, c, d));
             }
         }
@@ -2421,11 +2452,7 @@ impl SynthesisState {
                 frame[gidx as usize]
             } else {
                 let k = (-gidx) as usize;
-                if k <= hlen {
-                    hist[hlen - k]
-                } else {
-                    0.0
-                }
+                if k <= hlen { hist[hlen - k] } else { 0.0 }
             }
         };
         let mut best_b: Option<(usize, f32, f32)> = None;
@@ -2443,8 +2470,7 @@ impl SynthesisState {
             } else {
                 -1.0
             };
-            if metric >= 0.0 && best_b.map_or(true, |(_, bc, bd)| metric > bc * bc / bd.max(1e-12))
-            {
+            if metric >= 0.0 && best_b.is_none_or(|(_, bc, bd)| metric > bc * bc / bd.max(1e-12)) {
                 best_b = Some((mu, c, d));
             }
         }
@@ -4916,7 +4942,7 @@ mod tests {
 
     // ---------- spec-layout decode kernel ----------
 
-    use crate::linepack::{pack_frame, unpack_frame, PackedRate, SpecFrameParams};
+    use crate::linepack::{PackedRate, SpecFrameParams, pack_frame, unpack_frame};
 
     /// A voiced-ish hand-built spec parameter set at the given rate.
     fn voiced_spec_params(rate: PackedRate) -> SpecFrameParams {

@@ -34,7 +34,7 @@
 //! 0 in the least-significant byte (a documented crate convention; the
 //! Recommendation transmits `LPC` as one opaque 24-bit parameter).
 
-use crate::spec_tables::{lsp_codebook_entry, LspBand, LSP_DC_PREDICTED_FREQ_Q15};
+use crate::spec_tables::{LSP_DC_PREDICTED_FREQ_Q15, LspBand, lsp_codebook_entry};
 use crate::tables::{LPC_ORDER, LSP_PREDICTOR_B};
 
 /// The long-term LSP DC vector `p_DC` in table units (Q15 normalised
