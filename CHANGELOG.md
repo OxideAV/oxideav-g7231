@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-g7231/compare/v0.0.9...v0.0.10) - 2026-11-07
+
+### Other
+
+- API hygiene: hide internal DSP modules and encoder internals
+- edition 2024, MSRV 1.95
+
 ### Changed
 
 - `#[doc(hidden)]` on the internal DSP modules `annex_a`, `basicop`,
