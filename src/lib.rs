@@ -68,7 +68,9 @@
     clippy::doc_overindented_list_items
 )]
 
+#[doc(hidden)]
 pub mod annex_a;
+#[doc(hidden)]
 pub mod basicop;
 // Internal wire plumbing — kept `pub` for the fuzz harnesses, hidden from
 // rustdoc/semver (fleet rule 2026-09-01).
@@ -76,9 +78,13 @@ pub mod basicop;
 pub mod bitreader;
 pub mod encoder;
 pub mod header;
+#[doc(hidden)]
 pub mod linepack;
+#[doc(hidden)]
 pub mod qdec;
+#[doc(hidden)]
 pub mod spec_exc;
+#[doc(hidden)]
 pub mod spec_lsp;
 pub mod spec_tables;
 // Internal layout-constant storage (the advertised table surface is

@@ -2252,6 +2252,7 @@ fn conv_causal(x: &[f32; SUBFRAME_SIZE], h: &[f32]) -> [f32; SUBFRAME_SIZE] {
 /// every stored sample to the i16 range).
 const I16_MAX_NORM: f32 = 32_767.0 / 32_768.0;
 
+#[doc(hidden)]
 pub struct SynthesisState {
     prev_lsp: [f32; LPC_ORDER],
     /// Previous decoded LSP vector in the spec tables' Q15
@@ -3124,6 +3125,7 @@ fn to_i16_frame(pcm: &[f32; FRAME_SIZE_SAMPLES]) -> [i16; FRAME_SIZE_SAMPLES] {
 /// Callers chasing high SNR across a multi-frame stream should instantiate
 /// [`SynthesisState`] once and call [`SynthesisState::decode_acelp`] per
 /// frame.
+#[doc(hidden)]
 pub fn decode_acelp_local(payload: &[u8]) -> Result<Vec<i16>> {
     let mut st = SynthesisState::new();
     Ok(st.decode_acelp(payload)?.to_vec())
@@ -3132,6 +3134,7 @@ pub fn decode_acelp_local(payload: &[u8]) -> Result<Vec<i16>> {
 /// Convenience stateless wrapper around [`SynthesisState::decode_mpmlq`].
 /// See [`decode_acelp_local`] for the caveat about decoder state across
 /// frames.
+#[doc(hidden)]
 pub fn decode_mpmlq_local(payload: &[u8]) -> Result<Vec<i16>> {
     let mut st = SynthesisState::new();
     Ok(st.decode_mpmlq(payload)?.to_vec())
@@ -3143,6 +3146,7 @@ pub fn decode_mpmlq_local(payload: &[u8]) -> Result<Vec<i16>> {
 /// requires running the encoder with the high-pass selectively disabled
 /// (the `..C53`/`..C63H` vector naming: trailing `H` = high-pass ON,
 /// absent = OFF).
+#[doc(hidden)]
 pub struct SpecEncoder {
     analysis: AnalysisState,
     rate: PackedRate,
